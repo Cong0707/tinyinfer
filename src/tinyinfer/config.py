@@ -140,6 +140,10 @@ class TinyConfig:
             tie_word_embeddings=bool(tc.get("tie_word_embeddings", False)),
         )
 
+    def arch_family(self) -> str:
+        """Architecture family used by tinyinfer.adapters.open_adapter()."""
+        return "deepseek_v41"
+
     def summary(self) -> str:
         return (
             f"layers={self.n_layers} dim={self.dim} heads={self.n_heads} head_dim={self.head_dim} "
