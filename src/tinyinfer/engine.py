@@ -25,7 +25,9 @@ class Engine:
         expert_store=None,
         max_layers: int | None = None,
         allow_missing_layers: bool = False,
+        device: str = "cpu",
     ):
+        self.device = device
         self.adapter = open_adapter(adapter) if isinstance(adapter, str) else adapter
         self.cfg = self.adapter.load_config()
         self.store = self.adapter.store
@@ -34,9 +36,9 @@ class Engine:
         self.max_layers = self.cfg.n_layers if max_layers is None else min(max_layers, self.cfg.n_layers)
         self.allow_missing_layers = allow_missing_layers
         self._blocks: dict[int, Block] = {}
-        self.embed = self.store.get("embed.weight")
-        self.out_norm = self.store.get("norm.weight")
-        self.head = self.store.get("head.weight")
+        self.embed = self.store.get("embed.weight").to(device)
+        self.out_norm = self.store.get("norm.weight").to(device)
+        self.head = self.store.get("head.weight").to(device)
         self.eps = self.cfg.rms_norm_eps
 
     # -- residency ---------------------------------------------------------
@@ -60,7 +62,7 @@ class Engine:
     def block(self, layer_id: int) -> Block:
         b = self._blocks.get(layer_id)
         if b is None:
-            b = Block(self.store, layer_id, self.cfg, expert_store=self.expert_store)
+            b = Block(self.store, layer_id, self.cfg, expert_store=self.expert_store).to(self.device)
             self._blocks[layer_id] = b
         return b
 
@@ -77,7 +79,7 @@ class Engine:
             n = min(n, self.available_layers())
         h = self.embed[ids]
         h = h.unsqueeze(2).repeat(1, 1, self.cfg.hc_mult, 1)
-        pre_mix = torch.zeros(h.size(0), h.size(1), self.cfg.hc_mult, dtype=torch.float32)
+        pre_mix = torch.zeros(h.size(0), h.size(1), self.cfg.hc_mult, dtype=torch.float32, device=h.device)
         pre_mix[:, :, 0] = 1.0
         for i in range(n):
             h, pre_mix = self.block(i).forward(h, start_pos, pre_mix)
@@ -89,14 +91,14 @@ class Engine:
         """Greedy/sampled generation loop (prefill once, then decode step by step)."""
         ids = list(prompt_ids)
         with torch.inference_mode():
-            logits = self.forward(torch.tensor([ids]), 0)
+            logits = self.forward(torch.tensor([ids], device=self.device), 0)
             out = []
             for step in range(max_new_tokens):
                 nid = int(softmax_sample(logits[0, -1], temperature))
                 out.append(nid)
                 if eos_token_id is not None and nid == eos_token_id:
                     break
-                logits = self.forward(torch.tensor([[nid]]), start_pos=len(ids) + step)
+                logits = self.forward(torch.tensor([[nid]], device=self.device), start_pos=len(ids) + step)
         return out
 
     # -- introspection -----------------------------------------------------

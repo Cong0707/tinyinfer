@@ -46,11 +46,12 @@ def unpack_fp4(packed: torch.Tensor) -> torch.Tensor:
     """
     if packed.dtype != torch.uint8:
         packed = packed.view(torch.uint8)
+    table = E2M1_TABLE.to(packed.device)
     lo = packed & 0x0F
     hi = (packed >> 4) & 0x0F
     out = torch.empty(packed.shape[:-1] + (packed.shape[-1] * 2,), dtype=torch.float32, device=packed.device)
-    out[..., 0::2] = E2M1_TABLE[lo.long()]
-    out[..., 1::2] = E2M1_TABLE[hi.long()]
+    out[..., 0::2] = table[lo.long()]
+    out[..., 1::2] = table[hi.long()]
     return out
 
 
