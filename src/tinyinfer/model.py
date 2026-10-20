@@ -4,6 +4,7 @@ from __future__ import annotations
 import torch
 
 from .attention import MLAWindowAttention
+from .compressed_attention import MLACompressedAttention
 from .config import TinyConfig
 from .hc import HCBlockMixin
 from .moe import MoE
@@ -20,7 +21,10 @@ class Block(HCBlockMixin):
         self.hc_mult = cfg.hc_mult
         self.hc_sinkhorn_iters = cfg.hc_sinkhorn_iters
         self.hc_eps = cfg.hc_eps
-        self.attn = MLAWindowAttention(store, layer_id, cfg)
+        if cfg.compress_ratios[layer_id] == 0:
+            self.attn = MLAWindowAttention(store, layer_id, cfg)
+        else:
+            self.attn = MLACompressedAttention(store, layer_id, cfg)
         self.ffn = MoE(store, layer_id, cfg)
         p = f"layers.{layer_id}."
         self.attn_norm = store.get(p + "attn_norm.weight")
@@ -64,6 +68,13 @@ class TinyModel:
         self.head = store.get("head.weight")
         self.layers = layers or []
         self.blocks = [Block(store, i, cfg) for i in self.layers]
+
+    def reset(self) -> None:
+        for block in self.blocks:
+            block.attn.reset()
+            for e in getattr(block.ffn, "_expert_cache", {}).values():
+                pass
+            block.ffn._expert_cache.clear()
 
     def forward(self, ids: torch.Tensor, start_pos: int = 0):
         h = self.embed[ids]  # [b, s, dim]
