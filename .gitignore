@@ -1,0 +1,17 @@
+# 虚拟环境与缓存
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 大文件：权重与中间产物（可由脚本重新生成/下载）
+cache/
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.log
+
+# 本地配置
+.env
+config.local.*
