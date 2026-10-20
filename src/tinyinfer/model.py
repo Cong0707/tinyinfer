@@ -71,9 +71,8 @@ class TinyModel:
 
     def reset(self) -> None:
         for block in self.blocks:
-            block.attn.reset()
-            for e in getattr(block.ffn, "_expert_cache", {}).values():
-                pass
+            if hasattr(block.attn, "reset"):
+                block.attn.reset()
             block.ffn._expert_cache.clear()
 
     def forward(self, ids: torch.Tensor, start_pos: int = 0):

@@ -4,7 +4,9 @@ Counts finished files by exact size, plus in-flight segment bytes, so progress i
 visible while big shards are still being assembled. Also prints the observed rate
 since the previous run (state kept in _progress_state.json).
 """
-import json, os, sys, time, urllib.request
+import json, os, re, sys, time, urllib.request
+
+SEG_RE = re.compile(r"\.seg\d{4}(?:\.part)?$")
 
 REPO = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
 API = f"https://hf-mirror.com/api/models/{REPO}?blobs=true"
@@ -38,7 +40,7 @@ def main():
     seg_bytes = 0
     seg_count = 0
     for n in os.listdir(DEST):
-        if ".seg" in n:
+        if SEG_RE.search(n):
             try:
                 seg_bytes += os.path.getsize(os.path.join(DEST, n))
                 seg_count += 1
@@ -55,7 +57,6 @@ def main():
                 done += 1
                 have += size
             else:
-                have += min(n, size)
                 partial.append((name, n, size))
         else:
             partial.append((name, 0, size))

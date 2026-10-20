@@ -53,3 +53,29 @@
 | 475GB 下载成本 | 阶段化：P1-P4 只取所需分片，P5 再全量 |
 | 47GB RAM 装不下非专家权重 | 按层/按张量流式；非专家也可分层 |
 | 8GB VRAM 连单层都紧张 | 激活/KV 压缩；分块计算 |
+
+## 优化分级 O1–O9（扩展版：为 500B 模型压进 8GB 笔记本）
+
+> 目标不是"跑得动一般模型"，而是让 **DeepSeek-V4.1-Flash（~510GB, 384 专家/6 激活）** 在
+> 8GB VRAM + 47GB RAM + NVMe 上产生可用 token。O1–O4 是常规优化；**O5–O9 是让 500B 可行的关键**。
+
+| 级别 | 名称 | 核心手段 | 验证方式 |
+|---|---|---|---|
+| O1 | 正确性 | PyTorch 参考实现、HF 直接加载、数值对齐 | 已完成的单测（RoPE/sink/fp8/fp4） |
+| O2 | 算子融合 | tilelang：RMSNorm+RoPE、SwiGLU、MoE combine、sparse MLA、gather-scatter | ms/op、与 O1 数值一致 |
+| O3 | 量化加速 | FP8 E4M3 / NVFP4 tensor core 直接计算；KV 8bit/4bit(Hadamard)/K8V4；分组 scale | tokens/s、PPL 变化 |
+| O4 | 内存分层 | 非专家 17.7GB 驻 RAM、专家 296GB 流式、engram 196.6GB 行读、KV 分层 | 峰值内存、命中率 |
+| **O5** | **投机与预判** | DSpark/MTP 内置 draft（模型自带 3 个 MTP 层 + DSpark 头）、n-gram draft、树形投机、**speculative prefill**（长 prompt 稀疏早停）、CPU 侧 draft 采样/验证 | 接受率、tokens/成本、TTFT |
+| **O6** | **CPU 辅助决策** | CPU 计算 router/gate（5120×384 很小）提前 1–2 层预测专家集合 → 预取；CPU 做采样与验证（避免 GPU→CPU 同步）；CPU 决定 PCIe/磁盘分工；CPU 侧 n-gram/engram 查询 | 预测命中率、同步开销、CPU 利用率 |
+| **O7** | **IO/加载协同** | 双缓冲预取（GPU 算 attention 时 NVMe 读下一层专家）、O_DIRECT/overlapped IO、NVMe 多队列、fp4 原样搬运、batch 内专家去重、热专家 pinning + 冷专家 eviction（LRU/ARC/S3-FIFO） | 有效磁盘带宽、miss 延迟、tokens/s |
+| **O8** | **跨 agent 协同** | 多会话共享专家热度、batched MoE（多 token 汇聚一次 I/O）、prompt cache 复用 KV/专家状态、slot 级缓存归属 | 并发吞吐、缓存命中、内存预算 |
+| **O9** | **异构流水线** | GPU(L2)/RAM(L3)/NVMe(容量) 三级流水：attention 在 GPU、专家在 CPU+GPU、SSD 供数；PCIe 分担与计算-IO 重叠的调度器；"GPU 只做 attention + 部分专家，CPU 主力"的混合执行 | 端到端 tok/s、各资源利用率、稳定性 |
+
+### 500B 模型的关键算式（决定一切）
+- 每 token 激活：6/384 路由专家 + 1 共享 ≈ **~10–12B 参数**；fp4/fp8 混合下每 token 需读约 **3–5GB** 专家权重。
+- 8GB VRAM：放不下整层专家（每层 ~7.2GB Q2），只能放 **专家缓存 + attention 层权重 + KV**。
+- 47GB RAM：非专家 17.7GB 全驻 + 专家页缓存 ~20GB + KV/激活。
+- 结论：**瓶颈是"每 token 4.25GB 的专家读取 + 非专家驻留"**，因此 O5–O8（投机减少 token 数、CPU 预测提前 I/O、跨 agent 合并 I/O、流水重叠）才是可行性的核心；O2/O3 是单步成本，O5/O6/O8 是总量削减。
+
+### 每级都要保留的可测指标
+每 token 磁盘字节、专家缓存命中率、预取提前量（层数）、CPU/GPU 空闲率、TTFT、tokens/s、PPL 回归。

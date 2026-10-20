@@ -49,7 +49,7 @@ class MLAWindowAttention:
         )
         self._kv_cache: torch.Tensor | None = None
 
-    def reset_cache(self) -> None:
+    def reset(self) -> None:
         self._kv_cache = None
 
     def _decode_idxs(self, start_pos: int, b: int, device) -> torch.Tensor:
