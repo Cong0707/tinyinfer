@@ -62,7 +62,8 @@ def plan(level: OptLevel = OptLevel.BALANCED, vram_gb: float = 8.0, ram_gb: floa
             "kv_hadamard": True,
             "wo_low_rank": 0.75,       # SVD-truncate grouped output projection
             "skip_layer_pattern": "every8",  # drop a layer's residual contribution periodically
-            "fft_linear_attn": False,  # experiment: FFT-based linear attention on window path
+            "fast_math": ["exp", "silu", "rsqrt", "sin", "cos"],  # curve fits for SFU ops
+            "fft_linear_attn": False,  # experiment only: FFT token mixing (measured unusable)
             "fp4_experts": True,
         },
         notes="approximation/fitting regime: low-rank output proj, layer skipping, KV4; "
