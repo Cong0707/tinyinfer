@@ -97,3 +97,70 @@ tinyinfer/
 - DeepInfer：HF 直接加载器、EPLB、压缩 KV/Engram/MTP 的官方实现
 - Strata（docs/DETAILS.md）：融合 int8 tensor-core、KV streaming、专家 tier 交换、PCIe 分担、O1-O4 式工程优化
 - ds4 / flash-moe / llama.cpp #25294：SSD 专家流式与缓存策略
+
+## 使用（生产路径）
+
+### 1. 环境
+```powershell
+# 复用本机已装 torch 的环境（推荐，省下载）
+.\scripts\bootstrap.ps1 -ReuseEnv D:\Develop\Other\python\.venv
+# 或全新安装（torch 走 cu130）
+.\scripts\bootstrap.ps1
+```
+tilelang kernel 需要 vcvars64 + CUDA_HOME（prototypes/kernels/run_py.bat 已封装）。
+
+### 2. 权重
+模型放在 `cache/weights`（HF safetensors 原格式，无需转换）。
+```powershell
+uv run python scripts\download_repo.py      # 完整仓库（断点续传）
+uv run python scripts\download_progress.py  # 进度
+```
+
+### 3. 起服务（OpenAI 兼容）
+```powershell
+.venv\Scripts\python.exe -m tinyinfer.server --model-dir cache\weights --tier balanced --device cuda --port 8000
+curl http://127.0.0.1:8000/v1/models
+```
+- 端点：`/v1/models`、`/v1/completions`、`/v1/chat/completions`（SSE）、`/v1/slots`、`/health`
+- 多 slot：`X-Session-Id` 绑定 KV 快照；`reset_slot` 清空
+- 多模型：`--extra-model NAME=DIR`，`/v1/models` 动态列出
+
+### 4. 基准
+```powershell
+.venv\Scripts\python.exe scripts\bench.py --max-layers 6 --device cuda --tier balanced
+```
+
+## 当前实现状态
+
+| 模块 | 状态 |
+|---|---|
+| HF safetensors 直接加载（fp8/fp4/engram 行读） | ✅ |
+| MLA window + 压缩 KV/Indexer（分块 prefill/decode） | ✅ 真实权重（L0-L5） |
+| MoE（fp4 官方 kernel / GPU dequant） | ✅ |
+| Hyper-Connections | ✅ |
+| Engram（L1/L14，按行读表） | 代码就绪，表分片（196GB）待下载 |
+| 层驻留 + 流式（GPU/RAM 预算） | ✅ |
+| 多 slot KV 快照 | ✅ |
+| OpenAI API + SSE + function calling 回显 | ✅ |
+| MTP/DSpark 投机 | 设计完成（等 MTP 分片） |
+| tier 分档（conservative→extreme） | ✅ 开关定义 |
+
+## 限制
+- 全 40 层需等完整下载（当前 L0-L5）。
+- Engram 表（196GB）为最后下载项；缺表时 L1/L14 跳过 engram（数值偏差，文档标注）。
+- Windows 上 tilelang 依赖 vcvars64；无 CUDA 环境自动回退 PyTorch 参考。
+- per-slot KV 是快照隔离，尚不支持跨请求 prefix 复用。
+## 实测性能（RTX 5060 Laptop 8GB + Ryzen 9 9955HX，2026-10）
+
+| 配置 | prefill | decode | 说明 |
+|---|---|---|---|
+| 5 层 balanced（GPU，fp8 常驻 + fp4 专家 kernel） | 16 tok / ~0.7s | **~180ms/token（5.4-5.7 tok/s）** | 预测预取 + 状态机槽 + 融合 dequant |
+| 40 层（外推） | — | ~1.4-1.6s/token（0.6-0.7 tok/s） | 25 层常驻 + 15 层流式 |
+
+优化点：
+- fp8→bf16 融合反量化 kernel（wo_a 2.0→0.48ms，4.2x）
+- CPU 上下文预测器（token/bigram/trigram 表，命中 94.9%）+ 异步 RAM 预取
+- VRAM 槽状态机（FREE/RESERVED/COPYING/STAGED/IN_USE + 事件完成通知，并发安全）
+- 双 staging（pinned）+ 专用 copy stream（H2D 26.6GB/s，与计算重叠）
+
+理论分析：瓶颈是专家冷读（4.5GB/token @ SSD）；命中 90% 时 IO 下限 ~100ms/token（10 tok/s），GPU 算力远未饱和。

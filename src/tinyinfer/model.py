@@ -15,17 +15,30 @@ from .weights import ShardStore
 class Block(HCBlockMixin):
     """One decoder layer: Hyper-Connection collapse -> norm -> attention -> HC expand -> ... FFN."""
 
-    def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, expert_store=None):
+    def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, expert_store=None, quant: bool = False,
+                 hashes=None, cache_wo_a: bool = False):
         self.layer_id = layer_id
         self.cfg = cfg
         self._expert_store = expert_store
+        self.quant = quant
+        self.cache_wo_a = cache_wo_a
+        self.engram = None
+        self._device = "cpu"
+        self.profile = False
+        self._stream_cache = None   # (owner, attr) -> device tensor (reused by copy_)
+        self._cpu_refs = None       # original CPU tensors, restored on to("cpu")
+        if hashes is not None and layer_id in cfg.engram_layer_ids:
+            shard = store.shard_of(f"layers.{layer_id}.engram.embed.weight")
+            if (store.model_dir / shard).exists():
+                from .engram import Engram
+                self.engram = Engram(store, layer_id, cfg, hashes)
         self.hc_mult = cfg.hc_mult
         self.hc_sinkhorn_iters = cfg.hc_sinkhorn_iters
         self.hc_eps = cfg.hc_eps
         if cfg.compress_ratios[layer_id] == 0:
-            self.attn = MLAWindowAttention(store, layer_id, cfg)
+            self.attn = MLAWindowAttention(store, layer_id, cfg, quant=quant, cache_wo_a=cache_wo_a)
         else:
-            self.attn = MLACompressedAttention(store, layer_id, cfg)
+            self.attn = MLACompressedAttention(store, layer_id, cfg, quant=quant)
         self.ffn = MoE(store, layer_id, cfg, expert_store=expert_store)
         p = f"layers.{layer_id}."
         self.attn_norm = store.get(p + "attn_norm.weight")
@@ -37,51 +50,112 @@ class Block(HCBlockMixin):
         self.hc_ffn_base = store.get(p + "hc_ffn_base").float()
         self.hc_ffn_scale = store.get(p + "hc_ffn_scale").float()
 
+    def _weight_paths(self):
+        """(owner, attr, tensor) for every weight; runtime state (underscore) excluded."""
+        out = []
+        for name in ("attn_norm", "ffn_norm", "hc_attn_fn", "hc_attn_base", "hc_attn_scale",
+                     "hc_ffn_fn", "hc_ffn_base", "hc_ffn_scale"):
+            out.append((self, name, getattr(self, name)))
+        a = self.attn
+        for name in ("q_norm", "kv_norm", "sink", "freqs_cis"):
+            out.append((a, name, getattr(a, name)))
+        for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
+            ql = getattr(a, name)
+            if hasattr(ql, "weight"):
+                out.append((ql, "weight", ql.weight))
+                out.append((ql, "scale", ql.scale))
+            else:
+                out.append((a, name, ql))
+        comp = getattr(a, "compressor", None)
+        if comp is not None:
+            for name in ("norm_w", "wkv", "wgate"):
+                t = getattr(comp, name, None)
+                if isinstance(t, torch.Tensor):
+                    out.append((comp, name, t))
+        idx = getattr(a, "indexer", None)
+        if idx is not None:
+            for name in ("wq_b", "weights_proj", "wk", "k_norm", "freqs_cis"):
+                t = getattr(idx, name, None)
+                if isinstance(t, torch.Tensor):
+                    out.append((idx, name, t))
+        f = self.ffn
+        for name in ("weight", "bias", "bias_vl"):
+            t = getattr(f.gate, name, None)
+            if isinstance(t, torch.Tensor):
+                out.append((f.gate, name, t))
+        for name in ("w1", "w2", "w3"):
+            t = getattr(f.shared, name, None)
+            if hasattr(t, "weight"):
+                out.append((t, "weight", t.weight))
+                out.append((t, "scale", t.scale))
+            elif isinstance(t, torch.Tensor):
+                out.append((f.shared, name, t))
+        return out
+
     def to(self, device):
-        """Move this block's weights to a device (in place; returns self)."""
-        for name, value in list(vars(self).items()):
-            if isinstance(value, torch.Tensor):
-                setattr(self, name, value.to(device))
-        for mod_name in ("attn", "ffn"):
-            mod = getattr(self, mod_name)
-            for name, value in list(vars(mod).items()):
-                if isinstance(value, torch.Tensor):
-                    setattr(mod, name, value.to(device))
-            if mod_name == "ffn":
-                for name, value in list(vars(mod.shared).items()):
-                    if isinstance(value, torch.Tensor):
-                        setattr(mod.shared, name, value.to(device))
-                for tname in ("weight", "bias", "bias_vl"):
-                    g = getattr(mod.gate, tname, None)
-                    if isinstance(g, torch.Tensor):
-                        setattr(mod.gate, tname, g.to(device))
-            if mod_name == "attn":
-                comp = getattr(mod, "compressor", None)
-                if comp is not None:
-                    for name, value in list(vars(comp).items()):
-                        if isinstance(value, torch.Tensor):
-                            setattr(comp, name, value.to(device))
-                idx = getattr(mod, "indexer", None)
-                if idx is not None:
-                    for name, value in list(vars(idx).items()):
-                        if isinstance(value, torch.Tensor):
-                            setattr(idx, name, value.to(device))
+        """Move/preload this block's weights.
+
+        Weights are read-only at inference time, so moving to CPU only swaps the
+        original CPU tensors back (zero copy). Moving to CUDA copies into cached
+        device tensors (one H2D per token instead of fresh allocations).
+        """
+        if device == self._device:
+            return self
+        paths = self._weight_paths()
+        if device == "cpu":
+            if self._cpu_refs is None:
+                self._device = "cpu"
+                return self
+            for (owner, name, _), ref in zip(paths, self._cpu_refs):
+                setattr(owner, name, ref)
+            self._device = "cpu"
+            return self
+        if self._cpu_refs is None:
+            # pinned host copies so copy_ is a true async DMA (pageable copies serialise)
+            self._cpu_refs = [t.pin_memory() if t.is_cpu and t.device.type == "cpu" else t
+                              for (_, _, t) in paths]
+        # no per-layer cache: a shared slot is managed by the engine (streamed layers
+        # would otherwise keep one device copy each and blow the VRAM budget)
+        for (owner, name, _), cpu in zip(paths, self._cpu_refs):
+            setattr(owner, name, cpu.to(device, non_blocking=True))
+        self._device = device
         return self
 
     def forward(self, x: torch.Tensor, start_pos: int, pre_mix: torch.Tensor):
+        if self.profile:
+            ev = [torch.cuda.Event(enable_timing=True) for _ in range(6)]
+            ev[0].record()
         residual = x
         attn_pre, attn_post, attn_comb = self.hc_mixes(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         h = self.hc_pre(x, pre_mix)
         h = rms_norm(h, self.attn_norm, self.cfg.rms_norm_eps)
+        if self.profile:
+            ev[1].record()
         h = self.attn.forward(h, start_pos)
+        if self.profile:
+            ev[2].record()
         x = self.hc_post(h, residual, attn_post, attn_comb)
 
         residual = x
         ffn_pre, ffn_post, ffn_comb = self.hc_mixes(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
         h = self.hc_pre(x, attn_pre)
         h = rms_norm(h, self.ffn_norm, self.cfg.rms_norm_eps)
+        if self.profile:
+            ev[3].record()
         h = self.ffn.forward(h)
+        if self.profile:
+            ev[4].record()
         x = self.hc_post(h, residual, ffn_post, ffn_comb)
+        if self.profile:
+            ev[5].record()
+            torch.cuda.synchronize()
+            self._parts = {
+                "hc_pre": ev[0].elapsed_time(ev[1]),
+                "attn": ev[1].elapsed_time(ev[2]),
+                "hc_mid": ev[2].elapsed_time(ev[3]),
+                "ffn": ev[3].elapsed_time(ev[4]),
+                "hc_post": ev[4].elapsed_time(ev[5]),
+            }
         return x, ffn_pre
 
 

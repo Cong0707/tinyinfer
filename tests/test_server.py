@@ -8,10 +8,12 @@ stop sequences, sessions/slots, limits, errors, API keys and keep-alives.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,9 +27,15 @@ from tinyinfer.server import (
     BackendError,
     BaseBackend,
     MockBackend,
+    ModelEntry,
+    ModelSpec,
+    MultiModelBackend,
     SlotManager,
     TinyModelBackend,
+    build_backend,
     create_app,
+    detect_adapter_kind,
+    resolve_tier,
 )
 
 
@@ -747,3 +755,371 @@ def test_backend_receives_session_and_slot():
     local.post("/v1/completions", json={"prompt": "transient", "max_tokens": 2})
     assert backend.requests[-1].session_id is None
     assert backend.requests[-1].slot_id is not None
+
+
+# ---------------------------------------------------------------------------
+# Tiers, adapters and multi-model routing
+# ---------------------------------------------------------------------------
+
+
+def test_tier_resolution():
+    conservative = resolve_tier("conservative")
+    balanced = resolve_tier("balanced")
+    assert conservative.level.name == "CONSERVATIVE"
+    assert balanced.level.name == "BALANCED"
+    assert balanced.expert_cache_gb > 0
+    with pytest.raises(ValueError):
+        resolve_tier("aggressive")
+    with pytest.raises(ValueError):
+        resolve_tier("warp")
+    with pytest.raises(ValueError):
+        TinyModelBackend(model_dir=None, tier="extreme")
+
+
+def test_detect_adapter_kind(tmp_path):
+    hf = tmp_path / "hf"
+    hf.mkdir()
+    (hf / "model.safetensors.index.json").write_text("{}", encoding="utf-8")
+    assert detect_adapter_kind(hf) == "hf_deepseek_v41"
+    gguf = tmp_path / "gguf"
+    gguf.mkdir()
+    (gguf / "model-Q4.gguf").write_bytes(b"GGUF")
+    assert detect_adapter_kind(gguf) == "gguf"
+    assert detect_adapter_kind(tmp_path / "empty") == "unknown"
+    assert detect_adapter_kind(None) == "unknown"
+
+
+def test_gguf_adapter_reserved(tmp_path):
+    gguf = tmp_path / "gguf-model"
+    gguf.mkdir()
+    (gguf / "model.gguf").write_bytes(b"GGUF")
+    backend = TinyModelBackend(model_dir=gguf, model_id="gguf-model")
+    app = create_app(backend, request_timeout=10)
+    local = TestClient(app)
+
+    models = {entry["id"]: entry for entry in local.get("/v1/models").json()["data"]}
+    assert models["gguf-model"]["adapter"] == "gguf"
+    assert models["gguf-model"]["supported"] is False
+    assert "GGUF" in models["gguf-model"]["note"]
+
+    response = local.post("/v1/completions", json={"prompt": "x", "max_tokens": 1})
+    assert response.status_code == 501
+    assert response.json()["error"]["code"] == "adapter_not_implemented"
+
+
+def test_build_backend_single_and_multi(tmp_path):
+    mock = build_backend("mock")
+    assert isinstance(mock, MockBackend)
+
+    single = build_backend(
+        "tiny", model_dir=tmp_path / "one", layers=[0], tier="balanced", model_id="one"
+    )
+    assert isinstance(single, TinyModelBackend)
+    assert single.tier_name == "balanced"
+    entry = single.list_models()[0]
+    assert entry["id"] == "one"
+    assert entry["supported"] is False  # no checkpoint files under tmp_path/"one"
+
+    multi = build_backend(
+        "tiny",
+        models=[
+            {"model_id": "alpha", "model_dir": tmp_path / "a"},
+            {"model_id": "beta", "model_dir": tmp_path / "b"},
+        ],
+        default_model="beta",
+        tier="conservative",
+    )
+    assert isinstance(multi, MultiModelBackend)
+    assert multi.default_model == "beta"
+    assert [item["id"] for item in multi.list_models()[:2]] == ["alpha", "beta"]
+
+    with pytest.raises(ValueError):
+        build_backend("tiny", model_dir=tmp_path / "x", tier="extreme")
+
+
+def test_multi_model_endpoint_and_routing():
+    alpha = RecordingBackend()
+    alpha.model_id = "alpha"
+    beta = RecordingBackend()
+    beta.model_id = "beta"
+    backend = MultiModelBackend(
+        [
+            ModelEntry(
+                model_id="alpha",
+                factory=lambda: alpha,
+                adapter="mock",
+                tier="conservative",
+                layers=(0,),
+            ),
+            ModelEntry(
+                model_id="beta",
+                factory=lambda: beta,
+                adapter="gguf",
+                tier="balanced",
+                layers=(0, 1),
+                supported=False,
+                note="GGUF adapter is reserved",
+            ),
+        ],
+        default_model="alpha",
+    )
+    app = create_app(backend, request_timeout=10)
+    local = TestClient(app)
+
+    models = {item["id"]: item for item in local.get("/v1/models").json()["data"]}
+    assert set(models) >= {"alpha", "beta"}
+    assert models["alpha"]["adapter"] == "mock"
+    assert models["alpha"]["layers"] == [0]
+    assert models["beta"]["supported"] is False
+    assert models["beta"]["note"] == "GGUF adapter is reserved"
+
+    response = local.post(
+        "/v1/chat/completions",
+        json={
+            "model": "beta",
+            "messages": [{"role": "user", "content": "route me"}],
+            "max_tokens": 2,
+        },
+    )
+    assert response.status_code == 200
+    assert beta.requests and beta.requests[-1].model == "beta"
+    assert not alpha.requests
+
+    fallback = local.post(
+        "/v1/chat/completions",
+        json={
+            "model": "not-registered",
+            "messages": [{"role": "user", "content": "fallback"}],
+            "max_tokens": 2,
+        },
+    )
+    assert fallback.status_code == 200
+    assert alpha.requests and alpha.requests[-1].model == "not-registered"
+
+
+def test_tiny_slot_kv_ownership():
+    class FakeEngine:
+        def __init__(self):
+            self.kv = {}
+            self.resets = 0
+
+        def reset(self):
+            self.kv = {}
+            self.resets += 1
+
+        def snapshot(self):
+            return dict(self.kv)
+
+        def restore(self, state):
+            self.kv = dict(state)
+
+    backend = TinyModelBackend(model_dir=None, tier="conservative")
+    engine = FakeEngine()
+    backend._model = engine
+    backend._cfg = SimpleNamespace(max_position_embeddings=128)
+    sentinel_three = object()
+    sentinel_four = object()
+
+    backend._bind_slot(3)
+    assert engine.kv == {} and engine.resets == 1
+    engine.kv[0] = sentinel_three
+    backend._stash_slot(3)
+    assert backend._slot_kv[3][0] is sentinel_three
+    assert 4 not in backend._slot_kv
+
+    backend._bind_slot(4)
+    assert engine.kv == {}
+    engine.kv[0] = sentinel_four
+    backend._stash_slot(4)
+
+    backend._bind_slot(3)
+    assert engine.kv[0] is sentinel_three
+
+    backend.reset_slot(3)
+    assert 3 not in backend._slot_kv
+    assert engine.kv == {}
+    assert backend._slot_kv[4][0] is sentinel_four
+
+
+# ---------------------------------------------------------------------------
+# Minimal function calling
+# ---------------------------------------------------------------------------
+
+LOOKUP_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "lookup",
+        "description": "look something up",
+        "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+    },
+}
+CALL_TEXT = '{"name": "lookup", "arguments": {"q": "tinyinfer"}}'
+
+
+def _tools_client(script):
+    return TestClient(create_app(MockBackend(script=script), request_timeout=10))
+
+
+def test_tool_call_non_streaming():
+    client = _tools_client([CALL_TEXT])
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "find tinyinfer"}],
+            "tools": [LOOKUP_TOOL],
+            "tool_choice": "auto",
+            "max_tokens": 8,
+            "seed": 1,
+        },
+    )
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    message = choice["message"]
+    assert message["content"] is None
+    call = message["tool_calls"][0]
+    assert call["type"] == "function"
+    assert call["id"].startswith("call_")
+    assert call["function"]["name"] == "lookup"
+    assert json.loads(call["function"]["arguments"]) == {"q": "tinyinfer"}
+
+
+def test_tool_call_streaming():
+    client = _tools_client([CALL_TEXT])
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "find tinyinfer"}],
+            "tools": [LOOKUP_TOOL],
+            "max_tokens": 8,
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    chunks = sse_payloads(response.text)
+    tool_chunks = [
+        chunk
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0]["delta"].get("tool_calls")
+    ]
+    assert len(tool_chunks) == 1
+    call = tool_chunks[0]["choices"][0]["delta"]["tool_calls"][0]
+    assert call["function"]["name"] == "lookup"
+    assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    content_chunks = [
+        chunk
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0]["delta"].get("content")
+    ]
+    assert content_chunks == []
+
+
+def test_tool_call_unknown_name_keeps_text():
+    client = _tools_client(['{"name": "unregistered", "arguments": {}}'])
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [LOOKUP_TOOL],
+            "max_tokens": 8,
+        },
+    )
+    choice = response.json()["choices"][0]
+    assert "tool_calls" not in choice["message"]
+    assert choice["message"]["content"].startswith('{"name": "unregistered"')
+    assert choice["finish_reason"] != "tool_calls"
+
+
+def test_tools_streaming_plain_text_is_buffered():
+    client = _tools_client(["hello", " world"])
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [LOOKUP_TOOL],
+            "max_tokens": 8,
+            "stream": True,
+        },
+    )
+    chunks = sse_payloads(response.text)
+    assert chat_text(chunks) == "hello world"
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_tool_choice_none_disables_extraction():
+    client = _tools_client([CALL_TEXT])
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [LOOKUP_TOOL],
+            "tool_choice": "none",
+            "max_tokens": 8,
+        },
+    )
+    choice = response.json()["choices"][0]
+    assert "tool_calls" not in choice["message"]
+    assert choice["message"]["content"] == CALL_TEXT
+
+
+# ---------------------------------------------------------------------------
+# Optional: real L0 weights end-to-end (set TINYINFER_L0=1 to enable)
+# ---------------------------------------------------------------------------
+
+L0_DIR = ROOT / "cache" / "weights"
+L0_READY = (
+    (L0_DIR / "model-00003-of-00048.safetensors").is_file()
+    and (L0_DIR / "model-00002-of-00048.safetensors").is_file()
+    and (L0_DIR / "model-00043-of-00048.safetensors").is_file()
+)
+
+
+@pytest.mark.skipif(
+    not (os.environ.get("TINYINFER_L0") and L0_READY),
+    reason="set TINYINFER_L0=1 with the L0/embed/head shards present",
+)
+def test_l0_real_weights_end_to_end():
+    backend = TinyModelBackend(
+        model_dir=L0_DIR, layers=[0], tier="conservative", model_id="deepseek-v41-l0"
+    )
+    app = create_app(backend, request_timeout=300, max_slots=2)
+    with TestClient(app) as client:
+        models = {item["id"]: item for item in client.get("/v1/models").json()["data"]}
+        assert models["deepseek-v41-l0"]["loaded"] is True
+        assert models["deepseek-v41-l0"]["adapter"] == "deepseek_v41_hf"
+        assert models["deepseek-v41-l0"]["context_length"] == 1_048_576
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "hello tinyinfer"}],
+                "max_tokens": 3,
+                "seed": 7,
+                "session_id": "l0-session",
+            },
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["usage"]["completion_tokens"] == 3
+        assert body["usage"]["prompt_tokens"] > 0
+        assert isinstance(body["choices"][0]["message"]["content"], str)
+
+        streamed = client.post(
+            "/v1/completions",
+            json={
+                "prompt": "hello",
+                "max_tokens": 2,
+                "stream": True,
+                "session_id": "l0-session",
+            },
+        )
+        assert streamed.status_code == 200
+        assert streamed.text.rstrip().endswith("data: [DONE]")
+
+        slots = client.get("/v1/slots").json()
+        by_session = {
+            slot["session_id"]: slot for slot in slots["slots"] if slot["session_id"]
+        }
+        assert "l0-session" in by_session
+        assert by_session["l0-session"]["n_prompt_tokens"] > 0
+        assert backend._slot_kv

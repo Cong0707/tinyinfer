@@ -23,6 +23,21 @@ def window_idxs_prefill(seqlen: int, window: int, device=None) -> torch.Tensor:
     return idxs.int()
 
 
+def window_idxs_general(start_pos: int, seqlen: int, old_len: int, window: int, device=None) -> torch.Tensor:
+    """Window slots for a chunk inside a linear KV history.
+
+    kv_att = [old_history (old_len, oldest first), new_chunk (seqlen)]; a query at global
+    position p attends to [max(0, p-window+1) .. p]. Returns [seqlen, window] int32 (-1 = empty).
+    """
+    qpos = torch.arange(start_pos, start_pos + seqlen, device=device)
+    back = torch.arange(window - 1, -1, -1, device=device)
+    gpos = qpos[:, None] - back[None, :]  # [s, window] window start..p
+    base = start_pos - old_len
+    idx = gpos - base
+    valid = (gpos >= 0) & (idx >= 0) & (idx < old_len + seqlen)
+    return torch.where(valid, idx, torch.full_like(idx, -1)).int()
+
+
 def sparse_attn_ref(
     q: torch.Tensor, kv: torch.Tensor, sink: torch.Tensor, idxs: torch.Tensor, scale: float
 ) -> torch.Tensor:
@@ -58,6 +73,26 @@ def softmax_sample(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tens
     logits = logits / max(temperature, 1e-5)
     probs = torch.softmax(logits.float(), dim=-1)
     return probs.div_(torch.empty_like(probs).exponential_(1)).argmax(dim=-1)
+
+
+def sample_logits(logits: torch.Tensor, temperature: float = 0.0, top_p: float = 1.0, top_k: int = 0) -> int:
+    """Greedy (temperature 0) or temperature/top-p/top-k sampling."""
+    if temperature <= 0:
+        return int(logits.argmax(dim=-1))
+    logits = logits.float() / temperature
+    if top_k and top_k > 0:
+        k = min(top_k, logits.numel())
+        v, _ = torch.topk(logits, k)
+        logits = logits.masked_fill(logits < v[-1], float("-inf"))
+    probs = torch.softmax(logits, dim=-1)
+    if top_p < 1.0:
+        sorted_p, order = torch.sort(probs, descending=True)
+        cum = torch.cumsum(sorted_p, dim=-1)
+        keep = cum - sorted_p < top_p
+        sorted_p = torch.where(keep, sorted_p, torch.zeros_like(sorted_p))
+        probs = torch.zeros_like(probs).scatter_(0, order, sorted_p)
+        probs = probs / probs.sum().clamp_min(1e-12)
+    return int(torch.multinomial(probs, 1))
 
 
 def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) -> torch.Tensor:

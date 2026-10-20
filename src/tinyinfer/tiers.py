@@ -46,7 +46,7 @@ def plan(level: OptLevel = OptLevel.BALANCED, vram_gb: float = 8.0, ram_gb: floa
         return TierConfig(
             level=level, use_tilelang_attn=True, use_fp8_gemm=False, use_fp4_gemm=False,
             keep_weights_quantized=True, expert_cache_gb=cache, kv_bits=16,
-            prefetch=False, prefetch_k=0, mtp=False, head_on_cpu=True,
+            prefetch=False, prefetch_k=0, mtp=False, head_on_cpu=False,
             approximations={}, notes="tilelang attention + tiered expert storage; no speculation")
     if level == OptLevel.AGGRESSIVE:
         return TierConfig(

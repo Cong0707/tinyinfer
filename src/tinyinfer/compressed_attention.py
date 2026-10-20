@@ -1,7 +1,7 @@
-"""MLA attention with compressed/global KV (compress_ratio > 0), plain PyTorch.
+"""MLA attention with compressed KV (compress_ratio > 0), chunked-prefill capable.
 
-Combines the sliding-window KV with the shared compressed KV cache and the indexer's
-top-k positions, mirroring official Attention.forward for layers 2..39.
+Window KV uses a linear rolling history; compressed KV is a global group-indexed cache
+shared from kv_source layers. Supports arbitrary (start_pos, seqlen) chunks and decode.
 """
 from __future__ import annotations
 
@@ -11,16 +11,18 @@ import torch.nn.functional as F
 from .compressor import Compressor, Indexer, shared_attn
 from .config import TinyConfig
 from .kernels import sparse_attn_dispatch
-from .nn import apply_rope, precompute_freqs_cis, rms_norm, window_idxs_prefill
+from .linear import QuantLinear
+from .nn import apply_rope, precompute_freqs_cis, rms_norm, window_idxs_general
 from .quant import dequant_fp8_block
 from .weights import ShardStore
 
 
 class MLACompressedAttention:
-    def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig):
+    def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, *, quant: bool = False):
         p = f"layers.{layer_id}.attn."
         self.layer_id = layer_id
         self.cfg = cfg
+        self.quant = quant
         self.eps = cfg.rms_norm_eps
         self.n_heads = cfg.n_heads
         self.head_dim = cfg.head_dim
@@ -34,11 +36,18 @@ class MLACompressedAttention:
         self.is_index_source = layer_id in cfg.index_source_layer_ids
         self.scale = self.head_dim ** -0.5
 
-        self.wq_a = dequant_fp8_block(store.get(p + "wq_a.weight"), store.get(p + "wq_a.scale"))
-        self.wq_b = dequant_fp8_block(store.get(p + "wq_b.weight"), store.get(p + "wq_b.scale"))
-        self.wkv = dequant_fp8_block(store.get(p + "wkv.weight"), store.get(p + "wkv.scale"))
-        self.wo_a = dequant_fp8_block(store.get(p + "wo_a.weight"), store.get(p + "wo_a.scale"))
-        self.wo_b = dequant_fp8_block(store.get(p + "wo_b.weight"), store.get(p + "wo_b.scale"))
+        if quant:
+            self.wq_a = QuantLinear(store.get(p + "wq_a.weight"), store.get(p + "wq_a.scale"))
+            self.wq_b = QuantLinear(store.get(p + "wq_b.weight"), store.get(p + "wq_b.scale"))
+            self.wkv = QuantLinear(store.get(p + "wkv.weight"), store.get(p + "wkv.scale"))
+            self.wo_a = QuantLinear(store.get(p + "wo_a.weight"), store.get(p + "wo_a.scale"))
+            self.wo_b = QuantLinear(store.get(p + "wo_b.weight"), store.get(p + "wo_b.scale"))
+        else:
+            self.wq_a = dequant_fp8_block(store.get(p + "wq_a.weight"), store.get(p + "wq_a.scale"))
+            self.wq_b = dequant_fp8_block(store.get(p + "wq_b.weight"), store.get(p + "wq_b.scale"))
+            self.wkv = dequant_fp8_block(store.get(p + "wkv.weight"), store.get(p + "wkv.scale"))
+            self.wo_a = dequant_fp8_block(store.get(p + "wo_a.weight"), store.get(p + "wo_a.scale"))
+            self.wo_b = dequant_fp8_block(store.get(p + "wo_b.weight"), store.get(p + "wo_b.scale"))
         self.q_norm = store.get(p + "q_norm.weight")
         self.kv_norm = store.get(p + "kv_norm.weight")
         self.sink = store.get(p + "attn_sink").float()
@@ -53,14 +62,46 @@ class MLACompressedAttention:
             32.0,
             1.0,
         )
-        self.compressor = Compressor(store, layer_id, cfg) if self.is_kv_source else None
+        self.compressor = Compressor(store, layer_id, cfg, quant=quant) if self.is_kv_source else None
         self.indexer = Indexer(store, layer_id, cfg, self.freqs_cis) if self.is_index_source else None
-        self._kv_cache: torch.Tensor | None = None          # window ring buffer
-        self._compress_kv: torch.Tensor | None = None       # own compressed KV (source layers)
+        # per-layer runtime state (shared streaming slots serve several layers)
+        self._states: dict[int, dict] = {}
+        self._active_layer = 0
+
+    def _st(self) -> dict:
+        st = self._states.get(self._active_layer)
+        if st is None:
+            st = self._states[self._active_layer] = {}
+        return st
+
+    @property
+    def _kv_window(self):
+        return self._st().get("kv")
+
+    @_kv_window.setter
+    def _kv_window(self, value):
+        self._st()["kv"] = value
+
+    @property
+    def _compress_kv(self):
+        return self._st().get("ckv")
+
+    @_compress_kv.setter
+    def _compress_kv(self, value):
+        self._st()["ckv"] = value
+
+    @property
+    def _decode_win_idxs(self):
+        return self._st().get("idxs")
+
+    @_decode_win_idxs.setter
+    def _decode_win_idxs(self, value):
+        self._st()["idxs"] = value
 
     def reset(self) -> None:
-        self._kv_cache = None
+        self._kv_window = None
         self._compress_kv = None
+        self._decode_win_idxs = None
         if self.compressor is not None:
             self.compressor.reset()
         if self.indexer is not None:
@@ -70,81 +111,90 @@ class MLACompressedAttention:
         shared_attn.topk_idxs = None
         shared_attn.candidates = None
 
-    def _decode_idxs(self, start_pos: int, b: int, device) -> torch.Tensor:
-        oldest = start_pos % self.window + 1
-        idx = torch.cat([torch.arange(oldest, self.window, device=device),
-                         torch.arange(0, oldest, device=device)])
-        idx = torch.where(idx > start_pos, torch.full_like(idx, -1), idx)
-        return idx.int().view(1, 1, -1).expand(b, -1, -1).contiguous()
+    def to(self, device):
+        for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
+            mod = getattr(self, name)
+            if hasattr(mod, "to"):
+                mod.to(device)
+            else:
+                setattr(self, name, mod.to(device))
+        for name in ("q_norm", "kv_norm", "sink"):
+            setattr(self, name, getattr(self, name).to(device))
+        self.freqs_cis = self.freqs_cis.to(device)
+        if self.compressor is not None:
+            self.compressor.to(device)
+        if self.indexer is not None:
+            self.indexer.to(device)
+        return self
 
     def forward(self, x: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
         b, s, _ = x.shape
+        if self.compressor is not None:
+            self.compressor._active_layer = self._active_layer
+        if self.indexer is not None:
+            self.indexer._active_layer = self._active_layer
         freqs = self.freqs_cis[start_pos:start_pos + s]
 
-        qr = rms_norm(F.linear(x, self.wq_a), self.q_norm, self.eps)
-        q = F.linear(qr, self.wq_b).view(b, s, self.n_heads, self.head_dim)
+        def _lin(w, x_):
+            return w.forward(x_) if hasattr(w, "forward") else F.linear(x_, w)
+
+        qr = rms_norm(_lin(self.wq_a, x), self.q_norm, self.eps)
+        q = _lin(self.wq_b, qr).view(b, s, self.n_heads, self.head_dim)
         apply_rope(q[..., -self.rope_dim:], freqs)
 
-        kv = rms_norm(F.linear(x, self.wkv), self.kv_norm, self.eps)
+        kv = rms_norm(_lin(self.wkv, x), self.kv_norm, self.eps)
         apply_rope(kv[..., -self.rope_dim:], freqs)
 
-        if self._kv_cache is None or self._kv_cache.shape[0] != b:
-            self._kv_cache = torch.zeros(b, self.window, self.head_dim, dtype=kv.dtype, device=kv.device)
-        if start_pos == 0:
-            if s <= self.window:
-                self._kv_cache[:, :s] = kv
-            else:
-                cutoff = s % self.window
-                tail = kv[:, -self.window:]
-                self._kv_cache[:, cutoff:self.window] = tail[:, : self.window - cutoff]
-                self._kv_cache[:, :cutoff] = tail[:, self.window - cutoff:]
-            window_kv = kv
-            idxs = window_idxs_prefill(s, self.window, device=x.device).unsqueeze(0).expand(b, -1, -1).contiguous()
+        old = self._kv_window if self._kv_window is not None else kv.new_empty(b, 0, self.head_dim)
+        kv_w = torch.cat([old, kv], dim=1)
+        full = s == 1 and old.size(1) == self.window
+        if full and self._decode_win_idxs is not None:
+            win_idxs = self._decode_win_idxs
         else:
-            self._kv_cache[:, start_pos % self.window] = kv[:, 0]
-            window_kv = self._kv_cache
-            idxs = self._decode_idxs(start_pos, b, x.device)
+            win_idxs = window_idxs_general(start_pos, s, old.size(1), self.window, x.device).unsqueeze(0).expand(b, -1, -1)
+            if full:
+                self._decode_win_idxs = win_idxs
+        self._kv_window = kv_w[:, -self.window:].contiguous()
 
         # ---- compressed KV ----
         end_pos = start_pos + s
         compress_len = end_pos // self.ratio
         latent = self.compressor.forward(x, start_pos) if self.compressor is not None else None
         if latent is not None:
-            if start_pos == 0:
-                cfreqs = self.freqs_cis[: s - s % self.ratio : self.ratio]
-            else:
-                cfreqs = self.freqs_cis[start_pos + 1 - self.ratio].unsqueeze(0)
-            apply_rope(latent[..., -self.rope_dim:], cfreqs)
-            need = max(end_pos // self.ratio, latent.size(1), 1)
+            start_group = start_pos // self.ratio
+            need = start_group + latent.size(1)
             if self._compress_kv is None or self._compress_kv.shape[1] < need:
-                old = self._compress_kv
-                self._compress_kv = torch.zeros(b, need, self.head_dim, dtype=latent.dtype, device=latent.device)
-                if old is not None:
-                    self._compress_kv[:, : old.size(1)] = old
-            self._compress_kv[:, start_pos // self.ratio : start_pos // self.ratio + latent.size(1)] = latent
+                grown = torch.zeros(b, need, self.head_dim, dtype=latent.dtype, device=latent.device)
+                if self._compress_kv is not None:
+                    grown[:, : self._compress_kv.shape[1]] = self._compress_kv
+                self._compress_kv = grown
+            self._compress_kv[:, start_group : start_group + latent.size(1)] = latent
             shared_attn.compress_kv = self._compress_kv
         if compress_len <= 0:
-            compress_kv = None
-            compress_idxs = None
+            compress_kv = compress_idxs = None
         else:
             compress_kv = shared_attn.compress_kv[:, :compress_len]
             if self.indexer is not None:
-                compress_idxs = self.indexer.forward(x, qr, latent, start_pos, window_kv.size(1))
+                compress_idxs = self.indexer.forward(x, qr, latent, start_pos, kv_w.size(1))
                 shared_attn.topk_idxs = compress_idxs
             else:
                 compress_idxs = shared_attn.topk_idxs
 
         if compress_idxs is not None and compress_idxs.size(-1) > 0:
-            kv_all = torch.cat([window_kv, compress_kv], dim=1)
-            idxs_all = torch.cat([idxs, compress_idxs], dim=-1)
+            kv_all = torch.cat([kv_w, compress_kv], dim=1)
+            idxs_all = torch.cat([win_idxs, compress_idxs], dim=-1)
         else:
-            kv_all = window_kv
-            idxs_all = idxs
+            kv_all, idxs_all = kv_w, win_idxs
 
         o = sparse_attn_dispatch(q, kv_all, self.sink, idxs_all, self.scale)
         apply_rope(o[..., -self.rope_dim:], freqs, inverse=True)
 
         o = o.view(b, s, self.o_groups, -1)
-        wo_a = self.wo_a.view(self.o_groups, self.o_lora_rank, -1)
+        if hasattr(self.wo_a, "weight"):  # fp8 resident: dequant just this grouped GEMM
+            from .quant import dequant_fp8_block
+            wo_a = dequant_fp8_block(self.wo_a.weight, self.wo_a.scale)
+        else:
+            wo_a = self.wo_a
+        wo_a = wo_a.view(self.o_groups, self.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
-        return F.linear(o.flatten(2), self.wo_b)
+        return _lin(self.wo_b, o.flatten(2))

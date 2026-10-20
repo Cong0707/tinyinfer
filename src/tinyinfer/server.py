@@ -48,7 +48,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Literal, Protocol, Sequence, runtime_checkable
+from typing import Any, Callable, Iterator, Literal, Mapping, Protocol, Sequence, runtime_checkable
 
 try:  # fastapi lives in the optional "server" extra
     from fastapi import FastAPI, Request
@@ -69,6 +69,9 @@ logger = logging.getLogger("tinyinfer.server")
 __all__ = [
     "APIError",
     "Backend",
+    "ModelEntry",
+    "ModelSpec",
+    "MultiModelBackend",
     "BackendError",
     "BaseBackend",
     "GenerationRequest",
@@ -81,8 +84,11 @@ __all__ = [
     "Usage",
     "build_backend",
     "create_app",
+    "detect_adapter_kind",
     "main",
+    "models_from_args",
     "parse_layers",
+    "resolve_tier",
 ]
 
 DEFAULT_CONTEXT_TOKENS = 1_048_576  # 1M, the DeepSeek-V4.1-Flash context window
@@ -461,44 +467,131 @@ class MockBackend(BaseBackend):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Adapter helpers
+# ---------------------------------------------------------------------------
+
+_TIER_KEYS = ("conservative", "balanced", "aggressive", "extreme")
+
+
+def resolve_tier(tier: str):
+    """Return a tinyinfer.tiers.TierConfig for a supported reference tier.
+
+    Only conservative and balanced are wired into the current PyTorch path;
+    aggressive/extreme are accepted by tinyinfer.tiers but need kernels,
+    quantized KV and speculation that the reference driver does not use yet.
+    """
+    from .tiers import OptLevel, plan
+
+    key = str(tier or "conservative").strip().lower()
+    levels = {
+        "conservative": OptLevel.CONSERVATIVE,
+        "balanced": OptLevel.BALANCED,
+        "aggressive": OptLevel.AGGRESSIVE,
+        "extreme": OptLevel.EXTREME,
+    }
+    if key not in levels:
+        raise ValueError(f"unknown tier {tier!r}; choose from {sorted(levels)}")
+    level = levels[key]
+    if level not in (OptLevel.CONSERVATIVE, OptLevel.BALANCED):
+        raise ValueError(
+            f"tier {key!r} is not wired into the reference path yet; "
+            "use 'conservative' or 'balanced'"
+        )
+    return plan(level)
+
+
+def detect_adapter_kind(model_dir: str | Path | None) -> str:
+    """Best-effort checkpoint layout detection, without loading any weights."""
+    if model_dir is None:
+        return "unknown"
+    directory = Path(model_dir)
+    if (directory / "model.safetensors.index.json").is_file():
+        return "hf_deepseek_v41"
+    if any(directory.glob("*.gguf")):
+        return "gguf"
+    return "unknown"
+
+
+def _adapter_support(adapter: str, model_dir: str | Path | None) -> tuple[bool, str | None]:
+    kind = detect_adapter_kind(model_dir) if adapter in ("auto", "", None) else str(adapter)
+    if kind == "hf_deepseek_v41":
+        return True, None
+    if kind == "gguf":
+        return False, "GGUF adapter is reserved (see tinyinfer.adapters.open_adapter)"
+    if kind == "unknown":
+        return False, "unrecognized checkpoint layout (need model.safetensors.index.json)"
+    return False, f"adapter {kind!r} is not implemented"
+
+
+# ---------------------------------------------------------------------------
+# tinyinfer backend (adapter-driven reference path)
+# ---------------------------------------------------------------------------
+
+
 class TinyModelBackend(BaseBackend):
-    """Backend that drives the reference tinyinfer.model.TinyModel.
+    """Backend that drives tinyinfer.model.TinyModel through an adapter.
 
-    Loading is lazy and explicit: warmup() (called by serve) or the first
-    generate/count_prompt_tokens call builds the ShardStore, TinyConfig and
-    TinyModel for the configured model directory and layer list.  It is
-    intentionally conservative: it runs the PyTorch reference path on CPU, one
-    request at a time.
+    The checkpoint layout and weights come from
+    tinyinfer.adapters.open_adapter(): HF safetensors for deepseek_v41 is the
+    implemented adapter, GGUF is reserved (open_adapter reports it as not
+    implemented and the server surfaces a clear 501).
 
-    Per-slot cache ownership is reserved but not implemented yet: the reference
-    attention layers keep a single KV ring buffer, so reset_slot resets it and
-    concurrent requests are serialised with a lock.  When the engine gains
-    per-slot KV/expert caches this is the class to wire them into.
+    Tiers: "conservative" is the plain PyTorch reference path; "balanced"
+    additionally streams routed experts through tinyinfer.loading.ExpertStore
+    (bounded RAM expert cache) and lets the attention dispatcher use tilelang
+    when the environment can build it.  Both tiers run on CPU here; device
+    placement and per-slot KV reuse at CUDA speed come with the engine work.
+
+    Slots: every request is generated with the KV ring buffers restored from
+    that slot's snapshot, and the resulting caches are stored back when the
+    request ends.  The OpenAI API is stateless (the prompt always carries the
+    whole conversation), so a request still prefills from token 0; the slot
+    snapshot is the ownership/isolation boundary and the hook for future
+    resume-from-prefix support.  reset_slot() drops a slot's KV and (bounded)
+    expert cache.
     """
 
     def __init__(
         self,
         model_dir: str | Path | None = None,
         *,
+        adapter: str = "auto",
         layers: Sequence[int] | None = None,
+        tier: str = "conservative",
         device: str = "auto",
         model_id: str | None = None,
         tokenizer: Any | None = None,
         aliases: Sequence[str] = ("tinyinfer",),
         load_at_init: bool = False,
+        max_cached_experts: int = 64,
+        expert_cache_gb: float | None = None,
     ) -> None:
         self.model_dir = Path(model_dir) if model_dir is not None else None
         self.layers = list(layers) if layers is not None else None
         self.requested_device = device if device in ("auto", "cpu", "cuda") else "auto"
+        self.requested_adapter = adapter or "auto"
+        self.tier_name = str(tier or "conservative").strip().lower()
+        self._tier = resolve_tier(self.tier_name)
         self.model_id = model_id or (
             self.model_dir.name if self.model_dir else "tinyinfer-deepseek-v4.1-flash"
         )
         self.aliases = tuple(dict.fromkeys((self.model_id, *aliases)))
+        self.max_cached_experts = max(1, int(max_cached_experts))
+        self.expert_cache_gb = None if expert_cache_gb is None else float(expert_cache_gb)
         self._tokenizer = tokenizer
         self._model = None
         self._cfg = None
         self._store = None
         self._torch = None
+        self._adapter = None
+        self.adapter_name = (
+            detect_adapter_kind(self.model_dir)
+            if self.requested_adapter in ("auto", "", None)
+            else self.requested_adapter
+        )
+        self._expert_store = None
+        self._slot_kv: dict[int, dict[int, Any]] = {}
         self._lock = threading.Lock()
         self._gen_lock = threading.Lock()
         if load_at_init:
@@ -510,26 +603,71 @@ class TinyModelBackend(BaseBackend):
         return self._model is not None
 
     def health(self) -> dict[str, Any]:
+        model = self._model
         return {
             "backend": "TinyModelBackend",
             "model": self.model_id,
+            "adapter": self.adapter_name,
+            "tier": self.tier_name,
+            "layers": self.layers,
             "ready": self.ready,
             "model_dir": str(self.model_dir) if self.model_dir else None,
-            "layers": self.layers,
-            "device": "cpu (reference PyTorch path)",
+            "device": getattr(model, "device", "cpu") if model is not None else "cpu",
+            "gpu_layers_budget": getattr(model, "gpu_layers", None) if model is not None else None,
+            "engine_stats": model.stats() if model is not None and hasattr(model, "stats") else None,
             "tokenizer": type(self._tokenizer).__name__ if self._tokenizer is not None else None,
+            "slot_caches": len(self._slot_kv),
+            "expert_store": self._expert_store is not None,
         }
+
+    def list_models(self) -> list[dict[str, Any]]:
+        if self._adapter is not None:
+            kind = getattr(self._adapter, "name", self.adapter_name)
+            supported, note = True, None
+            context = (
+                int(self._cfg.max_position_embeddings)
+                if self._cfg is not None
+                else None
+            )
+        else:
+            kind = self.adapter_name
+            supported, note = _adapter_support(kind, self.model_dir)
+            context = None
+        entry = {
+            "id": self.model_id,
+            "adapter": kind,
+            "tier": self.tier_name,
+            "layers": list(self.layers) if self.layers is not None else None,
+            "model_dir": str(self.model_dir) if self.model_dir else None,
+            "loaded": self._model is not None,
+            "supported": supported,
+            "context_length": context,
+        }
+        if note:
+            entry["note"] = note
+        models = [entry]
+        for alias in self.aliases:
+            if alias != self.model_id:
+                models.append({**entry, "id": alias, "alias_of": self.model_id})
+        return models
 
     def close(self) -> None:
         self._model = None
         self._cfg = None
-        store = self._store
-        self._store = None
+        self._slot_kv.clear()
+        expert_store, self._expert_store = self._expert_store, None
+        if expert_store is not None:
+            try:
+                expert_store.close()
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("closing expert store failed", exc_info=True)
+        store, self._store = self._store, None
         if store is not None:
             try:
                 store.close()
             except Exception:  # pragma: no cover - defensive
                 logger.debug("closing shard store failed", exc_info=True)
+        self._adapter = None
 
     def _check_files(self) -> None:
         if self.model_dir is None:
@@ -537,6 +675,27 @@ class TinyModelBackend(BaseBackend):
                 "TinyModelBackend has no model_dir; start the server with --model-dir DIR",
                 status_code=503,
                 code="model_not_loaded",
+            )
+        if not self.model_dir.is_dir():
+            raise BackendError(
+                f"model directory not found: {self.model_dir}",
+                status_code=503,
+                code="model_not_loaded",
+            )
+        kind = detect_adapter_kind(self.model_dir)
+        if self.requested_adapter == "gguf" or kind == "gguf":
+            raise BackendError(
+                "the GGUF adapter is reserved but not implemented yet "
+                "(tinyinfer.adapters.open_adapter reports GGUF as planned); "
+                "use an HF safetensors checkpoint",
+                status_code=501,
+                code="adapter_not_implemented",
+            )
+        if self.requested_adapter not in ("auto", "hf", "hf_deepseek_v41", "deepseek_v41"):
+            raise BackendError(
+                f"adapter {self.requested_adapter!r} is not implemented",
+                status_code=501,
+                code="adapter_not_implemented",
             )
         if not (self.model_dir / "config.json").is_file():
             raise BackendError(
@@ -553,7 +712,7 @@ class TinyModelBackend(BaseBackend):
             )
 
     def load(self) -> None:
-        """Load config, sharded weights and tokenizer (idempotent)."""
+        """Detect the adapter, load the selected layers and the tokenizer."""
         if self._model is not None:
             return
         with self._lock:
@@ -562,36 +721,86 @@ class TinyModelBackend(BaseBackend):
             self._check_files()
             try:
                 import torch
-                from .config import TinyConfig
+                from .adapters import open_adapter
                 from .model import TinyModel
-                from .weights import ShardStore
             except Exception as exc:  # pragma: no cover - torch is installed in the venv
                 raise BackendError(
                     f"cannot import the tinyinfer reference implementation: {exc}",
                     status_code=503,
                     code="model_not_loaded",
                 ) from exc
-            cfg = TinyConfig.from_hf(self.model_dir)
-            layer_ids = list(range(cfg.n_layers)) if self.layers is None else list(self.layers)
-            store = ShardStore(self.model_dir)
             try:
-                model = TinyModel(store, cfg, layer_ids)
-            except Exception as exc:
-                try:
-                    store.close()
-                except Exception:  # pragma: no cover
-                    pass
+                adapter = open_adapter(self.model_dir)
+            except NotImplementedError as exc:
                 raise BackendError(
-                    f"failed to load tinyinfer model from {self.model_dir}: {exc}",
-                    status_code=500,
-                    code="model_load_failed",
+                    str(exc), status_code=501, code="adapter_not_implemented"
                 ) from exc
+            except (FileNotFoundError, ValueError) as exc:
+                raise BackendError(
+                    f"cannot open checkpoint {self.model_dir}: {exc}",
+                    status_code=503,
+                    code="model_not_loaded",
+                ) from exc
+            cfg = adapter.load_config()
+            store = getattr(adapter, "store", None)
+            if store is None:
+                raise BackendError(
+                    f"adapter {getattr(adapter, 'name', type(adapter).__name__)!r} cannot "
+                    "drive tinyinfer.model.TinyModel yet (no ShardStore)",
+                    status_code=501,
+                    code="adapter_not_supported",
+                )
+            layer_ids = list(range(cfg.n_layers)) if self.layers is None else list(self.layers)
             if self._tokenizer is None:
                 self._tokenizer = self._load_tokenizer()
-            self._torch = torch
+            expert_store = self._make_expert_store(store)
+            from .engine import Engine
+
+            device = self.requested_device
+            if device == "auto":
+                try:
+                    device = "cuda" if torch.cuda.is_available() else "cpu"
+                except Exception:
+                    device = "cpu"
+            model = Engine(
+                adapter,
+                tier=self._tier,
+                expert_store=expert_store,
+                device=device,
+                tokenizer=self._tokenizer,
+                layers=layer_ids,
+            )
+            self._adapter = adapter
+            self.adapter_name = getattr(adapter, "name", type(adapter).__name__)
             self._cfg = cfg
             self._store = store
             self._model = model
+            self._torch = torch
+
+    def _make_expert_store(self, store):
+        from .tiers import OptLevel
+
+        if self._tier.level == OptLevel.CONSERVATIVE:
+            return None
+        try:
+            from .loading import ExpertStore
+
+            cache_gb = (
+                self.expert_cache_gb
+                if self.expert_cache_gb is not None
+                else float(self._tier.expert_cache_gb)
+            )
+            expert_store = ExpertStore.from_store(
+                store, cache_bytes=max(256 << 20, int(cache_gb * (1 << 30)))
+            )
+        except Exception:
+            logger.warning(
+                "balanced tier: ExpertStore unavailable; falling back to direct shard reads",
+                exc_info=True,
+            )
+            return None
+        self._expert_store = expert_store
+        return expert_store
 
     def warmup(self) -> None:
         self.load()
@@ -609,6 +818,11 @@ class TinyModelBackend(BaseBackend):
                 status_code=503,
                 code="tokenizer_load_failed",
             ) from exc
+
+    def context_limit(self, request: GenerationRequest | None = None) -> int | None:
+        if self._cfg is None:
+            self.load()
+        return int(self._cfg.max_position_embeddings) if self._cfg is not None else None
 
     # -- prompt handling ---------------------------------------------------
     def render_prompt(self, request: GenerationRequest) -> str:
@@ -658,6 +872,40 @@ class TinyModelBackend(BaseBackend):
             ids.update(int(value) for value in values if isinstance(value, int))
         return ids
 
+    # -- slot KV ownership -------------------------------------------------
+    def _bind_slot(self, slot_id: int) -> None:
+        if self._model is None:
+            return
+        state = self._slot_kv.get(slot_id)
+        if state is None:
+            self._model.reset()
+        else:
+            self._model.restore(state)
+
+    def _stash_slot(self, slot_id: int) -> None:
+        if self._model is not None:
+            self._slot_kv[slot_id] = self._model.snapshot()
+
+    def _trim_expert_cache(self) -> None:
+        limit = self.max_cached_experts
+        blocks = getattr(self._model, "_blocks", None)
+        if not blocks:
+            return
+        for block in list(blocks.values()):
+            cache = block.ffn._expert_cache
+            if not cache:
+                continue
+            while len(cache) > limit:
+                cache.pop(next(iter(cache)))
+
+    def reset_slot(self, slot_id: int) -> None:
+        """Drop the KV snapshot and bounded expert cache for one slot."""
+        with self._gen_lock:
+            self._slot_kv.pop(slot_id, None)
+            if self._model is not None:
+                self._model.reset()
+                self._trim_expert_cache()
+
     # -- generation --------------------------------------------------------
     def _sample_token(self, logits, sampling: SamplingParams, generator) -> int:
         torch = self._torch
@@ -683,21 +931,6 @@ class TinyModelBackend(BaseBackend):
             probs = probs / total
         return int(torch.multinomial(probs, 1, generator=generator).item())
 
-    def _reset_kv(self) -> None:
-        model = self._model
-        if model is None:
-            return
-        for block in getattr(model, "blocks", []):
-            attention = getattr(block, "attn", None)
-            reset = getattr(attention, "reset_cache", None)
-            if callable(reset):
-                reset()
-
-    def reset_slot(self, slot_id: int) -> None:
-        # Per-slot caches are a later engine feature; the reference model keeps
-        # a single ring buffer, so resetting it is the safe approximation.
-        self._reset_kv()
-
     def generate(self, request: GenerationRequest) -> Iterator[TokenEvent]:
         with self._gen_lock:
             yield from self._generate_locked(request)
@@ -722,7 +955,8 @@ class TinyModelBackend(BaseBackend):
                 code="context_length_exceeded",
             )
 
-        self._reset_kv()
+        slot_id = 0 if request.slot_id is None else int(request.slot_id)
+        self._bind_slot(slot_id)
         eos_ids = self._eos_ids()
         generator = None
         if sampling.seed is not None:
@@ -731,44 +965,187 @@ class TinyModelBackend(BaseBackend):
         emitted_text = ""
         token_count = 0
         finish = "length"
-        with torch.inference_mode():
-            ids = torch.tensor([prompt_ids], dtype=torch.long)
-            logits = self._model.forward(ids, 0)
-            position = len(prompt_ids)
-            for step in range(sampling.max_tokens):
-                if request.deadline is not None and time.monotonic() > request.deadline:
-                    raise BackendError(
-                        "generation timed out",
-                        status_code=504,
-                        error_type="timeout_error",
-                        code="timeout",
-                    )
-                next_id = self._sample_token(logits[:, -1, :], sampling, generator)
-                if next_id in eos_ids:
-                    finish = "stop"
-                    break
-                generated.append(next_id)
-                token_count += 1
-                full_text = self._decode(generated)
-                delta = full_text[len(emitted_text):] if full_text.startswith(emitted_text) else ""
-                if delta:
-                    emit, stopped = _split_at_stop(emitted_text, delta, sampling.stop)
-                    emitted_text += emit
-                    if emit:
-                        yield TokenEvent(text=emit, token_id=next_id)
-                    if stopped:
+        try:
+            with torch.inference_mode():
+                ids = torch.tensor([prompt_ids], dtype=torch.long)
+                logits = self._model.forward(ids, 0)
+                # the next sampled token occupies position len(prompt_ids)-1+1 == len(prompt_ids)
+                position = len(prompt_ids) - 1
+                for step in range(sampling.max_tokens):
+                    if request.deadline is not None and time.monotonic() > request.deadline:
+                        raise BackendError(
+                            "generation timed out",
+                            status_code=504,
+                            error_type="timeout_error",
+                            code="timeout",
+                        )
+                    next_id = self._sample_token(logits[:, -1, :], sampling, generator)
+                    if next_id in eos_ids:
                         finish = "stop"
                         break
-                if step + 1 >= sampling.max_tokens:
-                    finish = "length"
-                    break
-                position += 1
-                logits = self._model.forward(torch.tensor([[next_id]], dtype=torch.long), position)
+                    generated.append(next_id)
+                    token_count += 1
+                    full_text = self._decode(generated)
+                    delta = (
+                        full_text[len(emitted_text):]
+                        if full_text.startswith(emitted_text)
+                        else ""
+                    )
+                    if delta:
+                        emit, stopped = _split_at_stop(emitted_text, delta, sampling.stop)
+                        emitted_text += emit
+                        if emit:
+                            yield TokenEvent(text=emit, token_id=next_id)
+                        if stopped:
+                            finish = "stop"
+                            break
+                    if step + 1 >= sampling.max_tokens:
+                        finish = "length"
+                        break
+                    position += 1
+                    logits = self._model.forward(
+                        torch.tensor([[next_id]], dtype=torch.long), position
+                    )
+        finally:
+            self._stash_slot(slot_id)
+            self._trim_expert_cache()
         yield TokenEvent(
             finish_reason=finish,
             usage=Usage.from_counts(prompt_tokens, token_count),
         )
 
+
+@dataclass(slots=True)
+class ModelEntry:
+    """One model advertised by /v1/models, with a lazy backend factory."""
+
+    model_id: str
+    factory: Callable[[], Backend]
+    adapter: str = "auto"
+    tier: str = "conservative"
+    layers: tuple[int, ...] | None = None
+    model_dir: str | None = None
+    aliases: tuple[str, ...] = ()
+    supported: bool = True
+    note: str | None = None
+
+    def metadata(self, loaded: bool) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "id": self.model_id,
+            "adapter": self.adapter,
+            "tier": self.tier,
+            "layers": list(self.layers) if self.layers is not None else None,
+            "model_dir": self.model_dir,
+            "loaded": loaded,
+            "supported": self.supported,
+        }
+        if self.note:
+            data["note"] = self.note
+        if self.aliases:
+            data["aliases"] = list(self.aliases)
+        return data
+
+
+class MultiModelBackend(BaseBackend):
+    """Routes requests to one lazily-loaded backend per model id.
+
+    Used when several checkpoints/adapters are registered (for example an HF
+    deepseek_v41 model plus a future GGUF model).  Model names are matched
+    against ids and aliases; unknown names fall back to the default model so
+    agent clients that send arbitrary model names keep working.
+    """
+
+    def __init__(
+        self,
+        entries: Sequence[ModelEntry],
+        *,
+        default_model: str | None = None,
+    ) -> None:
+        if not entries:
+            raise ValueError("MultiModelBackend needs at least one model")
+        self._entries: OrderedDict[str, ModelEntry] = OrderedDict()
+        for entry in entries:
+            if entry.model_id in self._entries:
+                raise ValueError(f"duplicate model id {entry.model_id!r}")
+            self._entries[entry.model_id] = entry
+        ids = list(self._entries)
+        self.default_model = default_model or ids[0]
+        if self.default_model not in self._entries:
+            raise ValueError(f"default model {self.default_model!r} is not registered")
+        self.model_id = self.default_model
+        aliases: list[str] = []
+        for entry in entries:
+            aliases.append(entry.model_id)
+            aliases.extend(entry.aliases)
+        self.aliases = tuple(dict.fromkeys(aliases))
+        self._backends: dict[str, Backend] = {}
+        self._lock = threading.Lock()
+
+    @property
+    def ready(self) -> bool:
+        return bool(self._backends)
+
+    def _entry_for(self, model: str | None) -> ModelEntry:
+        if model in self._entries:
+            return self._entries[model]
+        if model:
+            for entry in self._entries.values():
+                if model in entry.aliases:
+                    return entry
+        return self._entries[self.default_model]
+
+    def backend_for(self, model: str | None = None) -> Backend:
+        entry = self._entry_for(model)
+        with self._lock:
+            backend = self._backends.get(entry.model_id)
+            if backend is None:
+                backend = entry.factory()
+                self._backends[entry.model_id] = backend
+            return backend
+
+    def list_models(self) -> list[dict[str, Any]]:
+        models: list[dict[str, Any]] = []
+        for entry in self._entries.values():
+            loaded = entry.model_id in self._backends
+            models.append(entry.metadata(loaded))
+            for alias in entry.aliases:
+                models.append({**entry.metadata(loaded), "id": alias, "alias_of": entry.model_id})
+        return models
+
+    def generate(self, request: GenerationRequest) -> Iterator[TokenEvent]:
+        yield from self.backend_for(request.model).generate(request)
+
+    def count_prompt_tokens(self, request: GenerationRequest) -> int:
+        return self.backend_for(request.model).count_prompt_tokens(request)
+
+    def render_prompt(self, request: GenerationRequest) -> str:
+        return self.backend_for(request.model).render_prompt(request)
+
+    def context_limit(self, request: GenerationRequest | None = None) -> int | None:
+        getter = getattr(self.backend_for(request.model if request else None), "context_limit", None)
+        return getter(request) if callable(getter) else None
+
+    def reset_slot(self, slot_id: int) -> None:
+        for backend in list(self._backends.values()):
+            backend.reset_slot(slot_id)
+
+    def warmup(self) -> None:
+        self.backend_for(self.default_model).warmup()
+
+    def close(self) -> None:
+        for backend in list(self._backends.values()):
+            backend.close()
+        self._backends.clear()
+
+    def health(self) -> dict[str, Any]:
+        models = self.list_models()
+        return {
+            "backend": "MultiModelBackend",
+            "model": self.default_model,
+            "default_model": self.default_model,
+            "ready": any(model.get("loaded") for model in models),
+            "models": models,
+        }
 
 # ---------------------------------------------------------------------------
 # Slots
@@ -1092,6 +1469,81 @@ def parse_layers(text: str | None) -> list[int] | None:
     return layers or None
 
 
+@dataclass(slots=True)
+class ModelSpec:
+    """One model the server can route to (CLI --model-dir / --extra-model)."""
+
+    model_id: str
+    model_dir: str | Path | None = None
+    adapter: str = "auto"
+    tier: str = "conservative"
+    layers: tuple[int, ...] | None = None
+    aliases: tuple[str, ...] = ()
+
+
+def _coerce_model_specs(
+    models: Sequence[ModelSpec | Mapping[str, Any]] | None,
+    *,
+    model_dir: str | Path | None,
+    layers: Sequence[int] | None,
+    tier: str,
+    adapter: str,
+    model_id: str | None = None,
+) -> list[ModelSpec]:
+    specs: list[ModelSpec] = []
+    if models:
+        for item in models:
+            if isinstance(item, ModelSpec):
+                spec = item
+            elif isinstance(item, Mapping):
+                raw_layers = item.get("layers")
+                spec = ModelSpec(
+                    model_id=str(item.get("model_id") or item.get("id") or ""),
+                    model_dir=item.get("model_dir"),
+                    adapter=str(item.get("adapter", adapter)),
+                    tier=str(item.get("tier", tier)),
+                    layers=(
+                        tuple(int(value) for value in raw_layers)
+                        if raw_layers is not None
+                        else (tuple(layers) if layers else None)
+                    ),
+                    aliases=tuple(item.get("aliases") or ()),
+                )
+            else:
+                raise TypeError(f"model specs must be ModelSpec or mapping, got {type(item)!r}")
+            if spec.model_dir is None:
+                raise ValueError(f"model {spec.model_id!r} has no model_dir")
+            if not spec.model_id:
+                spec = ModelSpec(
+                    model_id=Path(spec.model_dir).name,
+                    model_dir=spec.model_dir,
+                    adapter=spec.adapter,
+                    tier=spec.tier,
+                    layers=spec.layers,
+                    aliases=spec.aliases,
+                )
+            specs.append(spec)
+    else:
+        if model_dir is None:
+            raise ValueError("the tiny backend needs model_dir or a models list")
+        specs.append(
+            ModelSpec(
+                model_id=model_id or Path(model_dir).name,
+                model_dir=model_dir,
+                adapter=adapter,
+                tier=tier,
+                layers=tuple(layers) if layers is not None else None,
+            )
+        )
+    seen: set[str] = set()
+    for spec in specs:
+        if spec.model_id in seen:
+            raise ValueError(f"duplicate model id {spec.model_id!r}")
+        seen.add(spec.model_id)
+        resolve_tier(spec.tier)  # fail at startup, not on the first request
+    return specs
+
+
 def build_backend(
     kind: str = "mock",
     *,
@@ -1101,17 +1553,99 @@ def build_backend(
     model_id: str | None = None,
     script: Sequence[str] | None = None,
     token_delay: float = 0.0,
+    tier: str = "conservative",
+    adapter: str = "auto",
+    models: Sequence[ModelSpec | Mapping[str, Any]] | None = None,
+    default_model: str | None = None,
 ) -> Backend:
-    """Create one of the built-in backends."""
+    """Create one of the built-in backends.
+
+    kind="mock" -> MockBackend; kind="tiny" -> TinyModelBackend for one
+    checkpoint, or a MultiModelBackend when several specs are supplied.
+    """
     if kind == "mock":
         return MockBackend(
             model_id=model_id or "tinyinfer-mock", script=script, token_delay=token_delay
         )
-    if kind == "tiny":
-        return TinyModelBackend(
-            model_dir=model_dir, layers=layers, device=device, model_id=model_id
+    if kind != "tiny":
+        raise ValueError(f"unknown backend {kind!r} (choose from 'mock', 'tiny')")
+    specs = _coerce_model_specs(
+        models,
+        model_dir=model_dir,
+        layers=layers,
+        tier=tier,
+        adapter=adapter,
+        model_id=model_id,
+    )
+    entries: list[ModelEntry] = []
+    for spec in specs:
+        hint = (
+            detect_adapter_kind(spec.model_dir)
+            if spec.adapter in ("auto", "", None)
+            else spec.adapter
         )
-    raise ValueError(f"unknown backend {kind!r} (choose from 'mock', 'tiny')")
+        supported, note = _adapter_support(hint, spec.model_dir)
+
+        def factory(spec: ModelSpec = spec, device: str = device):
+            return TinyModelBackend(
+                model_dir=spec.model_dir,
+                adapter=spec.adapter,
+                layers=spec.layers,
+                tier=spec.tier,
+                device=device,
+                model_id=spec.model_id,
+                aliases=spec.aliases,
+            )
+
+        entries.append(
+            ModelEntry(
+                model_id=spec.model_id,
+                factory=factory,
+                adapter=hint,
+                tier=spec.tier,
+                layers=spec.layers,
+                model_dir=str(spec.model_dir) if spec.model_dir else None,
+                aliases=spec.aliases,
+                supported=supported,
+                note=note,
+            )
+        )
+    if len(entries) == 1:
+        return entries[0].factory()
+    return MultiModelBackend(entries, default_model=default_model or entries[0].model_id)
+
+
+def models_from_args(args: argparse.Namespace) -> list[ModelSpec]:
+    """Build model specs from server/CLI arguments (--model-dir / --extra-model)."""
+    specs: list[ModelSpec] = []
+    if getattr(args, "model_dir", None):
+        specs.append(
+            ModelSpec(
+                model_id=getattr(args, "model_id", None) or Path(args.model_dir).name,
+                model_dir=args.model_dir,
+                adapter=getattr(args, "adapter", "auto"),
+                tier=getattr(args, "tier", "conservative"),
+                layers=parse_layers(getattr(args, "layers", None)),
+            )
+        )
+    for item in getattr(args, "extra_model", None) or []:
+        name, separator, directory = str(item).partition("=")
+        if not separator or not name.strip() or not directory.strip():
+            raise ValueError(f"--extra-model expects NAME=DIR, got {item!r}")
+        specs.append(
+            ModelSpec(
+                model_id=name.strip(),
+                model_dir=Path(directory.strip()),
+                adapter=getattr(args, "adapter", "auto"),
+                tier=getattr(args, "tier", "conservative"),
+                layers=parse_layers(getattr(args, "layers", None)),
+            )
+        )
+    if not specs:
+        raise ValueError("no model configured: pass --model-dir or --extra-model NAME=DIR")
+    return specs
+
+
 
 
 def create_app(
@@ -1379,21 +1913,30 @@ def _check_context(
 ) -> None:
     settings: ServerSettings = app.state.settings
     backend: Backend = app.state.backend
+    limit = settings.max_context_tokens
+    resolver = getattr(backend, "context_limit", None)
+    if callable(resolver):
+        try:
+            resolved = resolver(request)
+        except BackendError as exc:
+            raise exc.to_api_error() from exc
+        if resolved:
+            limit = min(limit, int(resolved))
     try:
         prompt_tokens = int(backend.count_prompt_tokens(request))
     except BackendError as exc:
         raise exc.to_api_error() from exc
     request.prompt_tokens = prompt_tokens
-    if prompt_tokens >= settings.max_context_tokens:
+    if prompt_tokens >= limit:
         raise APIError(
             f"prompt is too long: {prompt_tokens} tokens, "
-            f"the context is {settings.max_context_tokens}",
+            f"the context is {limit}",
             status_code=400,
             error_type="invalid_request_error",
             param=param,
             code="context_length_exceeded",
         )
-    room = settings.max_context_tokens - prompt_tokens
+    room = limit - prompt_tokens
     if request.sampling.max_tokens > room:
         if settings.fit_max_tokens and room >= 1:
             request.sampling.max_tokens = room
@@ -1401,13 +1944,15 @@ def _check_context(
             raise APIError(
                 f"max_tokens ({request.sampling.max_tokens}) plus prompt tokens "
                 f"({prompt_tokens}) exceeds the context "
-                f"({settings.max_context_tokens}); only {room} tokens are left",
+                f"({limit}); only {room} tokens are left",
                 status_code=400,
                 error_type="invalid_request_error",
                 param="max_tokens",
                 code="context_length_exceeded",
             )
     request.deadline = time.monotonic() + settings.request_timeout
+
+
 
 
 def _acquire_resources(app: FastAPI, session_id: str | None) -> Slot:
@@ -1574,22 +2119,63 @@ def _model_objects(app: FastAPI) -> list[dict[str, Any]]:
     backend: Backend = app.state.backend
     settings: ServerSettings = app.state.settings
     created = _model_created(app)
-    ids = [backend.model_id, *getattr(backend, "aliases", ())]
-    seen: list[str] = []
-    for model_id in ids:
-        if model_id and model_id not in seen:
-            seen.append(model_id)
-    return [
-        {
+    entries: list[Any] | None = None
+    lister = getattr(backend, "list_models", None)
+    if callable(lister):
+        try:
+            entries = list(lister())
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("backend list_models failed")
+    if not entries:
+        entries = [{"id": backend.model_id}]
+        for alias in getattr(backend, "aliases", ()):
+            if alias and alias != backend.model_id:
+                entries.append({"id": alias, "alias_of": backend.model_id})
+    objects: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in entries:
+        if isinstance(raw, str):
+            raw = {"id": raw}
+        if not isinstance(raw, Mapping):
+            continue
+        model_id = raw.get("id")
+        if not isinstance(model_id, str) or not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        context = raw.get("context_length")
+        try:
+            context_length = int(context) if context is not None else settings.max_context_tokens
+        except (TypeError, ValueError):
+            context_length = settings.max_context_tokens
+        entry: dict[str, Any] = {
             "id": model_id,
             "object": "model",
             "created": created,
             "owned_by": "tinyinfer",
-            "context_length": settings.max_context_tokens,
+            "context_length": context_length,
             "max_output_tokens": settings.max_tokens_limit,
         }
-        for model_id in seen
-    ]
+        for key in (
+            "adapter",
+            "tier",
+            "layers",
+            "model_dir",
+            "loaded",
+            "supported",
+            "note",
+            "alias_of",
+            "aliases",
+        ):
+            value = raw.get(key)
+            if value is None:
+                continue
+            if isinstance(value, tuple):
+                value = list(value)
+            entry[key] = value
+        objects.append(entry)
+    return objects
+
+
 
 
 def _completion_chunk(
@@ -1648,6 +2234,86 @@ def _usage_chunk(
     }
 
 
+def _tool_function_names(tools: Sequence[Mapping[str, Any]] | None) -> set[str]:
+    names: set[str] = set()
+    for tool in tools or ():
+        if not isinstance(tool, Mapping):
+            continue
+        function = tool.get("function")
+        name = function.get("name") if isinstance(function, Mapping) else tool.get("name")
+        if isinstance(name, str) and name:
+            names.add(name)
+    return names
+
+
+def _extract_tool_call(text: str, tool_names: set[str]) -> dict[str, str] | None:
+    """Recognise a minimal function call written as JSON by the model.
+
+    Supports a plain JSON object, a fenced JSON block and the
+    <tool_call>{...}</tool_call> wrapper.  The name must be declared in the
+    request (when tools are given), otherwise the text is left untouched.
+    """
+    if not text:
+        return None
+    candidate = text.strip()
+    wrapper = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", candidate, re.S)
+    if wrapper:
+        candidate = wrapper.group(1)
+    else:
+        fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", candidate, re.S)
+        if fenced:
+            candidate = fenced.group(1)
+    data = None
+    try:
+        data = json.loads(candidate)
+    except Exception:
+        for match in re.finditer(r"\{", candidate):
+            start = match.start()
+            for end in range(len(candidate), start, -1):
+                try:
+                    data = json.loads(candidate[start:end])
+                    break
+                except Exception:
+                    continue
+            if isinstance(data, dict):
+                break
+            data = None
+    if not isinstance(data, dict):
+        return None
+    inner = data.get("tool_call")
+    if isinstance(inner, Mapping):
+        data = dict(inner)
+    function = data.get("function")
+    name = data.get("name")
+    if name is None and isinstance(function, Mapping):
+        name = function.get("name")
+    arguments = data.get("arguments")
+    if arguments is None and isinstance(function, Mapping):
+        arguments = function.get("arguments")
+    if arguments is None:
+        arguments = data.get("parameters", {})
+    if not isinstance(name, str) or not name:
+        return None
+    if tool_names and name not in tool_names:
+        return None
+    if isinstance(arguments, str):
+        arguments_text = arguments
+    else:
+        try:
+            arguments_text = json.dumps(arguments, ensure_ascii=False)
+        except TypeError:  # pragma: no cover - unusual argument objects
+            arguments_text = json.dumps(str(arguments))
+    return {"name": name, "arguments": arguments_text}
+
+
+def _tool_call_payload(call: Mapping[str, str]) -> dict[str, Any]:
+    return {
+        "id": "call_" + uuid.uuid4().hex[:24],
+        "type": "function",
+        "function": {"name": call["name"], "arguments": call["arguments"]},
+    }
+
+
 def _normalise_prompt(prompt: str | list[str]) -> str:
     if isinstance(prompt, str):
         return prompt
@@ -1690,6 +2356,7 @@ def _streaming_response(
     kind: Literal["completion", "chat"],
     include_usage: bool,
     session_id: str | None,
+    tool_names: Sequence[str] = (),
 ):
     settings: ServerSettings = app.state.settings
     slot = _acquire_resources(app, request.session_id)
@@ -1712,6 +2379,8 @@ def _streaming_response(
         finish_reason: str | None = None
         usage: Usage | None = None
         failed = False
+        buffering = kind == "chat" and bool(tool_names)
+        buffered: list[str] = []
         wait = settings.sse_keepalive_s if settings.sse_keepalive_s > 0 else 1.0
         keepalive = settings.sse_keepalive_s > 0
         try:
@@ -1756,7 +2425,9 @@ def _streaming_response(
                         break
                     completion_tokens += 1
                     if event.text:
-                        if kind == "chat":
+                        if buffering:
+                            buffered.append(event.text)
+                        elif kind == "chat":
                             yield frame(
                                 _chat_chunk(
                                     completion_id,
@@ -1793,6 +2464,31 @@ def _streaming_response(
                     break
             if not failed:
                 finish_reason = finish_reason or "stop"
+                if buffering:
+                    text = "".join(buffered)
+                    call = _extract_tool_call(text, set(tool_names))
+                    if call:
+                        finish_reason = "tool_calls"
+                        payload = _tool_call_payload(call)
+                        yield frame(
+                            _chat_chunk(
+                                completion_id,
+                                created,
+                                model,
+                                {"tool_calls": [{"index": 0, **payload}]},
+                                None,
+                            )
+                        )
+                    elif text:
+                        yield frame(
+                            _chat_chunk(
+                                completion_id,
+                                created,
+                                model,
+                                {"content": text},
+                                None,
+                            )
+                        )
                 if usage is None:
                     usage = Usage.from_counts(
                         request.prompt_tokens or 0, completion_tokens
@@ -1830,6 +2526,8 @@ def _streaming_response(
     return StreamingResponse(body(), media_type="text/event-stream", headers=headers)
 
 
+
+
 def _register_routes(app: FastAPI) -> None:
     @app.get("/health")
     def health():
@@ -1840,9 +2538,11 @@ def _register_routes(app: FastAPI) -> None:
             backend_health = backend.health()
         except Exception as exc:  # pragma: no cover - defensive
             backend_health = {"error": f"{type(exc).__name__}: {exc}"}
+        models = _model_objects(app)
         return {
             "status": "ok",
             "model": backend.model_id,
+            "models": [entry["id"] for entry in models],
             "backend": backend_health,
             "ready": bool(getattr(backend, "ready", True)),
             "uptime_s": round(
@@ -1950,11 +2650,15 @@ def _register_routes(app: FastAPI) -> None:
             else body.max_completion_tokens
         )
         sampling = _sampling_from(body, settings, max_tokens=max_tokens)
+        tool_names: set[str] = set()
+        if body.tool_choice != "none":
+            tool_names = _tool_function_names(body.tools)
         if body.tools:
             logger.debug(
-                "tools are accepted but not executed by %s (%d definitions)",
-                type(backend).__name__,
-                len(body.tools),
+                "tools declared for %s: %s (tool_choice=%r)",
+                model,
+                sorted(tool_names),
+                body.tool_choice,
             )
         generation_request = GenerationRequest(
             request_id=_request_id(request),
@@ -1980,8 +2684,19 @@ def _register_routes(app: FastAPI) -> None:
                 kind="chat",
                 include_usage=include_usage,
                 session_id=session_id,
+                tool_names=sorted(tool_names),
             )
         text, finish_reason, usage = _run_generation(app_, generation_request)
+        tool_call = _extract_tool_call(text, tool_names) if tool_names else None
+        if tool_call is not None:
+            message: dict[str, Any] = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [_tool_call_payload(tool_call)],
+            }
+            finish_reason = "tool_calls"
+        else:
+            message = {"role": "assistant", "content": text}
         payload = {
             "id": completion_id,
             "object": "chat.completion",
@@ -1990,7 +2705,7 @@ def _register_routes(app: FastAPI) -> None:
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": text},
+                    "message": message,
                     "logprobs": None,
                     "finish_reason": finish_reason,
                 }
@@ -2020,6 +2735,8 @@ def _register_routes(app: FastAPI) -> None:
         )
 
 
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -2037,13 +2754,35 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--backend", choices=("mock", "tiny"), default="mock", help="model backend"
     )
     parser.add_argument(
-        "--model-dir", default=None, help="HF safetensors directory (backend=tiny)"
+        "--model-dir", default=None, help="HF safetensors directory of the default model"
+    )
+    parser.add_argument(
+        "--extra-model",
+        action="append",
+        default=None,
+        metavar="NAME=DIR",
+        help="register an additional model (repeatable)",
+    )
+    parser.add_argument(
+        "--default-model", default=None, help="model id used for unknown model names"
     )
     parser.add_argument(
         "--layers", default=None, help="comma separated layer ids for staged loading"
     )
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
-    parser.add_argument("--model-id", default=None, help="model id reported by /v1/models")
+    parser.add_argument("--model-id", default=None, help="model id of the default model")
+    parser.add_argument(
+        "--adapter",
+        default="auto",
+        choices=("auto", "hf_deepseek_v41", "gguf"),
+        help="checkpoint adapter (GGUF is reserved)",
+    )
+    parser.add_argument(
+        "--tier",
+        default="conservative",
+        choices=("conservative", "balanced"),
+        help="optimization tier for the reference path",
+    )
     parser.add_argument(
         "--api-key", default=None, help="comma separated API keys (or TINYINFER_API_KEY)"
     )
@@ -2063,7 +2802,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--max-context-tokens",
         type=int,
         default=DEFAULT_CONTEXT_TOKENS,
-        help="context window",
+        help="context window cap",
     )
     parser.add_argument(
         "--max-tokens-limit",
@@ -2090,12 +2829,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _backend_from_args(args: argparse.Namespace) -> Backend:
+    if args.backend == "mock":
+        return build_backend("mock", model_id=args.model_id)
+    specs = models_from_args(args)
     return build_backend(
-        args.backend,
-        model_dir=args.model_dir,
-        layers=parse_layers(args.layers),
+        "tiny",
+        models=specs,
+        tier=args.tier,
+        adapter=args.adapter,
+        default_model=args.default_model,
         device=args.device,
-        model_id=args.model_id,
     )
 
 
@@ -2106,10 +2849,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         level=args.log_level.upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    if args.backend == "tiny" and not args.model_dir:
-        parser.error("--model-dir is required with --backend tiny")
+    if args.backend == "tiny" and not args.model_dir and not args.extra_model:
+        parser.error("--model-dir or --extra-model is required with --backend tiny")
     api_key = args.api_key or os.environ.get("TINYINFER_API_KEY")
-    backend = _backend_from_args(args)
+    try:
+        backend = _backend_from_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+        return 2
     try:
         backend.warmup()
     except BackendError as exc:
@@ -2128,10 +2875,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         sse_keepalive_s=args.sse_keepalive,
     )
     logger.info(
-        "OpenAI-compatible API at http://%s:%s/v1  (backend=%s, model=%s)",
+        "OpenAI-compatible API at http://%s:%s/v1  (backend=%s, tier=%s, model=%s)",
         args.host,
         args.port,
         args.backend,
+        args.tier,
         backend.model_id,
     )
     try:
@@ -2141,6 +2889,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
     return 0
+
+
 
 
 if __name__ == "__main__":
