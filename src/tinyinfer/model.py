@@ -85,5 +85,7 @@ class TinyModel:
         from .hc import hc_split_sinkhorn  # noqa: F401  (kept importable for users)
         h = (pre_mix.unsqueeze(-1) * h.float()).sum(dim=2).to(h.dtype)
         h = rms_norm(h, self.out_norm, self.cfg.rms_norm_eps)
-        logits = torch.nn.functional.linear(h.float(), self.head.float())
+        # bf16 matvec (official head stores fp32 weights; bf16 is 2x faster on CPU and
+        # numerically fine for sampling) -- see docs/loading.md head measurements
+        logits = torch.nn.functional.linear(h, self.head).float()
         return logits

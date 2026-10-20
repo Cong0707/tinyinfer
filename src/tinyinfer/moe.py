@@ -60,9 +60,10 @@ class Expert:
 
 
 class MoE:
-    def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig):
+    def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, expert_store=None):
         self.cfg = cfg
         self.layer_id = layer_id
+        self._expert_store = expert_store  # optional tinyinfer.loading.ExpertStore
         self.gate = Gate(store, layer_id, cfg)
         p = f"layers.{layer_id}.ffn."
         self.shared = Expert(
@@ -78,13 +79,21 @@ class MoE:
     def _expert(self, i: int) -> Expert:
         e = self._expert_cache.get(i)
         if e is None:
-            p = f"layers.{self.layer_id}.ffn.experts.{i}."
-            e = Expert(
-                dequant_fp4_block(self._store.get(p + "w1.weight"), self._store.get(p + "w1.scale")),
-                dequant_fp4_block(self._store.get(p + "w2.weight"), self._store.get(p + "w2.scale")),
-                dequant_fp4_block(self._store.get(p + "w3.weight"), self._store.get(p + "w3.scale")),
-                self.swiglu_limit,
-            )
+            if self._expert_store is not None:
+                # zero-copy views are only valid inside the context; dequant copies out
+                with self._expert_store.experts(self.layer_id, [i]) as recs:
+                    rec = recs[0]
+                    w = {n: dequant_fp4_block(rec.tensor(n + ".weight"), rec.tensor(n + ".scale"))
+                         for n in ("w1", "w2", "w3")}
+                e = Expert(w["w1"], w["w2"], w["w3"], self.swiglu_limit)
+            else:
+                p = f"layers.{self.layer_id}.ffn.experts.{i}."
+                e = Expert(
+                    dequant_fp4_block(self._store.get(p + "w1.weight"), self._store.get(p + "w1.scale")),
+                    dequant_fp4_block(self._store.get(p + "w2.weight"), self._store.get(p + "w2.scale")),
+                    dequant_fp4_block(self._store.get(p + "w3.weight"), self._store.get(p + "w3.scale")),
+                    self.swiglu_limit,
+                )
             self._expert_cache[i] = e
         return e
 

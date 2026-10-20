@@ -48,7 +48,18 @@ def lru_hit(routes: np.ndarray, capacity: int) -> float:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", default=str(ROOT / "cache" / "weights"))
-    ap.add_argument("--prompt", default="def quicksort(xs):")
+    ap.add_argument("--prompt", default=(
+        "def quicksort(xs):\n"
+        "    if len(xs) <= 1:\n        return xs\n"
+        "    pivot = xs[len(xs)//2]\n"
+        "    left = [x for x in xs if x < pivot]\n"
+        "    mid = [x for x in xs if x == pivot]\n"
+        "    right = [x for x in xs if x > pivot]\n"
+        "    return quicksort(left) + mid + quicksort(right)\n\n"
+        "The quick brown fox jumps over the lazy dog. DeepSeek V4.1 Flash uses a sparse "
+        "mixture of experts with 384 routed experts per layer. Only six are activated per "
+        "token, plus one shared expert. The router scores are sqrt(softplus(gate logits)) "
+        "and the top six are normalized and scaled by 1.5."))
     ap.add_argument("--prompt-file", default=None)
     ap.add_argument("--max-tokens", type=int, default=192)
     ap.add_argument("--out", default=None)

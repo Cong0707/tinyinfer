@@ -28,6 +28,17 @@ def bench(fn, warmup: int = 3, runs: int = 5) -> float:
     return (time.perf_counter() - t) / runs
 
 
+def bench_gpu(fn, warmup: int = 5, runs: int = 20) -> float:
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    t = time.perf_counter()
+    for _ in range(runs):
+        fn()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - t) / runs
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--threads", type=int, default=16)
@@ -36,13 +47,14 @@ def main() -> int:
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
     V, D = args.rows, args.dim
+    nbytes = V * D * 2
     g = torch.Generator().manual_seed(0)
     w = torch.randn(V, D, dtype=torch.bfloat16, generator=g)
     h = torch.randn(D, dtype=torch.bfloat16, generator=g)
-    print(f"head {V}x{D} bf16 = {w.numel() * 2 / 1e9:.3f} GB, threads={args.threads}")
+    print(f"head {V}x{D} bf16 = {nbytes / 1e9:.3f} GB, threads={args.threads}")
 
     dt = bench(lambda: torch.mv(w, h))
-    print(f"CPU bf16 mv: {dt * 1e3:6.2f} ms  ({w.numel() * 2 / dt / 1e9:.1f} GB/s effective)")
+    print(f"CPU bf16 mv: {dt * 1e3:6.2f} ms  ({nbytes / dt / 1e9:.1f} GB/s effective)")
     del w
     wf = torch.randn(V, D, dtype=torch.float32, generator=g)
     hf = h.float()
@@ -55,8 +67,8 @@ def main() -> int:
     torch.cuda.init()
     wb = torch.randn(V, D, dtype=torch.bfloat16, generator=g).cuda()
     hb = h.cuda()
-    dt = bench(lambda: torch.mv(wb, hb), warmup=5, runs=20)
-    print(f"GPU bf16 mv resident: {dt * 1e3:5.2f} ms (occupies {w.numel() * 2 / 1e9:.2f} GB VRAM)")
+    dt = bench_gpu(lambda: torch.mv(wb, hb), warmup=5, runs=20)
+    print(f"GPU bf16 mv resident: {dt * 1e3:5.2f} ms (occupies {nbytes / 1e9:.2f} GB VRAM)")
     del wb, hb
     torch.cuda.empty_cache()
 
@@ -64,7 +76,7 @@ def main() -> int:
         src = torch.empty(V, D, dtype=torch.bfloat16, pin_memory=pin)
         dst = torch.empty_like(src, device="cuda")
         dt = bench(lambda: dst.copy_(src), warmup=1, runs=3)
-        print(f"H2D bf16 head pinned={str(pin):<5s}: {dt * 1e3:5.1f} ms ({w.numel() * 2 / dt / 1e9:.2f} GB/s)")
+        print(f"H2D bf16 head pinned={str(pin):<5s}: {dt * 1e3:5.1f} ms ({nbytes / dt / 1e9:.2f} GB/s)")
         del src, dst
     torch.cuda.empty_cache()
 
@@ -76,19 +88,21 @@ def main() -> int:
     src8.copy_(wq)
     dst8 = torch.empty_like(wq, device="cuda")
     dt = bench(lambda: dst8.copy_(src8), warmup=1, runs=3)
-    print(f"H2D fp8 head (0.66 GB) pinned: {dt * 1e3:5.1f} ms ({w.numel() / dt / 1e9:.2f} GB/s)")
+    print(f"H2D fp8 head (0.66 GB) pinned: {dt * 1e3:5.1f} ms ({nbytes / 2 / dt / 1e9:.2f} GB/s)")
     hh = h.cuda()
     sg = scale.squeeze(1).cuda()
-    dt = bench(lambda: torch.mv(dst8.to(torch.bfloat16) * sg.to(torch.bfloat16)[:, None], hh),
-               warmup=2, runs=5)
+    dt = bench_gpu(lambda: torch.mv(dst8.to(torch.bfloat16) * sg.to(torch.bfloat16)[:, None], hh),
+                   warmup=2, runs=5)
     print(f"GPU fp8->bf16 dequant + mv: {dt * 1e3:5.2f} ms (torch path, no fused kernel)")
     try:
         a = h.float().div(h.float().abs().max() / 448).to(torch.float8_e4m3fn).view(1, D).cuda()
-        b = wq.t()  # [D, V], column-major view
+        b = wq.t().cuda()  # [D, V], column-major view
         sa = torch.ones(1, 1, dtype=torch.float32, device="cuda")
         sb = scale.amax().view(1, 1).to(torch.float32).cuda()
         torch._scaled_mm(a, b, scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16)
-        print("torch._scaled_mm fp8 head (per-tensor scale): OK")
+        dt = bench_gpu(lambda: torch._scaled_mm(a, b, scale_a=sa, scale_b=sb, out_dtype=torch.bfloat16),
+                       warmup=3, runs=10)
+        print(f"torch._scaled_mm fp8 head (per-tensor scale): OK, {dt * 1e3:.2f} ms on GPU")
     except Exception as exc:  # noqa: BLE001 - probe only
         print(f"torch._scaled_mm fp8 head: unavailable ({type(exc).__name__}: {exc})")
     return 0
