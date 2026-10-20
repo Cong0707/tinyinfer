@@ -10,7 +10,8 @@ import torch.nn.functional as F
 
 from .compressor import Compressor, Indexer, shared_attn
 from .config import TinyConfig
-from .nn import apply_rope, precompute_freqs_cis, rms_norm, sparse_attn_ref, window_idxs_prefill
+from .kernels import sparse_attn_dispatch
+from .nn import apply_rope, precompute_freqs_cis, rms_norm, window_idxs_prefill
 from .quant import dequant_fp8_block
 from .weights import ShardStore
 
@@ -98,7 +99,7 @@ class MLACompressedAttention:
                 self._kv_cache[:, cutoff:self.window] = tail[:, : self.window - cutoff]
                 self._kv_cache[:, :cutoff] = tail[:, self.window - cutoff:]
             window_kv = kv
-            idxs = window_idxs_prefill(s, self.window).unsqueeze(0).expand(b, -1, -1).contiguous()
+            idxs = window_idxs_prefill(s, self.window, device=x.device).unsqueeze(0).expand(b, -1, -1).contiguous()
         else:
             self._kv_cache[:, start_pos % self.window] = kv[:, 0]
             window_kv = self._kv_cache
@@ -140,7 +141,7 @@ class MLACompressedAttention:
             kv_all = window_kv
             idxs_all = idxs
 
-        o = sparse_attn_ref(q, kv_all, self.sink, idxs_all, self.scale)
+        o = sparse_attn_dispatch(q, kv_all, self.sink, idxs_all, self.scale)
         apply_rope(o[..., -self.rope_dim:], freqs, inverse=True)
 
         o = o.view(b, s, self.o_groups, -1)

@@ -16,8 +16,8 @@
 4. **冷解码时间预算**（no cache）：NVMe 513 ms + PCIe 与固定开销 ≈ 110 ms → **~1.55 tok/s**（8.8 GB/s）；4.5 GB/s 时 ~0.88 tok/s。
 5. **缓存是主杠杆，不是预取**。20 GB ARC 专家缓存在合成分布（Zipf 0.9 + topic + 25% temporal）下命中 **24.7%**，Zipf 1.2 下 **32.1%**；对应解码 **2.0–2.3 tok/s**。预取只能再拿 **+3%～+16%**，且必须过 gate，否则负收益（flash-moe 的 -18% 结论仍然成立）。
 6. **预填充是最大惊喜**：512-token chunk 会触及几乎全部 384 专家/层 → 288.7 GB，33 s，**15.6 tok/s**；但若按"逐层预填充（layer-major）"把整个 prompt 一次喂完（激活放 RAM，专家每层只读一遍），8K prompt 也只要 ~33 s + 计算 → **~240 tok/s 预填充**。这是 O9 的核心设计。
-7. **推荐默认配置**：MTP 关、注意力权重 fp8 常驻 29–34 层、24 个专家槽（451 MB）、RAM 专家缓存 20–22 GB、ARC + 热度 pin、O_DIRECT 专家流、预取 lead=1 层 / k=2 / gate 开。
-8. **真实 router 分布尚不可得**：需要全部 40 层分片（当前下载中）+ tokenizer，才能跑完整前向采集 hidden→gate logits 对。仅下载 40 层的 gate 权重（~160 MB）不够，因为路由取决于完整前向的 hidden state。在权重到位前用合成分布 + 敏感性分析；脚本已就绪（scripts/prototypes/loading_research/）。
+7. **推荐默认配置（Lead 已拍板）**：MTP 关、head 放 CPU（实测 bf16 matvec 39–41 ms）、注意力 fp8 常驻 auto（29–34 层，可配全驻/部分驻）、24 个专家槽（451 MB）、RAM 专家缓存 20 GB 起步（可配）、ARC + 热度 pin、O_DIRECT 专家流、预取 lead=1 层 / k=2 / gate 开、活跃会话 2（上限 4）。fp8/int8 head 备选评估见 5.4.1：8 GB 卡上不划算，保持 CPU。
+8. **真实 router 分布：layer 0 已完成，全 40 层待权重**。layer 0 真实预检（159 token）给出 232/384 专家、top-24 41.9%、单层 LRU(27) 命中 34.4%，不低于合成 24.7%，可把 24.7% 当保守下限。完整 E-L3/E-L4 需要全部 40 层分片 + tokenizer（当前下载 baseline 11.13/510.3 GB，约 11 h）；只下载 40 层 gate 权重（~160 MB）不够，因为路由输入是完整前向 hidden。脚本已就绪（scripts/prototypes/loading_research/）。
 
 ---
 
@@ -52,7 +52,7 @@
 |---|---:|---|
 | GPU | 8151 MiB，sm_120，PCIe 5.0 ×8 | nvidia-smi |
 | CUDA 分配前已用 VRAM | 1.7 GB | 桌面 + 浏览器（本次测量时） |
-| RAM 可用 | 19.85 GB | 下载器/浏览器占满 page cache 时，非稳态 |
+| RAM 可用 | 19.8–29.7 GB 波动 | 下载器/浏览器占 page cache 时偏低，非稳态；预算必须启动时实测 |
 | PCIe H2D pinned | 26.11 GB/s | torch pinned 256 MB ×4 |
 | PCIe H2D pageable | 8.96 GB/s | 同上 |
 | NVMe 顺序读 4T | 7.53 GB/s | 8 GB 新写文件、NO_BUFFERING |
@@ -73,7 +73,7 @@
 | Engram 行 | 12,288 B（2 层 × 24 行 × 256 B） | 随机行；4 KB 页粒度下 ≤196,608 B/token |
 | 非专家流（未常驻的注意力层） | 0–1.36 GB | 常驻 29 层时剩 11 层 × 170 MB = 1.87 GB；34 层时 6 层 = 1.02 GB |
 | KV 窗口 | 5.24 MB/会话 | 40 层 × 128 × 512 × 2 B（仅在 VRAM） |
-| head | 1.32 GB | 建议放 CPU 算（26 ms）或常驻 fp8（0.66 GB） |
+| head | 1.32 GB | CPU bf16 matvec 实测 39–41 ms；fp8/int8 备选见 5.4.1 |
 
 时间模型（解码，单会话）：
 
@@ -276,8 +276,24 @@ Strata 在 RAM↔VRAM 间按热度搬专家。本项目的对应设计：
 - 17.78 GB 非专家全驻 RAM（pinned 10.8 GB 以内），每 token 从 RAM 取。
 - VRAM 常驻 29–34 层注意力（fp8 原样），剩余 6–11 层按 token 流：每层 170 MB，26 GB/s → 6.5 ms/层；11 层 = 72 ms/token，可与 NVMe 并行。
 - **不要**把注意力反量化成 bf16 常驻 VRAM（340 MB/层 × 40 = 13.6 GB，不可能）。需要 bf16 计算时，在 kernel 内联反量化或每层临时 dequant 到 scratch（340 MB 峰值）。
-- head：129280×5120 bf16 = 1.32 GB。默认 **CPU 计算**（matvec 1.3 GFLOP + 读 1.32 GB RAM ≈ 26 ms），避免 1.32 GB 上卡；后续可离线转 fp8 放 VRAM（0.66 GB）作为优化。
+- head：129280×5120 bf16 = 1.32 GB。默认 **CPU bf16 matvec**，实测 39–41 ms/次（16 线程；读 1.32 GB RAM，有效 33 GB/s），见 5.4.1。
 - embedding：只做行 gather（10 KB/token），放 RAM。
+
+#### 5.4.1 head 放哪里：实测与 fp8/int8 备选
+
+实测条件：随机 bf16 [129280, 5120]（1.324 GB），torch 2.9 CPU 16 线程，RTX 5060 Laptop；与真实 head.weight 的 dtype/形状一致（header：BF16 [129280,5120]）。误差 ±2 ms。
+
+| 方案 | 实测/估算 | 结论 |
+|---|---:|---|
+| **CPU bf16 matvec（默认）** | **39–41 ms**（8/16/32 线程 40.8/39.8/40.3） | 推荐：0 VRAM，速度可接受 |
+| CPU fp32 matvec（当前 model.py 路径 .float()） | 80.9 ms + 2.65 GB 转换 | 不要；除非 logits 精度验证必须 |
+| GPU bf16 常驻 VRAM | GEMV 3.6 ms，但占 1.32 GB → 挤掉 8 层注意力 ≈ +52 ms PCIe/token | 不划算 |
+| GPU bf16 每 token pinned 上卡 | H2D 46.3 ms + GEMV 3.6 ms ≈ 50 ms | 不如 CPU |
+| fp8 head 0.66 GB（per-row scale）常驻 RAM | H2D 28.2 ms + torch dequant+GEMV 29.4 ms ≈ 58 ms；若自定义 fused fp8 GEMV（~3 ms）≈ 31 ms | 备选 B：需 tilelang 内核；torch._scaled_mm 在 sm_120 不支持 rowwise scale（实测报错） |
+| fp8 head 常驻 VRAM 0.66 GB | 挤掉 4 层注意力 ≈ +26 ms + GEMV ~3 ms ≈ 29 ms | 比 CPU 略快，但 0.66 GB VRAM + 量化质量风险；8 GB 卡不推荐 |
+| int8 head 0.66 GB | 与 fp8 同尺寸：H2D 28.0 ms；torch 无 rowwise int8 GEMM | 备选 C：收益与 fp8 同量级，质量更差，暂不做 |
+
+**拍板**：默认 CPU bf16；把 model.py 的 head 计算从 h.float()/head.float() 改为 bf16（否则 81 ms + 2.65 GB）。fp8/int8 只有在 (a) 自定义 fused GEMV 内核落地且 (b) 真实权重质量验证通过后才考虑；在 8 GB 卡上收益仅 5–10 ms，不值得抢先做。若未来换 12–16 GB 卡，可把 fp8 head 常驻 VRAM 作为省 CPU 的方案。
 
 ### 5.5 Engram 行读与缓存
 
@@ -328,7 +344,7 @@ CPU 决策点（O6）：
 - **lead=1 层**：在 layer L 的 attention 输出（router 输入）拿到后，CPU 立刻用 lookahead 预测 L+1 的 6 个专家；此时 GPU 正在算 L 的 FFN（3–5 ms），NVMe 空闲，正好读 L+1 的 2 个高置信专家。**这是唯一真正能隐藏 I/O 的窗口**。
 - **lead=2 层**：只有当每层计算 ≥6 ms（PyTorch fallback/长上下文）时才值得；否则预取字节超过窗口，负收益。
 - **transformer 依赖决定了不可能提前更多**：layer L+1 的 router 输入依赖 layer L 的 FFN 输出，而 FFN 输出依赖专家本身。任何"提前 2 层以上"的预测都是对 hidden 的猜测，误差累积。
-- CPU 还负责：采样（head 1.3 GFLOP，CPU 26 ms 可接受）、n-gram 查表、PCIe/CPU 分流决策（6.4）、gate 统计。
+- CPU 还负责：采样（head 1.3 GFLOP，CPU bf16 39–41 ms，见 5.4.1）、n-gram 查表、PCIe/CPU 分流决策（6.4）、gate 统计。
 
 ### 6.3 预测器实现（loading.py 已提供）
 
@@ -389,7 +405,7 @@ CPU 决策点（O6）：
 
     时间 →
     GPU:   [attn_L 计算 1.5ms]──[FFN_L 计算 1.5ms]────────────[attn_{L+1}]…
-    CPU:        [router 0.3ms][预测 L+1 0.1ms][gate/统计 0.05ms][采样/head 26ms(每 token 一次)]
+    CPU:        [router 0.3ms][预测 L+1 0.1ms][gate/统计 0.05ms][采样/head 39ms(每 token 一次)]
     NVMe:                 [读 L+1 预测 2 专家 4.3ms][读 L+1 缺失 4.8 专家 10.2ms]
     PCIe:                          [L 的 6 专家上卡 4.3ms]──…
 
@@ -467,6 +483,20 @@ CPU 决策点（O6）：
 | TierBudget | plan(...), table(), io_scenarios() | 内存/IO 预算 |
 | IoBudget | compute(...) | 命中率→tok/s |
 
+### 9.4 接入 moe.py 最关键的 3 个 API（短清单）
+
+1. **ExpertStore.from_store(...)**：`store = ExpertStore.from_store(store, cache_bytes=20<<30, policy="arc", vram_slots=24, direct=True, device="cuda")`。进程内只建一次，传给所有 MoE 层/会话；不要每层 new 一个（重复文件句柄+缓存+线程池，RAM 会翻倍）。
+2. **store.experts(layer_id, ids) + rec.tensor(name)**：推荐 `with store.experts(layer_id, ids) as recs:`，先 fetch 全部 6 个，再并行 `dequant_fp4_block(rec.tensor("w1.weight"), rec.tensor("w1.scale"))`。视图零拷贝，uint8 packed fp4 + float8_e8m0fnu scale，直接喂现有 quant 函数；with 退出自动 release。
+3. **store.prefetch(layer, ids) / store.pin_hot(per_layer=20) / Prefetcher.note_layer(...)**：预取与热度 pin 是可选加速；预测逻辑放在 Prefetcher，不要塞进 MoE 循环。集成顺序：先正确性（1+2），再 gate（3）。
+
+**陷阱（按踩坑概率排序）**
+- 不要把 rec.tensor(...) 的视图带到 with 之外使用：VRAM 槽会被复用（换 owner 后同一 slot 是脏数据）；RAM 条目也可能被驱逐。跨层/跨 token 要用时先复制到自有 buffer。
+- dtype/形状别转错：weight 是 **uint8 packed fp4（每字节 2 个 nibble）**，不要 .float()、不要 .view(int8) 后按 fp4 解；scale 是 **float8_e8m0fnu [out, in/32]**。dequant_fp4_block 期望 (packed [out,in//2], scale [out,in//32])，别 reshape 成 (in,out)。
+- 并发引用数不能超过 vram_slots：6 专家/层 + 双缓冲 6 + 预取 12 = 24；多会话时按 union 计算，否则抛 "all VRAM expert slots are referenced"。
+- fetch 异常也要 release（务必用 with）；close() 前等所有 prefetch future 结束（当前 close() 内部 shutdown）。
+- direct=True 只用于专家流；非专家权重仍用 buffered（17.7 GB 常驻 RAM）。ShardReader 每线程一个文件句柄，线程数默认 6。
+- 集成前先跑 `python -m tinyinfer.loading selftest` 与 `budget`；cache/gb 为 0 或分片缺失时会显式抛异常。
+
 ---
 
 ## 10. 实验计划（按依赖顺序）
@@ -484,6 +514,21 @@ CPU 决策点（O6）：
 | E-L9 | 命中率真实化 | E-L3 trace 代入 sim_router | 命中率/预取收益 | 给出 20/24/32 GB 三档真实命中率 |
 
 实验记录建议写入 docs/loading-experiments.md（由 Lead 决定负责人），本文件只保留设计与结论。
+
+### E-L3 预检（2026-10-21，仅 layer 0，真实权重）
+
+条件：model-00003（layer 0，7.39 GB）已完成；159-token 混合代码/文本 prompt；只跑 block0 的 attention+router（跳过 FFN），CPU 0.46 s；hook 真实 gate。
+
+- 触达 232/384 专家；top-6 share 24.3%、top-24 41.9%、top-48 57.8%、top-96 77.5%；有效专家数 131。
+- 相邻位置 top-6 交集均值 **0.85/6（14.2%）**，P(≥1)=47%。
+- 单层 LRU（逐层配额 27 条 ≈ 20 GB/40）：真实命中 **34.4%**；cap 12/20/40/64 → 22.1/28.8/42.0/58.1%。
+- 含义：layer 0 真实集中度不低于合成分布（20 GB 全局 ARC 24.7%），**24.7% 可视为保守下限**；但只是单层 prompt 内统计，decode 跨 token / 40 层仍需 E-L3 全量验证（需全部分片）。
+
+### E-L3/E-L4 阻塞状态
+
+- 下载日志：2026-10-21 00:24 重启后 baseline 11.13/510.3 GB，速率约 12 MB/s（≈11 h 到全量）；当前仅 layer 0 完整，layer 1–39、engram、MTP 未齐。
+- 因此 E-L3 只能先做 layer 0 预检；E-L4 的 lookahead 需要多层 hidden→logits 对，暂不能训练。
+- 权重齐后执行：collect_router_trace.py（128 token × 40 层，1–2 h）→ train_lookahead.py → sim_router.py --trace，替换本文 24.7%/32.1% 的合成数字。
 
 ---
 
@@ -512,12 +557,13 @@ CPU 决策点（O6）：
 1. **先接 ExpertStore，不要接 Prefetcher**：ExpertCache + ExpertStore 是正确性相关（缓存、生命周期、VRAM 槽），Prefetcher 是纯可选加速。建议集成顺序：ExpertStore → 预算/开关 → 多会话 scheduler → prefetcher gate → layer-major prefill。
 2. **moe.py 的改动点**：删除 _expert_cache: dict[int, Expert]；_expert(i) 改为从 ExpertStore 取 rec；6 个专家先全部 fetch 再 dequant（并行）；每层结束 release。Gate.forward 返回值不变。
 3. **数值一致性**：loading 层只改变"字节从哪里来"，不改变 dtype/布局；dequant 输入仍是原 HF 的 uint8/fp8 张量，因此输出应与现在逐层验证结果 bit-exact（除 GPU/CPU kernel 顺序差异）。
-4. **真实 router 分布**：需要全部 40 层分片 + tokenizer；只给我 40 层 gate.weight（约 160 MB）不够，因为路由输入是完整前向的 hidden。等分片齐了我跑 E-L3/E-L4，预计 1–2 小时（128 token × 40 层）。
-5. **需要确认的默认值**：
-   - MTP 默认关（省 8 GB 用于 cache）——是否同意？
-   - 单机并发上限 4（默认 2）——是否与产品预期一致？
-   - head 默认 CPU（26 ms/token）还是 fp8 上卡（+0.66 GB VRAM，省 20 ms）？
-   - 逐层预填充是 O9 的关键，但需要改 model.py 调度；是否排期？
+4. **真实 router 分布（进行中）**：需要全部 40 层分片 + tokenizer；只给 40 层 gate.weight（~160 MB）不够，因为路由输入是完整前向的 hidden。截至 2026-10-21 00:29 下载 baseline 11.13/510.3 GB、~12 MB/s（≈11 h），仅 layer 0 完整。已完成 layer-0 真实预检（见 §10）：232/384 专家、top-24 41.9%、单层 LRU(27) 命中 34.4%，不低于合成的 24.7%。权重齐后我按 E-L3/E-L4 跑全 40 层（1–2 h）替换合成数字。
+5. **已拍板默认值（2026-10-21 Lead）**：
+   - MTP/DSpark 默认关（省 8 GB 给专家缓存，作为可选档，用真实接受率再评估）；
+   - head 默认 CPU bf16（实测 39–41 ms；fp8/int8 备选见 5.4.1，8 GB 卡不划算）；
+   - 专家缓存 20 GB 起步（可配，CLI --expert-cache-gb）；非专家/attn 常驻策略做成配置（auto 29–34 层 / 可全驻 / 可部分驻）；
+   - 多 agent 默认 2 活跃（上限 4）、全局 ExpertCache、会话 pin ≤20%；
+   - 集成顺序：ExpertStore → 预算开关 → SessionScheduler → Prefetcher gate；layer-major prefill 由 Lead 改 model.py。
 6. **接口冻结建议**：loading.py 的 ExpertStore/ExpertRecord/ShardReader 接口先冻结；Prefetcher/Scheduler 可在 E-L5/E-L6 后调整。
 
 ---
@@ -539,12 +585,13 @@ CPU 决策点（O6）：
 
 | 开关 | 默认 | 说明 |
 |---|---|---|
-| --expert-cache-gb | auto（available − 12.8） | 上限 24；最低 4 |
+| --expert-cache-gb | **20**（可配；0=按 available 自动） | Lead 拍板 20 GB 起步；上限 24；最低 4 |
 | --cache-policy | arc | lru/arc/s3fifo |
 | --pin-per-layer | 0（实验 20） | 热度 pin |
+| --session-pin | 0.2 | 单会话 pin 不超过缓存的 20% |
 | --adapt-interval | 128 token | 重算热度/pin |
 | --expert-slots | 24 | VRAM 暂存槽 |
-| --attn-resident | auto | 注意力 fp8 常驻层数 |
+| --attn-resident | auto（29–34） | 可配 full（全 40 层）/ partial（auto）/ N |
 | --direct-io | on | 专家流 NO_BUFFERING |
 | --io-threads | 6 | 读取线程 |
 | --prefetch | on（gate） | 总开关 |
@@ -554,13 +601,13 @@ CPU 决策点（O6）：
 | --prefetch-free-ms | 3 | 计算窗口 |
 | --gate-window | 16 | 统计窗口 |
 | --gate-min-useful | 0.10 | 命中率下限 |
-| --mtp | off | DSpark/MTP |
+| --mtp | **off** | DSpark/MTP 可选档（+8 GB RAM） |
 | --kv-resident | 32768 | VRAM KV tokens |
 | --kv-q8 / --kv-q4 | off | KV 量化 |
 | --engram-row-cache-mb | 256 | Engram 行缓存 |
 | --pcie-frac | 0.5 | missed expert GPU/CPU 分流 |
 | --max-sessions | 2 | 活跃解码会话 |
-| --head | cpu | cpu/fp8/bf16 |
+| --head | **cpu**（bf16） | cpu/fp8/bf16；fp8/int8 见 5.4.1，默认不启用 |
 | --prefill-mode | layer-major | layer-major/chunked |
 
 ---
@@ -579,3 +626,113 @@ CPU 决策点（O6）：
 ---
 
 *本文与 loading.py 同属 loading-researcher 写作用域；修改请同步更新 scripts/prototypes/loading_research/README.md 的实验口径。*
+
+---
+
+## 附录 D：工具输出快照（2026-10-21，RTX 5060 Laptop 8 GB / 47.2 GB RAM / Windows）
+
+复现命令（在 tinyinfer 目录）：
+
+~~~text
+PS> .\.venv\Scripts\python.exe -m tinyinfer.loading selftest
+PS> .\.venv\Scripts\python.exe -m tinyinfer.loading budget --expert-cache-gb 20
+PS> .\.venv\Scripts\python.exe -m tinyinfer.loading sim --steps 128
+~~~
+
+说明：selftest 内部用 16 token 的模拟只是冒烟检查，命中率数字有噪声；正式扫描以 D.3 的 128-token 输出为准。测量期间下载器仍在写盘，NVMe 数字偏保守。
+
+### D.1 selftest（摘录，完整输出以命令为准）
+
+~~~text
+budget plan:
+VRAM total                                                     8.00 GB
+  - desktop/WDDM reserve                                       0.90 GB
+  - CUDA/runtime reserve                                       0.35 GB
+  attention weights pinned (fp8, 170 MB/layer)                 34 layers = 5.78 GB
+  attention weights streamed per token                         6 layers = 1.02 GB
+  expert slots (18.8 MB each)                                  24 = 0.45 GB
+  activations + KV window                                      0.42 GB
+VRAM used                                                      6.65 GB (free 1.35)
+RAM total                                                      47.20 GB
+  - OS + apps reserve                                          6.00 GB
+  non-expert resident (40 layers + embed + head + engram proj) 9.76 GB
+  MTP/DSpark layers (3)                                        0.00 GB
+  KV cache (RAM)                                               0.25 GB
+  pinned staging buffers                                       0.80 GB
+  headroom                                                     2.00 GB
+  expert cache                                                 28.39 GB = 1509 experts (9.8% of all 15360)
+
+IO scenarios (8.8 GB/s):
+  hit=0.0% read= 4.51 GB nvme=   513 ms pcie=  213 ms ~1.55 tok/s
+  hit=20.0% read= 3.61 GB nvme=   410 ms pcie=  178 ms ~1.88 tok/s
+  hit=30.0% read= 3.16 GB nvme=   359 ms pcie=  161 ms ~2.10 tok/s
+  hit=50.0% read= 2.26 GB nvme=   256 ms pcie=  126 ms ~2.77 tok/s
+
+SELFTEST PASSED
+~~~
+
+（selftest 内默认 cache=auto：MTP 关、47.2 GB 全额可用时 28.39 GB；产品默认按 Lead 拍板用 20 GB，见 D.2。）
+
+### D.2 budget（推荐默认：20 GB cache、MTP 关）
+
+~~~text
+VRAM total                                                     8.00 GB
+  - desktop/WDDM reserve                                       0.90 GB
+  - CUDA/runtime reserve                                       0.35 GB
+  attention weights pinned (fp8, 170 MB/layer)                 34 layers = 5.78 GB
+  attention weights streamed per token                         6 layers = 1.02 GB
+  expert slots (18.8 MB each)                                  24 = 0.45 GB
+  activations + KV window                                      0.42 GB
+VRAM used                                                      6.65 GB (free 1.35)
+RAM total                                                      47.20 GB
+  - OS + apps reserve                                          6.00 GB
+  non-expert resident (40 layers + embed + head + engram proj) 9.76 GB
+  MTP/DSpark layers (3)                                        0.00 GB
+  KV cache (RAM)                                               0.25 GB
+  pinned staging buffers                                       0.80 GB
+  headroom                                                     2.00 GB
+  expert cache                                                 20.00 GB = 1063 experts (6.9% of all 15360)
+
+hit=0.0%  read/token= 4.51 GB  NVMe=   513 ms  PCIe=  213 ms  ~1.55 tok/s
+hit=20.0%  read/token= 3.61 GB  NVMe=   410 ms  PCIe=  178 ms  ~1.88 tok/s
+hit=30.0%  read/token= 3.16 GB  NVMe=   359 ms  PCIe=  161 ms  ~2.10 tok/s
+hit=50.0%  read/token= 2.26 GB  NVMe=   256 ms  PCIe=  126 ms  ~2.77 tok/s
+~~~
+
+### D.3 sim（合成 Zipf 0.9 + topic + 25% temporal，128 token × 40 层）
+
+~~~text
+policy           cache GB  hit rate  disk GB/token  speedup
+lru                   4.0     0.000          4.512     0.00
+arc                   4.0     0.039          4.336     0.00
+s3fifo                4.0     0.042          4.324     0.00
+arc+pin20             4.0     0.026          4.395     0.00
+lru                   8.0     0.110          4.017     0.00
+arc                   8.0     0.148          3.845     0.00
+s3fifo                8.0     0.081          4.148     0.00
+arc+pin20             8.0     0.136          3.899     0.00
+lru                  16.0     0.191          3.651     0.00
+arc                  16.0     0.225          3.497     0.00
+s3fifo               16.0     0.131          3.922     0.00
+arc+pin20            16.0     0.225          3.496     0.00
+lru                  24.0     0.249          3.390     0.00
+arc                  24.0     0.268          3.302     0.00
+s3fifo               24.0     0.175          3.724     0.00
+arc+pin20            24.0     0.269          3.297     0.00
+lru                  32.0     0.280          3.249     0.00
+arc                  32.0     0.305          3.137     0.00
+s3fifo               32.0     0.210          3.563     0.00
+arc+pin20            32.0     0.304          3.142     0.00
+prefetch@0.4          0.0     0.400          0.902     1.11
+prefetch@0.5          0.0     0.500          0.752     1.14
+prefetch@0.6          0.0     0.600          0.602     1.17
+prefetch@0.7          0.0     0.700          0.451     1.20
+~~~
+
+读法：命中率按 expert 请求计；disk GB/token 是 NVMe 实际读；prefetch 行的 "hit rate" 实际是预测 precision，"disk GB/token" 是被浪费的预取字节（落在计算窗口内的部分不算关键路径），speedup 是层时间模型（compute=3 ms、B=8.8 GB/s、k=2）。
+
+### D.4 真实 layer-0 预检与 head 实测
+
+- layer 0 真实：232/384 专家，top-24 41.9%，单层 LRU(27) 34.4%，相邻位置重叠 0.85/6（14.2%）。
+- head CPU bf16：[129280,5120] 39–41 ms（16 线程）；fp32 80.9 ms；H2D bf16 pinned 46.3 ms、fp8 pinned 28.2 ms；torch rowwise fp8 _scaled_mm 在 sm_120 报 "Rowwise scaling is not currently supported on your device"。
+- 详见 §5.4.1、§10 E-L3 预检。
