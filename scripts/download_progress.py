@@ -87,6 +87,12 @@ def main():
         eta_h = rem / rate / 3600 if rate > 0 else float("inf")
         print(f"rate since last sample: {rate/1e6:.2f} MB/s   ETA at this rate: {eta_h:.1f} h")
     print(f"incomplete files: {len(partial)}")
+    if "--brief" in sys.argv:
+        done_shards = [n for n, s in files.items() if n.endswith(".safetensors")
+                       and os.path.exists(os.path.join(DEST, n))
+                       and os.path.getsize(os.path.join(DEST, n)) == s]
+        print("shards complete: " + ",".join(sorted(x[6:11] for x in done_shards)))
+        return
     for name, n, size in sorted(partial):
         if n == 0:
             print(f"  {name}: pending ({size/1e9:.2f} GB)")
