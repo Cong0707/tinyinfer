@@ -15,9 +15,10 @@ from .weights import ShardStore
 class Block(HCBlockMixin):
     """One decoder layer: Hyper-Connection collapse -> norm -> attention -> HC expand -> ... FFN."""
 
-    def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig):
+    def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, expert_store=None):
         self.layer_id = layer_id
         self.cfg = cfg
+        self._expert_store = expert_store
         self.hc_mult = cfg.hc_mult
         self.hc_sinkhorn_iters = cfg.hc_sinkhorn_iters
         self.hc_eps = cfg.hc_eps
@@ -25,7 +26,7 @@ class Block(HCBlockMixin):
             self.attn = MLAWindowAttention(store, layer_id, cfg)
         else:
             self.attn = MLACompressedAttention(store, layer_id, cfg)
-        self.ffn = MoE(store, layer_id, cfg)
+        self.ffn = MoE(store, layer_id, cfg, expert_store=expert_store)
         p = f"layers.{layer_id}."
         self.attn_norm = store.get(p + "attn_norm.weight")
         self.ffn_norm = store.get(p + "ffn_norm.weight")
