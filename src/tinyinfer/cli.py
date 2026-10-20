@@ -25,9 +25,29 @@ def _add_backend_args(parser: argparse.ArgumentParser) -> None:
     group = parser.add_argument_group("backend")
     group.add_argument("--backend", choices=("mock", "tiny"), default="mock", help="model backend")
     group.add_argument("--model-dir", default=None, help="HF safetensors directory (backend=tiny)")
+    group.add_argument(
+        "--extra-model",
+        action="append",
+        default=None,
+        metavar="NAME=DIR",
+        help="register an additional model (repeatable)",
+    )
+    group.add_argument("--default-model", default=None, help="model id for unknown model names")
     group.add_argument("--layers", default=None, help="comma separated layer ids (staged loading)")
     group.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     group.add_argument("--model-id", default=None, help="model id reported by /v1/models")
+    group.add_argument(
+        "--tier",
+        default="conservative",
+        choices=("conservative", "balanced"),
+        help="optimization tier (conservative=reference, balanced=ExpertStore experts)",
+    )
+    group.add_argument(
+        "--adapter",
+        default="auto",
+        choices=("auto", "hf_deepseek_v41", "gguf"),
+        help="checkpoint adapter (GGUF is reserved)",
+    )
 
 
 def _add_sampling_args(parser: argparse.ArgumentParser) -> None:
@@ -82,6 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     generate.add_argument("prompt", nargs="?", default=None, help="prompt text (default: read stdin)")
     generate.add_argument("--system", default=None, help="system message (chat mode)")
+    generate.add_argument("--model", default=None, help="registered model id to route to")
     generate.add_argument("--stream", action="store_true", help="print tokens as they arrive")
     generate.add_argument("--json", action="store_true", help="print a JSON result with usage")
     _add_sampling_args(generate)
@@ -90,14 +111,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _build_backend(args: argparse.Namespace):
-    from .server import build_backend, parse_layers
+    from .server import build_backend, models_from_args
 
+    if args.backend == "mock":
+        return build_backend("mock", model_id=args.model_id)
     return build_backend(
-        args.backend,
-        model_dir=args.model_dir,
-        layers=parse_layers(args.layers),
+        "tiny",
+        models=models_from_args(args),
+        tier=args.tier,
+        adapter=args.adapter,
+        default_model=args.default_model,
         device=args.device,
-        model_id=args.model_id,
     )
 
 
@@ -110,8 +134,11 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         level=args.log_level.upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    if args.backend == "tiny" and not args.model_dir:
-        print("error: --model-dir is required with --backend tiny", file=sys.stderr)
+    if args.backend == "tiny" and not args.model_dir and not args.extra_model:
+        print(
+            "error: --model-dir or --extra-model NAME=DIR is required with --backend tiny",
+            file=sys.stderr,
+        )
         return 2
     backend = _build_backend(args)
     try:
@@ -133,7 +160,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     )
     print(
         f"tinyinfer: OpenAI-compatible API on http://{args.host}:{args.port}/v1 "
-        f"(backend={args.backend}, model={backend.model_id})"
+        f"(backend={args.backend}, tier={args.tier}, model={backend.model_id})"
     )
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
     return 0
@@ -179,6 +206,7 @@ def _cmd_generate(args: argparse.Namespace) -> int:
             ],
             sampling=sampling,
             stream=args.stream,
+            model=args.model,
         )
     else:
         request = GenerationRequest(
@@ -186,6 +214,7 @@ def _cmd_generate(args: argparse.Namespace) -> int:
             prompt=prompt,
             sampling=sampling,
             stream=args.stream,
+            model=args.model,
         )
 
     started = time.perf_counter()

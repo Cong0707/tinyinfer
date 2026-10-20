@@ -5,7 +5,7 @@ tinyinfer 的对外服务层：把后端（MockBackend / TinyModelBackend / 后�
 服务层负责协议、SSE、usage、错误格式、request id、API key、限流、超时和会话/槽位。
 
 - 代码：`tinyinfer/src/tinyinfer/server.py`（FastAPI 应用）、`tinyinfer/src/tinyinfer/cli.py`（serve / generate）
-- 测试：`tinyinfer/tests/test_server.py`（40 个用例，MockBackend，无需权重/GPU）
+- 测试：`tinyinfer/tests/test_server.py`（52 个用例；默认全 Mock、无需权重/GPU，另有一个 `TINYINFER_L0=1` 才跑的真实 L0 权重端到端用例）
 - 依赖：`pyproject.toml` 的 `server` extra（fastapi、uvicorn、httpx）
 
 ---
@@ -46,9 +46,13 @@ OpenAPI 在 `/openapi.json`。启动参数（`--help` 可看全量）：
 |---|---|---|
 | `--host / --port` | `127.0.0.1 / 8000` | 监听地址 |
 | `--backend` | `mock` | `mock` 或 `tiny` |
-| `--model-dir` | – | HF safetensors 目录（`--backend tiny` 必填） |
-| `--layers` | 全部 40 层 | 逗号分隔的层号，做分段验证时用，如 `--layers 0,1` |
+| `--model-dir` | – | 默认模型的 HF safetensors 目录（`--backend tiny` 时与 `--extra-model` 至少给一个） |
+| `--extra-model NAME=DIR` | 无 | 注册额外模型，可重复；多模型时按请求的 `model` 路由 |
+| `--default-model` | 第一个 | 客户端传了未注册模型名时落到哪个模型 |
+| `--layers` | 全部 40 层 | 逗号分隔的层号，做分段验证时用，如 `--layers 0`（L0 端到端） |
 | `--device` | `auto` | 预留；当前 TinyModelBackend 是 CPU 参考路径 |
+| `--adapter` | `auto` | `auto` / `hf_deepseek_v41` / `gguf`（GGUF 为预留，返回 501） |
+| `--tier` | `conservative` | `conservative`（纯 PyTorch 参考）/ `balanced`（ExpertStore 分层专家缓存 + tilelang 可用时优先） |
 | `--api-key` | 无 | 逗号分隔多个 key；也支持环境变量 `TINYINFER_API_KEY` |
 | `--max-concurrency` | `4` | 同时在跑的 HTTP 请求数，超过返回 429 |
 | `--max-slots` | `4` | 会话槽位数（KV/专家缓存的归属单位） |
@@ -67,10 +71,10 @@ OpenAPI 在 `/openapi.json`。启动参数（`--help` 可看全量）：
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/health` | 存活、模型、ready、槽位、并发（无需 API key） |
-| GET | `/v1/models` | 列出模型（含别名、上下文/输出上限） |
+| GET | `/v1/models` | 动态列出已配置模型：id、adapter、tier、layers、loaded、supported、context_length 等 |
 | GET | `/v1/models/{id}` | 单个模型元数据；未知 404 |
 | POST | `/v1/completions` | 文本补全（流式/非流式） |
-| POST | `/v1/chat/completions` | 聊天补全（流式/非流式，tools 占位） |
+| POST | `/v1/chat/completions` | 聊天补全（流式/非流式，最小 function calling 回显） |
 | GET | `/v1/slots`、`/slots` | 槽位/会话状态（llama.cpp 风格字段） |
 | POST | `/v1/messages` | Anthropic Messages 预留接口（当前 501） |
 | GET | `/docs`、`/openapi.json` | 交互文档 / OpenAPI |
@@ -236,11 +240,53 @@ with httpx.Client(base_url="http://127.0.0.1:8000/v1", timeout=600) as c:
                 print(chunk["choices"][0]["delta"]["content"], end="", flush=True)
 ```
 
-### 5.4 tools 占位
+### 5.4 最小 function calling（tools 回显）
 
-`tools` / `tool_choice` / `parallel_tool_calls` 会被**接受并忽略**：响应仍是普通
-`assistant` 文本，不会返回 `tool_calls`，`finish_reason` 也不会是 `tool_calls`。
-这是为将来接入结构化输出留的协议位；MockBackend 和 TinyModelBackend 目前都不执行工具。
+`tools` / `tool_choice` 是**最小实现**：不执行工具，但能从模型输出里识别一次函数调用并回显成
+OpenAI 的 `tool_calls`，让 agent 客户端拿到可解析的结果。识别格式（任一）：
+
+- 纯 JSON：{"name": "lookup", "arguments": {"q": "x"}}
+- 代码块：json 围栏包裹的同一 JSON
+- 包装：<tool_call>{...}</tool_call>
+
+规则：
+
+- 只有请求里声明了 `tools` 且模型写出了合法 JSON、名字在 `tools[].function.name` 中时才识别；
+  名字不匹配或 JSON 不合法时，原文按普通 `content` 返回，不会误吞。
+- 非流式：`message.content` 为 null，`message.tool_calls=[{id,type:"function",function:{name,arguments}}]`，
+  `finish_reason="tool_calls"`；arguments 是 JSON 字符串。
+- 流式：声明了 tools 时服务端会**缓冲**完整输出（因为要检测完整 JSON），生成结束后一次性发
+  tool_calls delta 与 finish 帧；未命中则把文本作为单个 content delta 发出（此场景不逐 token 流式）。
+- `tool_choice: "none"` 会关闭识别；`parallel_tool_calls` 目前不处理（只回显一个调用）。
+
+示例：
+
+```powershell
+curl.exe http://127.0.0.1:8000/v1/chat/completions `
+  -H "Content-Type: application/json" `
+  -d '{"messages":[{"role":"user","content":"find tinyinfer"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],"max_tokens":64}'
+```
+
+```json
+{
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [{
+        "id": "call_ab12...",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": "{\"q\": \"tinyinfer\"}"}
+      }]
+    },
+    "finish_reason": "tool_calls"
+  }],
+  "usage": {"prompt_tokens": 8, "completion_tokens": 12, "total_tokens": 20}
+}
+```
+
+注：这是协议层回显，模型本身没有工具执行能力；真正的结构化输出/工具循环留给上层 agent。
 
 ---
 
@@ -291,8 +337,13 @@ class Backend(Protocol):
     def close(self) -> None: ...
 ```
 
-- `GenerationRequest.slot_id` 就是 KV/专家缓存的归属；`reset_slot` 在新会话占用该槽位时调用，
-  后端应丢弃旧缓存（TinyModelBackend 目前只有一份 ring-buffer KV，所以直接 reset 并用锁串行化）。
+- `GenerationRequest.slot_id` 就是 KV/专家缓存的归属。TinyModelBackend 为每个 slot 保存/恢复
+  一份每层 MLA ring-buffer KV 快照（`_bind_slot` / `_stash_slot`），新会话占用槽位时 `reset_slot` 丢掉该槽
+  的 KV 并清理有界专家缓存；不同槽位互不覆盖。OpenAI 语义是"每次请求带完整对话"，所以请求仍从 token 0
+  重新 prefill；槽位快照是隔离边界与将来 resume-from-prefix 的挂点，不是跨请求复用。
+- 专家缓存是模型级共享（只读权重），按 tier 决定：`conservative` 直接读 shard 并只保留最近 N 个
+  dequantized 专家（`max_cached_experts`，默认 64），`balanced` 走 `tinyinfer.loading.ExpertStore`
+  的分层 RAM 缓存。
 - 每个 token 通过 `TokenEvent(text=...)` 流式返回；最后一个事件带 `finish_reason`（`"stop"`/`"length"`）
   和 `usage`；服务端在缺失时兜底计算 usage。
 - 并发上限由 `max_concurrency` 控制；超过直接 429（带 `Retry-After: 1`），不会排队。
@@ -325,6 +376,7 @@ class Backend(Protocol):
 | 429 | `rate_limit_exceeded` / `server_busy` / `session_busy` | 并发超限 / 槽位全忙 / 同会话并发 |
 | 500 | `server_error` / `model_crashed` | 后端内部错误 |
 | 501 | `not_implemented_error` | `/v1/messages`（Anthropic 预留） |
+| 501 | `adapter_not_implemented` / `adapter_not_supported` | GGUF adapter（预留）或其他未实现的 checkpoint 布局 |
 | 503 | `model_not_loaded` / `tokenizer_load_failed` | 权重/分词器未就绪 |
 | 504 | `timeout` | 超过 `--request-timeout` |
 
@@ -352,18 +404,31 @@ data: [DONE]
 
 ## 9. TinyModelBackend 接入状态
 
-`TinyModelBackend` 是真正模型的接入点（Lead 后续集成）：
+`TinyModelBackend` 已接真实 `tinyinfer.model.TinyModel`，checkpoint 布局由
+`tinyinfer.adapters.open_adapter()` 选择（当前实现了 HF deepseek_v41，GGUF 预留）。L0 单层真实权重可以完整跑通：
 
 ```powershell
+# L0 单层（cache/weights 里已有 embed / L0 / head 分片，无需新下载）
 .\tinyinfer\.venv\Scripts\python.exe -m tinyinfer.server `
-  --backend tiny --model-dir .\tinyinfer\cache\weights --layers 0,1 --port 8000
+  --backend tiny --model-dir .\tinyinfer\cache\weights --layers 0 `
+  --model-id deepseek-v41-l0 --tier conservative --port 8000
+
+# balanced：ExpertStore 分层专家缓存
+.\tinyinfer\.venv\Scripts\python.exe -m tinyinfer.cli serve `
+  --backend tiny --model-dir .\tinyinfer\cache\weights --layers 0 --tier balanced
 ```
 
-- 启动时 `warmup()` 加载 `TinyConfig` + `ShardStore` + `TinyModel`（按 `--layers` 组装）和 tokenizer；
-  权重缺失/下载未完成时启动失败并打印原因；请求路径上的 TinyModelBackend 错误是 503 `model_not_loaded`。
-- 生成走 `TinyModel.forward` 的 PyTorch 参考路径；chat 请求优先用 tokenizer 的 chat template。
-- 当前限制：CPU 参考实现、单请求串行、全局一份 KV ring-buffer（`reset_slot` 会清空）。
-  真正的 per-slot KV/专家缓存和 CUDA 路径由引擎集成时补上，接口（`slot_id`/`reset_slot`/`TokenEvent`）已经留好。
+- 启动 `warmup()`：`open_adapter` 检测布局 → `TinyConfig` → `ShardStore` → `TinyModel(layers)` → tokenizer；
+  权重缺失/分片未下完是 503 `model_not_loaded`；GGUF 是 501 `adapter_not_implemented`。
+- adapter：`hf_deepseek_v41` 已实现（adapter 名 `deepseek_v41_hf`，HF index + safetensors 直接加载）；
+  GGUF 走 `tinyinfer.adapters.open_adapter` 的预留分支，server 层已把错误映射成 501 并在 `/v1/models` 标 `supported: false`。
+- tiers（`--tier`）：`conservative` = 纯 PyTorch 参考路径；`balanced` = 额外挂
+  `tinyinfer.loading.ExpertStore`（分层 RAM 专家缓存），attention 在 tilelang 可构建时优先、失败自动回退参考实现；
+  `aggressive`/`extreme` 暂未接入参考路径，启动时明确报错而不是静默降级。
+- slots：见第 6 节。每请求保存/恢复该槽位的 KV ring-buffer 快照，新会话 `reset_slot` 清空；专家缓存模型级共享。
+- 当前限制：CPU 参考实现、同一模型内生成串行（`_gen_lock`）；per-slot KV 只是快照隔离，跨请求仍从
+  token 0 重算（OpenAI 请求本来就带完整对话）。CUDA/真正的 prefix cache 留给引擎集成。
+- L0 实测数字见第 15 节。
 
 ---
 
@@ -373,9 +438,16 @@ data: [DONE]
 # Mock 后端
 .\tinyinfer\.venv\Scripts\python.exe -m tinyinfer.cli generate "hello tinyinfer" --max-tokens 12 --seed 3 --json
 
-# Tiny 后端（需要权重）
+# Tiny 后端：L0 单层真实权重（conservative / balanced）
 .\tinyinfer\.venv\Scripts\python.exe -m tinyinfer.cli generate "hello" `
-  --backend tiny --model-dir .\tinyinfer\cache\weights --layers 0,1 --stream
+  --backend tiny --model-dir .\tinyinfer\cache\weights --layers 0 --max-tokens 2 --json
+.\tinyinfer\.venv\Scripts\python.exe -m tinyinfer.cli generate "hello" `
+  --backend tiny --model-dir .\tinyinfer\cache\weights --layers 0 --tier balanced --stream
+
+# 多模型：默认模型 + 额外注册一个（请求里用 model 选择，未知名字落到 --default-model）
+.\tinyinfer\.venv\Scripts\python.exe -m tinyinfer.cli serve `
+  --backend tiny --model-dir DIR_L0 --layers 0 --model-id l0 `
+  --extra-model gguf-future=DIR_GGUF --default-model l0
 ```
 
 `--json` 输出 `{text, finish_reason, usage, elapsed_s}`；不加时文本打到 stdout、统计打到 stderr。
@@ -385,12 +457,19 @@ data: [DONE]
 ## 11. 测试
 
 ```powershell
+# 默认：52 个用例里 51 个 Mock 全链路 + 1 个真实 L0 用例自动 skip
 .\tinyinfer\.venv\Scripts\python.exe -m pytest .\tinyinfer\tests\test_server.py -q
+
+# 打开真实 L0 权重用例（需要 cache/weights 里已有 embed/L0/head 分片，约 13s）
+$env:TINYINFER_L0='1'
+.\tinyinfer\.venv\Scripts\python.exe -m pytest .\tinyinfer\tests\test_server.py -q -k l0
 ```
 
-覆盖：`/health`、`/v1/models`、completions/chat 的流式与非流式、usage、stop、
-上下文/输出上限、超时 504、并发 429、API key 401、session/slot、后端错误 500/503/SSE 错误帧、
-keep-alive、Anthropic 占位。全部基于 MockBackend，不需要权重、GPU 或网络。
+覆盖：`/health`、`/v1/models`（含 adapter/tier/loaded/supported）、completions/chat 的流式与非流式、
+usage、stop、上下文/输出上限（per-model 1M）、超时 504、并发 429、API key 401、session/slot、
+TinyModelBackend 的 slot KV 归属、multi-model 路由、GGUF 预留 501、最小 function calling、
+后端错误 500/503/SSE 错误帧、keep-alive、Anthropic 占位；L0 用例额外验证真实权重加载、chat 非流式、
+completions SSE 与 /v1/slots。
 
 ---
 
@@ -404,8 +483,11 @@ keep-alive、Anthropic 占位。全部基于 MockBackend，不需要权重、GPU
 | `temperature/top_p/top_k/seed/stop` | ✅ |
 | `max_completion_tokens` 别名、`stream_options.include_usage` | ✅ |
 | 多个 API key、request id、统一错误对象 | ✅ |
-| session/slot 多会话隔离元数据 | ✅（引擎侧 per-slot 缓存待接入） |
-| `tools` / `tool_choice` | ⚠️ 接受但忽略（占位） |
+| session/slot：per-slot KV 快照 + reset_slot | ✅（TinyModelBackend；跨请求 prefix 复用待引擎） |
+| 多模型路由、动态 /v1/models（adapter/tier/loaded/supported） | ✅ |
+| HF deepseek_v41 adapter（open_adapter） | ✅；GGUF ⏳ 预留（501 adapter_not_implemented） |
+| tiers：conservative / balanced（ExpertStore） | ✅；aggressive/extreme ⏳ 未接入参考路径 |
+| `tools` / `tool_choice` 最小 function calling 回显 | ✅（缓冲检测 JSON；不执行工具、不流式逐字输出） |
 | `n>1`、多 prompt 列表、`logprobs`、`echo`、penalties、图片输入 | ❌ 400 或忽略（见第 8 节） |
 | Anthropic `/v1/messages` | ⛔ 501 预留位 |
 | OpenAI `/v1/responses` | ⛔ 未实现（预留，可复用同一 Backend） |
@@ -423,3 +505,157 @@ keep-alive、Anthropic 占位。全部基于 MockBackend，不需要权重、GPU
 - **504 timeout**：预填/解码超过 `--request-timeout`；给大 prompt 或慢机器调大（默认 600s）。
 - **流式没有输出但连接成功**：看 `/health` 的 `ready` 和后端日志；长 prompt 期间只会有
   `: keep-alive` 注释（属正常）。
+- **501 adapter_not_implemented**：checkpoint 是 GGUF（预留）或布局无法识别；换成 HF safetensors
+  （目录里需要 `config.json` + `model.safetensors.index.json`），或查看 `/v1/models` 里的 `supported/note`。
+- **balanced tier 日志出现 ExpertStore 回退**：说明分层专家缓存建不起来（缺少 loading 需要的文件等），
+  会自动退回直接 shard 读取，结果正确但慢；检查 `tinyinfer.loading.ShardIndex` 能否读到分片 header。
+- **L0 启动偏慢**：第一次加载 torch + transformers tokenizer + 3GB 左右的 embed/head/attn 权重，约 10-15s；
+  之后每个请求的 prefill/decode 取决于 prompt 长度和首次专家加载（见第 15 节）。
+- **tools 场景流式不逐字**：声明 `tools` 时服务端需要完整文本才能判断 JSON 函数调用，因此缓冲到结束再发；
+  不声明 tools 时仍逐 token 流式。
+
+---
+
+## 14. 多模型、适配器与 tiers
+
+### 14.1 配置多个模型
+
+没有新的路由端点：同一个 `create_app(backend)` 里，若后端是 `MultiModelBackend`，请求按 `model` 字段路由。
+
+```powershell
+.\tinyinfer\.venv\Scripts\python.exe -m tinyinfer.server `
+  --backend tiny `
+  --model-dir .\tinyinfer\cache\weights --layers 0 --model-id deepseek-v41-l0 `
+  --extra-model gguf-future=.\deepseek\future-gguf `
+  --tier conservative --default-model deepseek-v41-l0
+```
+
+路由规则（对 agent 友好）：
+
+- `model` 精确匹配注册 id 或其 `aliases` → 用该模型的 backend（按需懒加载）；
+- 未知名字（如 agent 配置里的 `gpt-4o` / `deepseek-chat`）→ 落到 `--default-model`，响应里的 `model` 仍回显请求名；
+- `GET /v1/models` 动态列出所有注册项：`id、adapter、tier、layers、loaded、supported、context_length` 等。
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "deepseek-v41-l0",
+      "object": "model",
+      "created": 1792512960,
+      "owned_by": "tinyinfer",
+      "context_length": 1048576,
+      "max_output_tokens": 1048576,
+      "adapter": "deepseek_v41_hf",
+      "tier": "conservative",
+      "layers": [0],
+      "model_dir": "E:\\Develop\\Deepseek\\tinyinfer\\cache\\weights",
+      "loaded": true,
+      "supported": true
+    },
+    {
+      "id": "gguf-future",
+      "adapter": "gguf",
+      "loaded": false,
+      "supported": false,
+      "note": "GGUF adapter is reserved (see tinyinfer.adapters.open_adapter)"
+    }
+  ]
+}
+```
+
+### 14.2 适配器
+
+| adapter | 状态 | 说明 |
+|---|---|---|
+| `hf_deepseek_v41`（auto 检测到 `model.safetensors.index.json`） | ✅ | 走 `tinyinfer.adapters.HFDeepSeekV41Adapter`，adapter 名 `deepseek_v41_hf` |
+| `gguf`（目录里出现 `*.gguf`） | ⏳ 预留 | `open_adapter` 抛 NotImplementedError → server 映射 501；`/v1/models` 标 `supported:false` + note |
+| 其他 HF 架构 | ⏳ | 需要先在 `tinyinfer.adapters` 注册新 adapter |
+
+### 14.3 tiers（`--tier conservative|balanced`）
+
+| tier | 当前行为 | 用途 |
+|---|---|---|
+| `conservative` | 纯 PyTorch 参考路径；专家直接读 shard，每层只保留最近 `max_cached_experts`（默认 64）个 dequantized 专家 | 正确性基线、L0 验证 |
+| `balanced` | 额外构造 `tinyinfer.loading.ExpertStore`（分层 RAM 专家缓存，默认按 `tiers.plan` 的 RAM 预算）；attention 在 tilelang 可构建时优先、失败自动回退 | 更接近最终内存/IO 策略 |
+| `aggressive` / `extreme` | 未接入参考路径，构造时明确报错 | 留给 kernel/量化 KV/投机阶段 |
+
+```python
+from tinyinfer.server import TinyModelBackend
+
+backend = TinyModelBackend(
+    model_dir=r".\tinyinfer\cache\weights",
+    layers=[0],
+    tier="balanced",
+    model_id="deepseek-v41-l0",
+)
+backend.warmup()
+print(backend.health())  # adapter / tier / loaded / slot_caches / expert_store ...
+```
+
+---
+
+## 15. L0 单层真实权重端到端（实测）
+
+2026-10-21，RTX 5060 Laptop（8GB，sm_120）+ Ryzen 9 9955HX + 47GB RAM，纯 Windows，CPU 参考路径。
+权重只用了 `tinyinfer/cache/weights` 里已有的分片（**没有下载新权重**）：
+
+| 分片 | 内容 | 大小 |
+|---|---|---|
+| `model-00002-of-00048.safetensors` | embed | 1.32 GB |
+| `model-00003-of-00048.safetensors` | L0（2334 个张量：attention/HC/shared expert/gate/384×fp4 experts） | 7.39 GB |
+| `model-00043-of-00048.safetensors` | norm + head | 1.32 GB |
+
+启动：`python -m tinyinfer.server --backend tiny --model-dir tinyinfer\cache\weights --layers 0 --model-id deepseek-v41-l0 --tier conservative`
+
+实测（首请求会按 token 路由加载专家，故第一个非流式请求最慢）：
+
+| 客户端 / 场景 | 结果 |
+|---|---|
+| OpenAI Python SDK `client.models.list()` | 0.07s，id=`deepseek-v41-l0`，context_length=1048576 |
+| OpenAI SDK chat 非流式，max_tokens=3 | 5.91s（冷专家），finish=length，usage 10/3/13，text=`medi crowdrende` |
+| OpenAI SDK chat SSE（include_usage） | 0.36s（专家已缓存），6 个 chunk，finish=length，usage 10/3/13 |
+| httpx 非流式 chat，max_tokens=3 | 0.98s，200，finish=length，usage 10/3/13 |
+| httpx 原始 SSE | 1.03s，6 个 chunk，收到 `[DONE]`，usage 10/3/13 |
+| `GET /v1/slots` | 两个 session（`sdk-e2e`、`http-e2e`）各 2 个请求，slot 0/1 |
+
+更早的单模型测量（同一台机器、prefill 4 token）：模型加载 <1s（mmap），tokenizer 首次 8.3s；
+prefill 3.7s，decode 一步 0.74s；prefill 后专家缓存 20 个。balanced tier 预热 5.4s，
+2 token 生成 1.29s，ExpertStore 生效（`expert_store: true`）。
+
+复现（终端 1 启动，终端 2 跑客户端）：
+
+```powershell
+# 终端 1
+.\tinyinfer\.venv\Scripts\python.exe -m tinyinfer.server `
+  --backend tiny --model-dir .\tinyinfer\cache\weights --layers 0 `
+  --model-id deepseek-v41-l0 --port 8125
+```
+
+```python
+from openai import OpenAI
+import httpx, json
+
+client = OpenAI(base_url="http://127.0.0.1:8125/v1", api_key="dummy", timeout=300)
+r = client.chat.completions.create(
+    model="deepseek-v41-l0",
+    messages=[{"role": "user", "content": "hello tinyinfer"}],
+    max_tokens=3, temperature=0, seed=7,
+)
+print(r.choices[0].message.content, r.usage)
+
+with httpx.Client(base_url="http://127.0.0.1:8125", timeout=300) as http:
+    with http.stream("POST", "/v1/chat/completions", json={
+        "model": "deepseek-v41-l0",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 2, "stream": True,
+    }) as stream:
+        for line in stream.iter_lines():
+            if line.startswith("data: ") and line[6:] != "[DONE]":
+                chunk = json.loads(line[6:])
+                print(chunk["choices"][0]["delta"].get("content", ""), end="")
+```
+
+注意：只加载 L0 时模型没有完整语义（输出是单层前向的 token，只为验证链路正确性）；
+L0 也没有经过训练后的 40 层组合，不代表模型质量。真正语义需要全量分片（仍在下载/分层执行阶段）。

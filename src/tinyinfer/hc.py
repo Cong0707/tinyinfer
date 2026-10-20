@@ -43,16 +43,40 @@ class HCBlockMixin:
     hc_ffn_base: torch.Tensor
 
     def hc_mixes(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
-        """x: [b,s,hc,d] -> pre/post/comb coefficients."""
+        """x: [b,s,hc,d] -> pre/post/comb coefficients (fused kernel on CUDA)."""
+        if x.is_cuda:
+            try:
+                from .hc_fused import fused_hc_mixes, fused_sinkhorn
+                b, s = x.shape[0], x.shape[1]
+                x2 = x.reshape(b * s, -1).to(torch.bfloat16)
+                raw = fused_hc_mixes(x2, hc_fn.float(), self.hc_eps)  # [b*s, 24] fp32
+                pre, post, comb = fused_sinkhorn(raw, hc_scale.float(), hc_base.float(),
+                                                 self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
+                return (pre.view(b, s, self.hc_mult), post.view(b, s, self.hc_mult),
+                        comb.view(b, s, self.hc_mult, self.hc_mult))
+            except Exception:
+                pass
         xf = x.flatten(2).float()
         rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.hc_eps)
         mixes = F.linear(xf, hc_fn) * rsqrt
         return hc_split_sinkhorn(mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
 
     def hc_pre(self, x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
+        if x.is_cuda:
+            try:
+                from .hc_fused import fused_hc_pre
+                return fused_hc_pre(x, pre_mix)
+            except Exception:
+                pass
         y = torch.sum(pre_mix.unsqueeze(-1) * x.float(), dim=2)
         return y.to(x.dtype)
 
     def hc_post(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
+        if x.is_cuda:
+            try:
+                from .hc_fused import fused_hc_post
+                return fused_hc_post(x, residual, post, comb)
+            except Exception:
+                pass
         y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
         return y.type_as(x)

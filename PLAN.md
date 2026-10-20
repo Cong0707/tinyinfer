@@ -79,3 +79,16 @@
 
 ### 每级都要保留的可测指标
 每 token 磁盘字节、专家缓存命中率、预取提前量（层数）、CPU/GPU 空闲率、TTFT、tokens/s、PPL 回归。
+
+## 实现进度（2026-10-21 01:15）
+- ✅ HF safetensors 直接加载（fp8/fp4/engram 行读表）；L0-L5 分片完整可跑。
+- ✅ MLA window + 压缩 KV/Indexer（统一支持任意 start_pos/s：分块 prefill + decode）。
+- ✅ MoE：官方 fp4 kernel（M>=32）/GPU dequant 回退；ExpertStore（ARC + 24 VRAM 槽）。
+- ✅ Hyper-Connections（Sinkhorn）；Engram 代码就绪（表分片 196GB 最后下载）。
+- ✅ Engine：chunked prefill、层驻留预算（bf16 3 层 / fp8 33 层）、GPU 流式、slot snapshot/restore、stream_generate。
+- ✅ OpenAI 兼容 server（多 slot/session、SSE、function calling 回显）驱动 Engine。
+- ✅ bench.py（prefill/decode/TTFT/内存）+ tiers（conservative→extreme）+ adapters（HF/GGUF 预留）。
+- ⏳ MTP/DSpark 投机（等 model-00044..46 分片；官方结构已读，初版因质量不足已删除）。
+- ⏳ Engram 表（model-00047/48，196GB）。
+- ⏳ 全 40 层端到端（下载中，7.75%，ETA ~16h）。
+- 已知问题：CPU 参考路径 ~0.3-0.5 tok/s（无优化）；GPU balanced 5 层实测待确认（两个 bench 进程曾并发争用 GPU）。

@@ -44,7 +44,9 @@ __all__ = [
     "ExpertRecord", "Prediction", "PredictionContext", "Predictor",
     "TemporalPredictor", "LookaheadRouterPredictor", "NgramRouterPredictor",
     "OraclePredictor", "EnsemblePredictor", "PrefetchConfig", "Prefetcher",
-    "SessionScheduler", "StepPlan", "simulate_workload", "simulate_cache",
+    "SessionScheduler", "StepPlan", "ExpertSlotPlan", "AttnResidencyPlan",
+    "VramResidencyPlan", "PrefillPlanner", "PrefillPlan", "PrefillLayerPlan",
+    "PrefillWavePlan", "simulate_workload", "simulate_cache",
     "simulate_prefetch", "run_simulation_suite", "format_sim_table", "selftest",
 ]
 
@@ -75,6 +77,9 @@ class ModelGeometry:
     n_activated: int = 6
     weight_block: int = 32
     fp4_bits: int = 4
+    hc_mult: int = 4
+    n_heads: int = 64
+    head_dim: int = 512
 
     def expert_weight_bytes(self) -> int:
         """w1 + w2 + w3 with fp4 packing: 3 * (dim * moe_inter_dim / 2)."""
@@ -267,6 +272,436 @@ class TierBudget:
 
 
 # ---------------------------------------------------------------------------
+# VRAM residency, expert slots and layer-major prefill planning
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ExpertSlotPlan:
+    """How many VRAM expert slots each phase needs (one 18.8 MB blob per slot).
+
+    Decode needs current-layer experts plus a stage group for the next layer;
+    prefill needs a compute group plus a stage group so the next wave's reads
+    overlap the current wave's grouped GEMM.  24 slots -> 12+12 prefill and
+    6+6 decode, which is what the docs budget for.
+    """
+
+    total_slots: int
+    blob_bytes: int
+    decode_current: int
+    decode_stage: int
+    prefill_compute: int
+    prefill_stage: int
+
+    @classmethod
+    def plan(cls, geo: ModelGeometry = ModelGeometry(), slots: int = 24,
+             *, double_buffer: bool = True) -> "ExpertSlotPlan":
+        slots = max(0, int(slots))
+        current = min(geo.n_activated, slots)
+        decode_stage = min(current, slots - current) if double_buffer else 0
+        prefill_stage = (max(1, slots // 2) if double_buffer and slots > 1 else 0)
+        prefill_compute = slots - prefill_stage
+        if prefill_compute <= 0:
+            prefill_compute, prefill_stage = slots, 0
+        return cls(
+            total_slots=slots,
+            blob_bytes=geo.expert_bytes(),
+            decode_current=current,
+            decode_stage=decode_stage,
+            prefill_compute=prefill_compute,
+            prefill_stage=prefill_stage,
+        )
+
+    @property
+    def total_bytes(self) -> int:
+        return self.total_slots * self.blob_bytes
+
+    def slots_for_phase(self, phase: str) -> int:
+        if phase == "decode":
+            return self.decode_current + self.decode_stage
+        if phase == "prefill":
+            return self.prefill_compute + self.prefill_stage
+        return self.total_slots
+
+    def warnings(self) -> list[str]:
+        out: list[str] = []
+        if self.total_slots < self.decode_current + 1:
+            out.append("fewer slots than the 6 experts of one decode layer")
+        elif self.total_slots < ExpertSlotPlan.plan(ModelGeometry(), 12).total_slots:
+            out.append("less than 12 slots: no double buffering for decode/prefill")
+        if self.prefill_compute < 6:
+            out.append("prefill wave < 6 experts: grouped GEMM efficiency drops")
+        return out
+
+    def table(self) -> str:
+        rows = [
+            ("total slots", f"{self.total_slots} = {self.total_bytes / 1e6:.1f} MB"),
+            ("decode", f"{self.decode_current} current + {self.decode_stage} staged"),
+            ("prefill", f"{self.prefill_compute} compute + {self.prefill_stage} staged"),
+        ]
+        out = "\n".join(f"  {a:<24s} {b}" for a, b in rows)
+        warnings = self.warnings()
+        if warnings:
+            out += "\n  warnings: " + "; ".join(warnings)
+        return out
+
+
+@dataclass(frozen=True)
+class AttnResidencyPlan:
+    """Which attention/non-expert layer weights stay pinned in VRAM.
+
+    Every layer's weights are needed once per token anyway; pinning N layers
+    removes N x 170 MB/token of PCIe traffic.  mode: auto (fit the budget),
+    full (all 40; 6.8 GB, only on a bigger card), or an explicit layer count.
+    """
+
+    n_layers: int
+    layer_bytes: int
+    mode: str
+    resident_layers: tuple[int, ...]
+    streamed_layers: tuple[int, ...]
+
+    @classmethod
+    def plan(cls, geo: ModelGeometry = ModelGeometry(), budget_bytes: int = 0,
+             *, mode: Any = "auto", layer_bytes: int | None = None) -> "AttnResidencyPlan":
+        layer_bytes = int(layer_bytes or DEFAULT_LAYER_OTHER_BYTES)
+        if isinstance(mode, str) and mode == "full":
+            count = geo.n_layers
+        elif isinstance(mode, str) and mode.isdigit():
+            count = int(mode)
+        elif isinstance(mode, int) and not isinstance(mode, bool):
+            count = int(mode)
+        else:
+            count = int(max(0, budget_bytes) // layer_bytes)
+        count = max(0, min(geo.n_layers, count))
+        return cls(
+            n_layers=geo.n_layers,
+            layer_bytes=layer_bytes,
+            mode=str(mode),
+            resident_layers=tuple(range(count)),
+            streamed_layers=tuple(range(count, geo.n_layers)),
+        )
+
+    def is_resident(self, layer: int) -> bool:
+        return layer in self.resident_layers
+
+    @property
+    def pinned_bytes(self) -> int:
+        return len(self.resident_layers) * self.layer_bytes
+
+    @property
+    def stream_bytes_per_token(self) -> int:
+        return len(self.streamed_layers) * self.layer_bytes
+
+    def table(self) -> str:
+        return "\n".join([
+            f"  mode                {self.mode}",
+            f"  pinned layers       {len(self.resident_layers)} / {self.n_layers} "
+            f"= {self.pinned_bytes / 1e9:.2f} GB",
+            f"  streamed layers     {len(self.streamed_layers)} "
+            f"= {self.stream_bytes_per_token / 1e6:.1f} MB/token over PCIe",
+        ])
+
+
+@dataclass(frozen=True)
+class VramResidencyPlan:
+    """Whole-VRAM budget: attention residency + expert slots + fixed buffers."""
+
+    vram_total_gb: float
+    desktop_reserve_gb: float
+    runtime_reserve_gb: float
+    activation_bytes: int
+    kv_bytes: int
+    head_bytes: int
+    slots: ExpertSlotPlan
+    attn: AttnResidencyPlan
+    available_bytes: int
+    used_bytes: int
+    warnings: tuple[str, ...] = ()
+
+    @classmethod
+    def plan(
+        cls,
+        geo: ModelGeometry = ModelGeometry(),
+        *,
+        vram_gb: float = 8.0,
+        desktop_reserve_gb: float = 0.9,
+        runtime_reserve_gb: float = 0.35,
+        activation_gb: float = 0.40,
+        kv_gb: float = 0.02,
+        head_gb: float = 0.0,
+        slots: int = 24,
+        attn_mode: Any = "auto",
+    ) -> "VramResidencyPlan":
+        available = int((vram_gb - desktop_reserve_gb - runtime_reserve_gb) * 1e9)
+        activation = int(activation_gb * 1e9)
+        kv = int(kv_gb * 1e9)
+        head = int(head_gb * 1e9)
+        slot_plan = ExpertSlotPlan.plan(geo, slots)
+        fixed = activation + kv + head + slot_plan.total_bytes
+        attn = AttnResidencyPlan.plan(geo, available - fixed, mode=attn_mode)
+        used = fixed + attn.pinned_bytes
+        warns: list[str] = []
+        if used > available:
+            warns.append(f"over budget by {(used - available) / 1e9:.2f} GB "
+                         f"(mode={attn_mode}, slots={slots}); reduce pinned layers or slots")
+        if attn.stream_bytes_per_token:
+            warns.append(f"{len(attn.streamed_layers)} attention layers stream "
+                         f"{attn.stream_bytes_per_token / 1e9:.2f} GB/token over PCIe")
+        return cls(
+            vram_total_gb=vram_gb,
+            desktop_reserve_gb=desktop_reserve_gb,
+            runtime_reserve_gb=runtime_reserve_gb,
+            activation_bytes=activation,
+            kv_bytes=kv,
+            head_bytes=head,
+            slots=slot_plan,
+            attn=attn,
+            available_bytes=available,
+            used_bytes=used,
+            warnings=tuple(warns),
+        )
+
+    @property
+    def free_bytes(self) -> int:
+        return self.available_bytes - self.used_bytes
+
+    @property
+    def feasible(self) -> bool:
+        return self.used_bytes <= self.available_bytes
+
+    def table(self) -> str:
+        rows = [
+            ("VRAM total", f"{self.vram_total_gb:.2f} GB"),
+            ("  desktop/WDDM reserve", f"{self.desktop_reserve_gb:.2f} GB"),
+            ("  CUDA/runtime reserve", f"{self.runtime_reserve_gb:.2f} GB"),
+            ("  activations", f"{self.activation_bytes / 1e9:.2f} GB"),
+            ("  KV window", f"{self.kv_bytes / 1e9:.3f} GB"),
+            ("  head on GPU", f"{self.head_bytes / 1e9:.2f} GB"),
+            ("  expert slots", f"{self.slots.total_slots} = {self.slots.total_bytes / 1e9:.2f} GB"),
+            ("  attention pinned", f"{len(self.attn.resident_layers)} layers = {self.attn.pinned_bytes / 1e9:.2f} GB"),
+            ("VRAM used", f"{self.used_bytes / 1e9:.2f} GB (free {self.free_bytes / 1e9:.2f})"),
+        ]
+        out = "\n".join(f"  {a:<38s} {b}" for a, b in rows)
+        if self.warnings:
+            out += "\n  warnings: " + "; ".join(self.warnings)
+        return out
+
+
+@dataclass(frozen=True)
+class PrefillWavePlan:
+    experts: tuple[int, ...]
+    token_counts: tuple[int, ...]
+    nbytes: int
+
+    @property
+    def tokens(self) -> int:
+        return sum(self.token_counts)
+
+
+@dataclass(frozen=True)
+class PrefillLayerPlan:
+    layer: int
+    n_tokens: int
+    requested: int
+    n_unique: int
+    waves: tuple[PrefillWavePlan, ...]
+    expert_bytes: int
+
+    @property
+    def mean_tokens_per_expert(self) -> float:
+        return self.n_tokens * 6 / max(1, self.n_unique)
+
+    def table(self) -> str:
+        return (f"  L{self.layer:02d} tokens={self.n_tokens:6d} unique={self.n_unique:3d}/384 "
+                f"waves={len(self.waves):2d} bytes={self.expert_bytes / 1e9:.2f} GB "
+                f"tokens/expert={self.mean_tokens_per_expert:.1f}")
+
+
+@dataclass(frozen=True)
+class PrefillPlan:
+    n_tokens: int
+    block: int
+    slots: ExpertSlotPlan
+    resident_attn_layers: int
+    streamed_attn_layers: int
+    layers: tuple[PrefillLayerPlan, ...]
+    projected: bool
+    expert_bytes: int
+    attn_stream_bytes: int
+    engram_bytes: int
+    memory: Mapping[str, int]
+    bandwidth_gbs: float
+    time_seconds: float
+
+    @property
+    def tokens_per_second(self) -> float:
+        return self.n_tokens / self.time_seconds if self.time_seconds else 0.0
+
+    def table(self) -> str:
+        gb = 1e9
+        rows = [
+            ("prompt tokens", f"{self.n_tokens}"),
+            ("token block", f"{self.block}"),
+            ("mode", "projected (routes unknown)" if self.projected else "actual routes"),
+            ("expert I/O", f"{self.expert_bytes / gb:.2f} GB"),
+            ("attention stream I/O", f"{self.attn_stream_bytes / gb:.3f} GB"),
+            ("engram row I/O", f"{self.engram_bytes / 1e6:.2f} MB"),
+            ("I/O time @8.8GB/s", f"{self.time_seconds:.2f} s"),
+            ("prefill throughput", f"{self.tokens_per_second:.1f} tok/s"),
+            ("hidden buffer", f"{self.memory['hidden'] / gb:.2f} GB"),
+            ("KV (prompt)", f"{self.memory['kv'] / gb:.2f} GB"),
+            ("expert wave slots", f"{self.memory['expert_wave'] / gb:.2f} GB"),
+            ("block attention scratch", f"{self.memory['attention_scratch'] / 1e6:.1f} MB"),
+        ]
+        out = "\n".join(f"  {a:<28s} {b}" for a, b in rows)
+        if self.layers:
+            shown = self.layers[:4]
+            out += "\n  first layers:\n" + "\n".join(p.table() for p in shown)
+            if len(self.layers) > len(shown):
+                out += f"\n  ... {len(self.layers) - len(shown)} more layers"
+        return out
+
+    def pseudo_code(self) -> str:
+        return (
+            "H = embed(ids)                      # [1, T, hc, dim], RAM or VRAM\n"
+            "for layer in range(40):\n"
+            "    attn = load_attn_weights(layer)  # fp8 resident or PCIe stream\n"
+            "    for b in blocks(T, BLOCK):       # chunked prefill attention\n"
+            "        H[b] = attn.forward_prefill(H[b], start_pos=b.start)\n"
+            "    logits, routes = gate(all_positions(H))   # [T, 6]\n"
+            "    groups = group_tokens_by_expert(routes)   # sort by expert id\n"
+            "    for wave in waves(sorted(groups), slots.prefill_compute):\n"
+            "        stage_experts(wave.next)      # 12 slots, async pread\n"
+            "        for expert in wave.current:   # 12 slots pinned\n"
+            "            x = gather(H, groups[expert])  # grouped tokens\n"
+            "            y = swiglu_fp4(expert, x)      # dequant inside GEMM\n"
+            "            scatter_add(H, groups[expert], y * weight)\n"
+            "    release(attn, wave slots)\n"
+        )
+
+
+class PrefillPlanner:
+    """Plan a layer-major prefill: experts are read once per layer, not per block.
+
+    The planner is model-agnostic: it needs the token count and (optionally) the
+    real route ids per layer.  With routes it produces exact wave lists and
+    token counts per expert; without routes it projects the unique-expert set
+    (large prompts touch nearly all 384 experts in every layer).
+    """
+
+    def __init__(
+        self,
+        geo: ModelGeometry = ModelGeometry(),
+        n_tokens: int = 1024,
+        *,
+        slots: int = 24,
+        block: int = 1024,
+        attn_resident_layers: int = 40,
+        hidden_dtype_bytes: int = 2,
+        kv_bytes_per_token: int = 1400,
+        bandwidth_gbs: float = 8.8,
+        double_buffer: bool = True,
+    ):
+        self.geo = geo
+        self.n_tokens = max(1, int(n_tokens))
+        self.slots = ExpertSlotPlan.plan(geo, slots, double_buffer=double_buffer)
+        self.block = max(1, int(block))
+        self.attn_resident_layers = max(0, min(geo.n_layers, int(attn_resident_layers)))
+        self.hidden_dtype_bytes = hidden_dtype_bytes
+        self.kv_bytes_per_token = kv_bytes_per_token
+        self.bandwidth_gbs = bandwidth_gbs
+
+    # -- projections -------------------------------------------------------
+    def expected_unique_experts(self) -> float:
+        p = self.geo.n_activated / max(1, self.geo.n_experts)
+        return min(self.geo.n_experts,
+                   self.geo.n_experts * (1.0 - (1.0 - p) ** self.n_tokens))
+
+    def memory(self) -> dict[str, int]:
+        g = self.geo
+        hidden = self.n_tokens * g.hc_mult * g.dim * self.hidden_dtype_bytes
+        pre_mix = self.n_tokens * g.hc_mult * 4
+        kv = self.n_tokens * self.kv_bytes_per_token
+        q_block = self.block * g.n_heads * g.head_dim * self.hidden_dtype_bytes
+        scores = self.block * 128 * g.n_heads * 2  # sliding window x heads (fp16 scores)
+        wave = self.slots.prefill_compute * self.slots.blob_bytes
+        grouped = self.n_tokens * g.n_activated * g.dim * 4
+        return {
+            "hidden": hidden + pre_mix,
+            "kv": kv,
+            "attention_scratch": q_block + scores,
+            "expert_wave": wave,
+            "grouped_activations": grouped,
+        }
+
+    # -- exact planning ----------------------------------------------------
+    def _flatten_routes(self, routes: Any) -> list[int]:
+        out: list[int] = []
+        for row in routes:
+            if isinstance(row, (list, tuple)):
+                out.extend(int(e) for e in row)
+            else:  # numpy array / torch tensor row
+                out.extend(int(e) for e in row.tolist())
+        return out
+
+    def plan_layer(self, layer: int, routes: Any, *, wave_size: int | None = None) -> PrefillLayerPlan:
+        ids = self._flatten_routes(routes)
+        counts: dict[int, int] = {}
+        for e in ids:
+            counts[e] = counts.get(e, 0) + 1
+        order = sorted(counts, key=lambda e: (-counts[e], e))
+        wave = max(1, int(wave_size or self.slots.prefill_compute))
+        waves: list[PrefillWavePlan] = []
+        for i in range(0, len(order), wave):
+            experts = tuple(order[i:i + wave])
+            waves.append(PrefillWavePlan(
+                experts=experts,
+                token_counts=tuple(counts[e] for e in experts),
+                nbytes=len(experts) * self.slots.blob_bytes,
+            ))
+        return PrefillLayerPlan(
+            layer=layer,
+            n_tokens=self.n_tokens,
+            requested=len(ids),
+            n_unique=len(order),
+            waves=tuple(waves),
+            expert_bytes=len(order) * self.slots.blob_bytes,
+        )
+
+    def plan(self, routes_by_layer: Mapping[int, Any] | None = None) -> PrefillPlan:
+        mem = self.memory()
+        engram_per_layer = 24 * 256
+        engram = self.n_tokens * engram_per_layer * len(DEFAULT_ENGRAM_LAYERS)
+        attn_stream = (self.geo.n_layers - self.attn_resident_layers) * DEFAULT_LAYER_OTHER_BYTES
+        if routes_by_layer:
+            layers = tuple(self.plan_layer(layer, routes)
+                           for layer, routes in sorted(routes_by_layer.items()))
+            expert_bytes = sum(p.expert_bytes for p in layers)
+            projected = False
+        else:
+            unique = self.expected_unique_experts()
+            layers = ()
+            expert_bytes = int(round(unique)) * self.slots.blob_bytes * self.geo.n_layers
+            projected = True
+        total = expert_bytes + attn_stream + engram
+        return PrefillPlan(
+            n_tokens=self.n_tokens,
+            block=self.block,
+            slots=self.slots,
+            resident_attn_layers=self.attn_resident_layers,
+            streamed_attn_layers=self.geo.n_layers - self.attn_resident_layers,
+            layers=layers,
+            projected=projected,
+            expert_bytes=expert_bytes,
+            attn_stream_bytes=attn_stream,
+            engram_bytes=engram,
+            memory=mem,
+            bandwidth_gbs=self.bandwidth_gbs,
+            time_seconds=total / (self.bandwidth_gbs * 1e9),
+        )
+
+
+# ---------------------------------------------------------------------------
 # safetensors index and expert blobs
 # ---------------------------------------------------------------------------
 
@@ -344,6 +779,8 @@ class ShardIndex:
                 if len(prefix) != 8:
                     raise ValueError(f"truncated safetensors header: {shard}")
                 size = struct.unpack("<Q", prefix)[0]
+                if size > 200 * 1024 * 1024:
+                    raise ValueError(f"implausible safetensors header size {size}: {shard}")
                 raw = f.read(size)
                 if len(raw) != size:
                     raise ValueError(f"truncated safetensors header: {shard}")
@@ -918,12 +1355,15 @@ class ExpertCache:
         self._stats.evictions += 1
         return True
 
-    def _insert_locked(self, key: tuple[int, int], data: bytearray, *, pinned: bool = False) -> None:
+    def _insert_locked(self, key: tuple[int, int], data: bytearray, *,
+                       pinned: bool = False, admit: bool = True) -> None:
         old = self._entries.get(key)
         if old is not None:
             self._stats.hits += 1
             self.policy.on_hit(key)
             return
+        if not admit:
+            return  # prefill streaming: read once, keep the cache for decode/hot experts
         while len(self._entries) >= self.capacity_entries:
             if not self._evict_locked():
                 break
@@ -933,7 +1373,8 @@ class ExpertCache:
             self.pin(key)
         self._stats.loads += 1
 
-    def get(self, layer: int, expert: int, *, blocking: bool = True) -> bytearray | None:
+    def get(self, layer: int, expert: int, *, blocking: bool = True,
+            admit: bool = True) -> bytearray | None:
         key = (layer, expert)
         with self._lock:
             data = self._entries.get(key)
@@ -952,11 +1393,11 @@ class ExpertCache:
             self._stats.disk_reads += 1
             self._stats.disk_bytes += len(data)
             self._stats.load_seconds += time.perf_counter() - started
-            self._insert_locked(key, data)
+            self._insert_locked(key, data, admit=admit)
             self._freq[key] += 1
         return data
 
-    def prefetch(self, layer: int, experts: Iterable[int]) -> Future:
+    def prefetch(self, layer: int, experts: Iterable[int], *, admit: bool = True) -> Future:
         """Read a set of experts into RAM in the background (deduplicated)."""
 
         def work() -> int:
@@ -972,7 +1413,7 @@ class ExpertCache:
                     if key not in self._entries:
                         self._stats.disk_reads += 1
                         self._stats.disk_bytes += len(data)
-                        self._insert_locked(key, data)
+                        self._insert_locked(key, data, admit=admit)
                         loaded += 1
                     self._stats.prefetch_issued += 1
             return loaded
@@ -1041,12 +1482,16 @@ class ExpertCache:
 
 
 class VramSlotCache:
-    """Fixed ring of device buffers, one expert blob per slot.
+    """Explicit-state VRAM expert slots: FREE -> RESERVED -> COPYING -> STAGED -> IN_USE.
 
-    Slots are staging memory, not a second copy of the RAM cache: evicting a
-    slot never loses data (the RAM cache still has it).  This keeps VRAM usage
-    explainable and bounded (24 slots x 18.8 MB = 451 MB by default).
+    Concurrent-safe by construction: a single lock guards all state transitions,
+    per-slot CUDA events signal copy completion (the compute stream waits on the
+    event instead of polling), and a condition variable lets acquire() block until
+    a prefetch finishes. Eviction only ever touches slots with zero references.
     """
+
+    FREE, RESERVED, COPYING, STAGED, IN_USE = 0, 1, 2, 3, 4
+    _NAMES = {0: "free", 1: "reserved", 2: "copying", 3: "staged", 4: "in_use"}
 
     def __init__(self, slots: int, blob_bytes: int, device: str = "cuda",
                  dtype: Any = None, pin_staging: bool = True):
@@ -1058,14 +1503,24 @@ class VramSlotCache:
         self._torch = None
         self._buffers: list[Any] = []
         self._staging: Any = None
-        self._owner: list[tuple[int, int] | None] = [None] * self.slots
-        self._refs: list[int] = [0] * self.slots
-        self._lru: list[tuple[int, int]] = []
-        self._lock = threading.RLock()
+        self._staging_b: Any = None       # second staging buffer for the prefetch thread
+        self._copy_stream: Any = None
+        self._copy_events: list[Any] = []
+        self._state = [self.FREE] * self.slots
+        self._key: list[tuple[int, int] | None] = [None] * self.slots
+        self._refs = [0] * self.slots
+        self._event: list[Any] = [None] * self.slots
+        self._by_key: dict[tuple[int, int], int] = {}
+        self._lru: list[int] = []
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._staging_lock = threading.Lock()
+        self._staging_lock_b = threading.Lock()
         self.hits = 0
         self.loads = 0
         self.evictions = 0
 
+    # -- infrastructure ---------------------------------------------------
     def _ensure(self):
         if self._buffers or self.slots == 0:
             return
@@ -1076,37 +1531,12 @@ class VramSlotCache:
         self._buffers = [torch.empty(self.blob_bytes, dtype=dtype, device=dev) for _ in range(self.slots)]
         if self.pin_staging and dev.type == "cuda":
             self._staging = torch.empty(self.blob_bytes, dtype=dtype, pin_memory=True)
+            self._staging_b = torch.empty(self.blob_bytes, dtype=dtype, pin_memory=True)
+            self._copy_stream = torch.cuda.Stream(device=dev)
+            self._copy_events = [torch.cuda.Event() for _ in range(self.slots)]
 
-    def acquire(self, layer: int, expert: int) -> int:
-        self._ensure()
-        key = (layer, expert)
-        with self._lock:
-            if key in self._lru:
-                idx = self._lru.index(key)
-                self._owner[idx] = key
-                self._refs[idx] += 1
-                self.hits += 1
-                return idx
-            free = next((i for i, o in enumerate(self._owner) if o is None), None)
-            if free is None:
-                for i in self._lru:
-                    idx = self._lru.index(i)
-                    if self._refs[idx] == 0:
-                        free = idx
-                        break
-            if free is None:
-                raise RuntimeError("all VRAM expert slots are referenced")
-            if self._owner[free] is not None:
-                self.evictions += 1
-                self._lru.remove(self._owner[free])
-            self._owner[free] = key
-            self._refs[free] = 1
-            self._lru.append(key)
-            self.loads += 1
-            return free
-
-    def copy_in(self, slot: int, data: Any) -> None:
-        self._ensure()
+    def _copy_blocking(self, idx: int, data: Any, event: Any = None):
+        """Copy data bytes into slot idx; returns the completion CUDA event (or None)."""
         import torch
         if isinstance(data, bytearray):
             cpu = torch.frombuffer(data, dtype=torch.uint8)
@@ -1114,21 +1544,163 @@ class VramSlotCache:
             cpu = torch.frombuffer(bytearray(data), dtype=torch.uint8)
         else:
             cpu = data
-        if cpu.dtype != self._buffers[slot].dtype:
-            cpu = cpu.view(self._buffers[slot].dtype)
-        if self._staging is not None:
-            self._staging.copy_(cpu)
-            self._buffers[slot].copy_(self._staging, non_blocking=True)
-        else:
-            self._buffers[slot].copy_(cpu, non_blocking=True)
+        buf = self._buffers[idx]
+        if cpu.dtype != buf.dtype:
+            cpu = cpu.view(buf.dtype)
+        # prefetch thread uses the second staging buffer so it never blocks a fetch copy
+        use_b = threading.current_thread().name.startswith("vram-prefetch")
+        lock = self._staging_lock_b if use_b else self._staging_lock
+        staging = self._staging_b if use_b and self._staging_b is not None else self._staging
+        with lock:
+            if staging is not None and self._copy_stream is not None:
+                ev = event if event is not None else torch.cuda.Event()
+                staging.copy_(cpu)
+                with torch.cuda.stream(self._copy_stream):
+                    buf.copy_(staging, non_blocking=True)
+                    ev.record(self._copy_stream)
+                return ev
+            buf.copy_(cpu, non_blocking=True)
+            return None
+
+    def _find_victim_locked(self) -> int | None:
+        for idx in range(self.slots):
+            if self._state[idx] == self.FREE:
+                return idx
+        for idx in self._lru:
+            if self._state[idx] in (self.STAGED, self.IN_USE) and self._refs[idx] == 0:
+                return idx
+        return None
+
+    def _evict_locked(self, idx: int) -> None:
+        key = self._key[idx]
+        if key is not None:
+            self._by_key.pop(key, None)
+            self._key[idx] = None
+        if idx in self._lru:
+            self._lru.remove(idx)
+        self._state[idx] = self.FREE
+        self._refs[idx] = 0
+        self._event[idx] = None
+        self.evictions += 1
+
+    def _reserve_locked(self, key: tuple[int, int]) -> int | None:
+        if key in self._by_key:
+            return self._by_key[key]
+        idx = self._find_victim_locked()
+        if idx is None:
+            return None
+        if self._state[idx] != self.FREE:
+            self._evict_locked(idx)
+        self._key[idx] = key
+        self._by_key[key] = idx
+        self._state[idx] = self.RESERVED
+        self._lru.append(idx)
+        self.loads += 1
+        return idx
+
+    # -- prefetch path ----------------------------------------------------
+    def preload(self, layer: int, expert: int, data: Any) -> bool:
+        """Reserve, copy and publish an expert for a later acquire() (background safe)."""
+        self._ensure()
+        key = (layer, expert)
+        with self._lock:
+            if key in self._by_key:
+                return False
+            idx = self._reserve_locked(key)
+            if idx is None:
+                return False
+            self._state[idx] = self.COPYING
+        import torch
+        ev = torch.cuda.Event()
+        with self._lock:
+            self._event[idx] = ev  # published before the copy so acquire() can wait on it
+        try:
+            self._copy_blocking(idx, data, event=ev)
+        except BaseException:
+            with self._lock:
+                self._evict_locked(idx)
+                self._cond.notify_all()
+            raise
+        with self._lock:
+            if self._state[idx] == self.COPYING:
+                self._state[idx] = self.STAGED
+            self._cond.notify_all()
+        return True
+
+    # -- fetch path -------------------------------------------------------
+    def acquire(self, layer: int, expert: int) -> tuple[int, bool]:
+        """Return (slot, ready). ready=False means the caller must copy_in + publish."""
+        self._ensure()
+        key = (layer, expert)
+        with self._cond:
+            while True:
+                idx = self._by_key.get(key)
+                if idx is not None:
+                    st = self._state[idx]
+                    if st in (self.STAGED, self.IN_USE):
+                        self._refs[idx] += 1
+                        self.hits += 1
+                        self._state[idx] = self.IN_USE
+                        return idx, True
+                    if st == self.COPYING:
+                        # consume immediately; the compute stream waits on the slot event
+                        self._refs[idx] += 1
+                        self.hits += 1
+                        self._state[idx] = self.IN_USE
+                        return idx, True
+                    # RESERVED: prefetch has not started the copy yet; wait for publish
+                    if not self._cond.wait(timeout=5.0):
+                        raise RuntimeError(f"VRAM slot prefetch stalled for {key} state={self._NAMES[st]}")
+                    continue
+                idx = self._reserve_locked(key)
+                if idx is None:
+                    # no evictable slot: degrade to the RAM record instead of blocking/crashing
+                    return -1, False
+                self._refs[idx] = 1
+                self._state[idx] = self.IN_USE
+                return idx, False
+
+    def copy_in(self, slot: int, data: Any):
+        return self._copy_blocking(slot, data)
+
+    def publish(self, slot: int, event: Any = None) -> None:
+        with self._lock:
+            if event is not None:
+                self._event[slot] = event
+            if self._state[slot] == self.COPYING:
+                self._state[slot] = self.STAGED
+            self._cond.notify_all()
+
+    def wait_event(self, slot: int) -> None:
+        ev = self._event[slot]
+        if ev is not None:
+            self._torch.cuda.current_stream().wait_event(ev)
 
     def release(self, layer: int, expert: int) -> None:
         key = (layer, expert)
         with self._lock:
-            for i, owner in enumerate(self._owner):
-                if owner == key and self._refs[i] > 0:
-                    self._refs[i] -= 1
-                    return
+            idx = self._by_key.get(key)
+            if idx is None:
+                return
+            if self._refs[idx] > 0:
+                self._refs[idx] -= 1
+            if self._refs[idx] == 0 and self._state[idx] == self.IN_USE:
+                self._state[idx] = self.STAGED
+            self._cond.notify_all()
+
+    def has(self, layer: int, expert: int) -> bool:
+        with self._lock:
+            return (layer, expert) in self._by_key
+
+    def is_staged(self, layer: int, expert: int) -> bool:
+        with self._lock:
+            idx = self._by_key.get((layer, expert))
+            return idx is not None and self._state[idx] == self.STAGED
+
+    @property
+    def staged_count(self) -> int:
+        with self._lock:
+            return sum(1 for s in self._state if s == self.STAGED)
 
     @property
     def buffer(self):
@@ -1141,7 +1713,11 @@ class VramSlotCache:
         with self._lock:
             return {"slots": self.slots, "blob_bytes": self.blob_bytes,
                     "hits": self.hits, "loads": self.loads, "evictions": self.evictions,
+                    "staged": sum(1 for s in self._state if s == self.STAGED),
+                    "copying": sum(1 for s in self._state if s == self.COPYING),
                     "gb": self.slots * self.blob_bytes / 1e9}
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -1217,6 +1793,8 @@ class ExpertStore:
         self.slots = VramSlotCache(vram_slots, self.index.expert_blob_bytes(), device=device) if vram_slots else None
         self.device = device
         self._open: dict[tuple[int, int], int] = defaultdict(int)
+        self._stream_reads = 0
+        self._stream_bytes = 0
         self._lock = threading.RLock()
 
     @classmethod
@@ -1231,23 +1809,65 @@ class ExpertStore:
             index.weight_map = weight_map
         return cls(model_dir, index=index, **kwargs)
 
-    def _materialize(self, layer: int, expert: int) -> ExpertRecord:
-        data = self.ram.get(layer, expert)
+    def _materialize(self, layer: int, expert: int, *, cache: bool = True) -> ExpertRecord:
         blob = self.index.expert_blob(layer, expert)
+        if cache:
+            data = self.ram.get(layer, expert)
+        else:
+            # prefill streams each expert once per layer; do not evict the
+            # decode/hot working set from the RAM cache for one-off bytes.
+            data = self.ram.get(layer, expert, admit=False)
+            with self._lock:
+                self._stream_reads += 1
+                self._stream_bytes += len(data)
         if self.slots is None or self.slots.slots == 0:
             return ExpertRecord((layer, expert), data, blob.tensors, "cpu")
-        slot = self.slots.acquire(layer, expert)
-        self.slots.copy_in(slot, data)
+        slot, ready = self.slots.acquire(layer, expert)
+        if slot < 0:  # no VRAM slot available: serve straight from the RAM cache
+            return ExpertRecord((layer, expert), data, blob.tensors, "cpu")
+        if ready:
+            self.slots.wait_event(slot)  # compute stream waits for the prefetch DMA
+        else:
+            ev = self.slots.copy_in(slot, data)
+            self.slots.publish(slot, ev)
         return ExpertRecord((layer, expert), self.slots.buffer(slot), blob.tensors, self.device)
 
-    def fetch(self, layer: int, experts: Iterable[int]) -> list[ExpertRecord]:
+    def fetch(self, layer: int, experts: Iterable[int], *, cache: bool = True) -> list[ExpertRecord]:
         records = []
         for expert in experts:
             expert = int(expert)
-            records.append(self._materialize(layer, expert))
+            records.append(self._materialize(layer, expert, cache=cache))
             with self._lock:
                 self._open[(layer, expert)] += 1
         return records
+
+    def prefetch_to_vram(self, layer: int, experts: Iterable[int], *, cache: bool = True) -> int:
+        """Stage experts in VRAM slots without taking references (prefill waves).
+
+        Runs on a background thread: the RAM fetch and the copy-stream DMA proceed while
+        the main thread keeps computing (acquire() waits on the per-slot event).
+        """
+        if self.slots is None or self.slots.slots == 0:
+            return 0
+        experts = [int(e) for e in experts]
+        if getattr(self, "_vram_executor", None) is None:
+            import concurrent.futures
+            self._vram_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1,
+                                                                        thread_name_prefix="vram-prefetch")
+
+        def work():
+            staged = 0
+            for expert in experts:
+                if self.slots.is_staged(layer, expert):
+                    continue
+                blob = self.index.expert_blob(layer, expert)
+                data = self.ram.get(layer, expert, admit=cache)
+                if self.slots.preload(layer, expert, data):
+                    staged += 1
+            return staged
+
+        self._vram_executor.submit(work)
+        return 0
 
     def release(self, records: Iterable[ExpertRecord]) -> None:
         for rec in records:
@@ -1258,12 +1878,16 @@ class ExpertStore:
                 self.slots.release(layer, expert)
 
     @contextmanager
-    def experts(self, layer: int, experts: Iterable[int]) -> Iterator[list[ExpertRecord]]:
-        records = self.fetch(layer, experts)
+    def experts(self, layer: int, experts: Iterable[int], *,
+                cache: bool = True) -> Iterator[list[ExpertRecord]]:
+        records = []
         try:
-            yield records
+            fetched = self.fetch(layer, experts, cache=cache)
+            records.extend(fetched)
+            yield fetched
         finally:
-            self.release(records)
+            if records:
+                self.release(records)
 
     def prefetch(self, layer: int, experts: Iterable[int]) -> Future:
         return self.ram.prefetch(layer, experts)
@@ -1275,7 +1899,9 @@ class ExpertStore:
         return self.ram.pin_hot(per_layer=per_layer)
 
     def stats(self) -> dict[str, Any]:
-        out: dict[str, Any] = {"ram": self.ram.stats(), "reader": self.reader.stats()}
+        out: dict[str, Any] = {"ram": self.ram.stats(), "reader": self.reader.stats(),
+                               "stream_reads": self._stream_reads,
+                               "stream_gb": self._stream_bytes / 1e9}
         if self.slots is not None:
             out["vram"] = self.slots.stats()
         return out
@@ -2038,6 +2664,40 @@ def _selftest_body(root: Path, opened: list[Any]) -> None:
     prefetcher.wait()
     assert prefetcher.total_issued > 0, prefetcher.stats()
 
+    # --- layer-major prefill planner + residency plans ---
+    slot_plan = ExpertSlotPlan.plan(ModelGeometry(), 24)
+    assert (slot_plan.prefill_compute, slot_plan.prefill_stage) == (12, 12), slot_plan
+    assert slot_plan.decode_current == 6
+    vram_plan = VramResidencyPlan.plan()
+    assert vram_plan.feasible and len(vram_plan.attn.resident_layers) >= 1
+    planner = PrefillPlanner(ModelGeometry(), 512, slots=24, block=256, attn_resident_layers=34)
+    projected = planner.plan()
+    assert projected.projected and projected.expert_bytes > 0 and projected.time_seconds > 0
+    route_map = {layer: np.tile(np.arange(6, dtype=np.int16), (512, 1)) for layer in range(2)}
+    actual = planner.plan(route_map)
+    assert not actual.projected and len(actual.layers) == 2 and actual.layers[0].waves
+    assert actual.layers[0].n_unique == 6
+    print(f"prefill(projected 512): {projected.expert_bytes / 1e9:.1f} GB, "
+          f"{projected.time_seconds:.1f} s, {projected.tokens_per_second:.1f} tok/s; "
+          f"VRAM plan {vram_plan.used_bytes / 1e9:.2f}/{vram_plan.available_bytes / 1e9:.2f} GB")
+
+    # --- VRAM staging (double buffer) + cache-less streaming ---
+    store3 = ExpertStore.from_store(type("S", (), {"model_dir": root})(),
+                                    cache_bytes=2 * blob.total_bytes, policy="arc",
+                                    vram_slots=4, device="cpu")
+    opened.append(store3)
+    staged = store3.prefetch_to_vram(0, [0, 1])
+    assert staged == 2, staged
+    assert store3.slots.staged_count == 2
+    entries_before = len(store3.ram)
+    recs = store3.fetch(0, [2], cache=False)
+    assert len(recs) == 1 and store3.stats()["stream_reads"] == 1
+    assert len(store3.ram) == entries_before, "cache=False must not admit"
+    store3.release(recs)
+    with store3.experts(0, [0]) as recs:
+        assert store3.slots.is_staged(0, 0) is False
+    assert not store3.slots.has(0, 0) or store3.slots.staged_count == 1
+
     budget = TierBudget.plan()
     assert budget.ram_expert_entries > 0
     io = IoBudget.compute(ModelGeometry(), hit_rate=0.3)
@@ -2067,9 +2727,38 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_budget.add_argument("--mtp", action="store_true", help="include the 8 GB MTP/DSpark set")
     p_budget.add_argument("--expert-cache-gb", type=float, default=20.0,
                           help="recommended default expert-cache size (0 = computed max)")
+    p_prefill = sub.add_parser("prefill")
+    p_prefill.add_argument("--tokens", default="1024,8192,32768",
+                           help="comma separated prompt lengths")
+    p_prefill.add_argument("--slots", type=int, default=24)
+    p_prefill.add_argument("--block", type=int, default=1024)
+    p_prefill.add_argument("--attn-resident", type=int, default=34)
+    p_prefill.add_argument("--bandwidth", type=float, default=8.8)
+    p_vram = sub.add_parser("vram")
+    p_vram.add_argument("--vram", type=float, default=8.0)
+    p_vram.add_argument("--slots", type=int, default=24)
+    p_vram.add_argument("--attn-mode", default="auto")
+    p_vram.add_argument("--head-gb", type=float, default=0.0)
     args = parser.parse_args(list(argv) if argv is not None else None)
     if args.cmd == "sim":
         print(format_sim_table(run_simulation_suite(steps=args.steps)))
+        return 0
+    if args.cmd == "prefill":
+        for tok in [int(x) for x in args.tokens.split(",") if x.strip()]:
+            planner = PrefillPlanner(ModelGeometry(), tok, slots=args.slots, block=args.block,
+                                     attn_resident_layers=args.attn_resident,
+                                     bandwidth_gbs=args.bandwidth)
+            print(f"=== layer-major prefill: {tok} tokens, slots={args.slots}, block={args.block} ===")
+            print(planner.plan().table())
+            print()
+        return 0
+    if args.cmd == "vram":
+        plan = VramResidencyPlan.plan(vram_gb=args.vram, slots=args.slots,
+                                      attn_mode=args.attn_mode, head_gb=args.head_gb)
+        print(plan.table())
+        print()
+        print(plan.attn.table())
+        print(plan.slots.table())
         return 0
     if args.cmd == "budget":
         cap = args.expert_cache_gb if args.expert_cache_gb > 0 else None

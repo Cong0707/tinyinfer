@@ -18,6 +18,7 @@
 6. **预填充是最大惊喜**：512-token chunk 会触及几乎全部 384 专家/层 → 288.7 GB，33 s，**15.6 tok/s**；但若按"逐层预填充（layer-major）"把整个 prompt 一次喂完（激活放 RAM，专家每层只读一遍），8K prompt 也只要 ~33 s + 计算 → **~240 tok/s 预填充**。这是 O9 的核心设计。
 7. **推荐默认配置（Lead 已拍板）**：MTP 关、head 放 CPU（实测 bf16 matvec 37.8–40.8 ms）、注意力 fp8 常驻 auto（29–34 层，可配全驻/部分驻）、24 个专家槽（451 MB）、RAM 专家缓存 20 GB 起步（可配）、ARC + 热度 pin、O_DIRECT 专家流、预取 lead=1 层 / k=2 / gate 开、活跃会话 2（上限 4）。fp8/int8 head 备选评估见 5.4.1：8 GB 卡上不划算，保持 CPU。
 8. **真实 router 分布：layer 0 已完成，全 40 层待权重**。layer 0 真实预检（159 token）给出 232/384 专家、top-24 41.9%、单层 LRU(27) 命中 34.4%，不低于合成 24.7%，可把 24.7% 当保守下限。完整 E-L3/E-L4 需要全部 40 层分片 + tokenizer（当前下载 baseline 11.13/510.3 GB，约 11 h）；只下载 40 层 gate 权重（~160 MB）不够，因为路由输入是完整前向 hidden。脚本已就绪（scripts/prototypes/loading_research/）。
+9. **layer-major 方案与接口已交付（待 Lead 实施）**：§4.2 给出调度/伪代码/预算/实施清单；PrefillPlanner 已实现（prefill CLI 可复现 1K/8K/32K 计划）；VRAM 24 槽 = decode 6+6 / prefill 12+12，VramSlotCache 支持 preload 双缓冲；非专家驻留由 AttnResidencyPlan/VramResidencyPlan 与 CUDA 预算联动；40 层 trace 脚本 smoke 通过。
 
 ---
 
@@ -201,7 +202,7 @@ B_nvme = 4.5 GB/s 时：0.88 / 1.18 / 1.31 tok/s（0 / 27% / 35%）；B_nvme = 3
     t_token ≈ t_nvme + 0.35 × t_pcie + 0.060 s
     tok/s = 1 / t_token
 
-### 4.2 预填充（逐 token 块 vs 逐层）
+### 4.2 预填充：逐块重读 vs layer-major（O9 核心）
 
 | 策略 | 1K prompt 专家 I/O | 时间 @8.8 | 预填充吞吐 | TTFT |
 |---|---:|---:|---:|---:|
@@ -210,11 +211,73 @@ B_nvme = 4.5 GB/s 时：0.88 / 1.18 / 1.31 tok/s（0 / 27% / 35%）；B_nvme = 3
 | 逐层 + 8K prompt | 288.7 GB | 32.8 s | ~250 tok/s | ~33 s + 计算 |
 | 逐层 + 32K prompt | 288.7 GB | 32.8 s | ~1000 tok/s | ~33 s + 计算/注意力 |
 
-逐层预填充（layer-major prefill，O9 核心）：
-1. 把整个 prompt 的 hidden（hc_mult × dim × 2 B = 40 KB/token）放 RAM；8K → 328 MB，32K → 1.3 GB。
-2. for layer in 40: 先算该层 attention（按 token 块，KV 流式），得到 router 输入；按 expert 分组所有 token；对 384 专家分 wave（wave_size = (slots − 6)/2 = 9），每个专家只读一次，做 grouped GEMM；写回 hidden。
-3. 结果：专家 I/O 与 prompt 长度基本无关（每层 7.22 GB 封顶），预填充从"每 token 4.5 GB"降到"每层 7.2 GB"。
-4. 代价：hidden 全量驻 RAM（8K 0.33 GB）、attention 需要按块重算/缓存、实现复杂度高；需要 tinyinfer.model 改成 layer-major 调度。这是 O5/O9 的主要工程量。
+#### 4.2.1 layer-major 调度设计（Lead 按此改 model.py）
+
+约束与关键洞察：
+- 一个 512-token 块会触达该层几乎全部 384 专家（1-(1-6/384)^512≈100%）；按块跑会在下一块**重新读同一批专家**。固定读盘量 = 288.78 GB（40 层 × 384 × 18.80 MB），与 prompt 长度基本无关。
+- 因此**顺序必须是"层优先"**：先对整 prompt 做完 layer L 的 attention，再一次性把 layer L 的 384 个专家各读一次、处理所有 token，然后才进入 layer L+1。hidden/residual 必须跨 token 保存（H buffer）。
+- attention 仍按 token 块算（控制激活/显存），但**每层只建一次 KV**：块 b 从 start_pos=b 继续追加 window/compressed KV。当前 compressed_attention.py 的 start_pos>0 分支按 decode（s=1）写，必须新增分块 prefill 路径（见 4.2.4 第 1 条）。
+
+单层流程（伪代码，PrefillPlan.pseudo_code 同源）：
+
+    H = embed(ids)                    # [1, T, hc, dim]，T 为 prompt 长度
+    for L in range(40):
+        attn = load_attn(L)           # fp8 常驻或 PCIe 流
+        for (a, b) in blocks(T, BLOCK):           # 例如 BLOCK=1024
+            h_attn = attn.forward_prefill(H[:, a:b], start_pos=a)
+            H[:, a:b] = hc_post(h_attn, H[:, a:b], ...)   # 残差+HC
+        logits, routes = gate_over_positions(H)   # [T, 6]，CPU/GPU 均可
+        groups = group_tokens_by_expert(routes)   # 按 expert 排序
+        ffn_out = zeros(T, dim)
+        for wave in waves(sorted(groups), slots.prefill_compute=12):
+            stage_next_wave(wave.next)            # 12 slots，async pread，cache=False
+            for e in wave.current:                # 12 slots pinned
+                x = gather(normed_h, groups[e])   # 该专家负责的 token 行
+                y = swiglu_fp4(e, x)              # fp4 原样上卡，dequant 融合
+                scatter_add(ffn_out, groups[e], y * gate_weight)
+        H = hc_post(ffn_out, H, ffn_coefs)        # 写回，进入下一层
+    logits = head(H[:, -1])                       # 只需要最后一个 token 的 logits
+
+要点：
+- **shared expert 每层只算一次全部 token**（35 MB fp8，算力小），不要按 token 重复。
+- gate 可以按块算（router 只需 [T,dim] 的 normed hidden），把 routes 拼起来后再分组；这比按块读专家便宜得多。
+- 分组建议：把 (token, expert, weight) 展平后按 expert 排序（torch.sort / np.argsort），每个 wave 取连续的 12 个 expert；gather 时直接按 index 取行，scatter 用 index_add_。
+- 预填充期间专家读取一律 cache=False（§5.7），避免 288 GB 一次性数据把 20 GB 的 decode 热缓存冲掉；staged slot 用 preload 双缓冲。
+- H 放置：T ≤ 8K 可放 VRAM（8K = 0.34 GB）；T 更大时放 RAM（32K = 1.34 GB），按块 H2D；attention scratch（当前块 q/scores）约 84 MB。
+- 输出：预填充只需要最后位置的 logits/TTFT；如果 API 需要 per-token logits，再按块跑 head（CPU 39 ms/次，按块摊薄）。
+
+#### 4.2.2 PrefillPlanner 接口（loading.py 已实现）
+
+    from tinyinfer.loading import PrefillPlanner, ModelGeometry
+    planner = PrefillPlanner(ModelGeometry(), n_tokens=8192, slots=24, block=1024,
+                             attn_resident_layers=34)
+    plan = planner.plan()                 # 路由未知 -> 投影（unique≈384/层）
+    plan = planner.plan(routes_by_layer)  # {layer: [T,6] ids} -> 精确 wave/token 数
+    plan.table()                          # I/O/内存/吞吐
+    planner.plan_layer(3, routes_l3)      # 单层：wave 列表 + 每专家 token 数
+    plan.pseudo_code()                    # 上面这段伪代码
+
+数据结构：PrefillPlan（n_tokens/block/slots/layers/projected/expert_bytes/attn_stream_bytes/memory/time）、PrefillLayerPlan（layer/n_unique/waves/expert_bytes）、PrefillWavePlan（experts/token_counts/nbytes）。路由未知时用 unique 期望；路由已知时 wave 大小 = slots.prefill_compute（24 槽 → 12）。
+
+#### 4.2.3 内存 / I/O 预算（CLI: python -m tinyinfer.loading prefill）
+
+| prompt | 专家 I/O | attn 流 | Engram 行 | I/O 时间@8.8 | 预填充吞吐 | hidden | KV | wave 槽 | 块 scratch |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1,024 | 288.78 GB | 1.020 GB | 12.6 MB | 32.9 s | 31.1 tok/s | 0.04 GB | 0.005 GB | 0.23 GB | 83.9 MB |
+| 8,192 | 288.78 GB | 1.020 GB | 100.7 MB | 32.9 s | 248.7 tok/s | 0.34 GB | 0.011 GB | 0.23 GB | 83.9 MB |
+| 32,768 | 288.78 GB | 1.020 GB | 402.7 MB | 33.0 s | 993.7 tok/s | 1.34 GB | 0.046 GB | 0.23 GB | 83.9 MB |
+
+注：expert I/O 假设每层 384 个专家都被触达（T≥1K 基本成立）；真实路由可以用 plan(routes) 精确到实际 unique 数，通常少 0–5%。hidden/KV 是预填充期间的峰值；32K 时 hidden 1.34 GB 必须放 RAM。8.8 GB/s 是 burst 上界，4.5 GB/s 时 1K TTFT ≈ 64 s、8K ≈ 64 s（吞吐减半）。
+
+#### 4.2.4 实施清单（Lead 在 model.py / attention 侧）
+
+1. **attention 分块 prefill API**：forward_prefill(x_block, start_pos)（或让 forward 支持 start_pos>0 且 s>1）。窗口 KV 用 ring 追加；compressed KV/compressor/indexer 只在所属层算一次并跨块复用；shared_attn 的全局状态要按层顺序建好。当前 else 分支假设 s=1，必须改。
+2. **H buffer 与 HC 状态**：H [1,T,hc,dim]（bf16）+ per-block 的 ffn_post/ffn_comb（[T,hc]、[T,hc,hc]）暂存到 FFN 阶段；不要把 hc 副本压成 mean（会改变数值）。
+3. **gate 全量**：按块算 router 输入（ffn_norm(h_attn)），拼成 [T,6] indices + weights；注意 bias_vl/image_mask 的文本路径与 decode 一致。
+4. **专家分组/GEMM**：展平 (token, expert) 按 expert 排序；每个 wave 12 个 expert；shared expert 每层一次全 token。
+5. **槽位/IO**：ExpertStore.prefetch_to_vram 预载下一 wave（cache=False），with store.experts(..., cache=False) 取当前 wave；wave 结束 release；保持 RAM cache 给 decode。
+6. **输出/数值**：只在最后块算 head；与现有 512-token 分块参考实现对比最后一 token 的 logits（bf16 容差 1e-2）和 hidden（1e-2）；预填充不应改变 decode 权重/布局。
+7. **失败回退**：layer-major 出问题时保留 chunked 路径（--prefill-mode chunked），两者输出需一致。
 
 ### 4.3 多 agent 并发（随机路由，K=6，384 专家）
 
@@ -310,6 +373,74 @@ Strata 在 RAM↔VRAM 间按热度搬专家。本项目的对应设计：
 - 估算（待实测）：压缩 KV ~1.3 KB/token → 128K 上下文 166 MB/会话，4 会话 664 MB；如果按 13.7 KB/token（Strata 的模型）则 128K = 1.75 GB/会话，必须限制并发或开 KV 量化。
 - 开关：--kv-resident 32768（tokens 在 VRAM）、--kv-q8/--kv-q4（量化，质量待测）。
 - tinyinfer 当前 attention.py 只实现窗口路径；压缩层的 KV 分层由 attention owner 接入，本模块预留 RAM 预算 0.25–1 GB。
+
+### 5.7 VRAM 专家槽（vram_slots）与 PCIe 预算
+
+```
+24 slots = 451.2 MB（专家 blob 18.80064 MB/槽）
+  decode   : 6 current（当前层） + 6 staged（下一层预测/前瞻）
+  prefill  : 12 compute（当前 wave） + 12 staged（下一 wave，双缓冲）
+  16 slots = 300.8 MB（8+8）：可用，但 wave 减半、启动次数翻倍
+  12 slots = 225.6 MB（6+6）：无双缓冲底线；<12 会显著增加串行等待
+```
+
+**24 够不够？够，而且不是瓶颈。** 预填充每层 384 专家、wave=12 → 32 个 wave；若用 24+0（无舞台）wave=24，单层多花约 9% I/O 时间（GPU 计算短、NVMe 在 wave 间空转）。decode 只需要 6 个当前专家，另外 6 个槽给下一层预取/前瞻足够；剩余槽留着做 wave 双缓冲，不额外占带宽。真正影响 VRAM 的是注意力常驻，不是这 0.45 GB。若将来要腾 VRAM：降到 16 槽只省 0.15 GB（不到 1 层注意力），不值得；12 槽以下才开始明显掉速。
+
+PCIe 预算（每专家 18.8 MB / 26 GB/s = 0.72 ms）：
+- decode 每 token 上卡丢失专家 = 240 × (1 − hit)；hit=27% → 175 × 0.72 ≈ 126 ms；加注意力流（6 层 × 170 MB ≈ 39 ms），合计约 165 ms/token，可与 374 ms 的 NVMe 读重叠（§4.1 已按 35% 暴露计）。
+- prefill 每层整层读 7.22 GB，PCIe 只搬 wave 的 12×18.8MB=225 MB/次；PCIe 与 NVMe 并行，不是瓶颈。
+- 槽是**暂存**不是缓存：从槽换出不会丢数据（RAM cache 还有）；不要按 LRU 把它当第二级专家缓存，否则会和 RAM cache 抢命中率。
+
+pin / 双缓冲策略（ExpertStore 已实现）：
+1. **decode 当前层**：with store.experts(layer, ids) 持有 6 个槽的引用（refs>0），release 前不会被换出。
+2. **decode 前瞻**：只有预测置信度高（≥0.5）且槽有空余时，用 store.prefetch_to_vram(layer+1, ids) 把 2–6 个专家 staged；默认仍然优先预取到 RAM（不占槽），避免和当前层抢。
+3. **prefill**：当前 wave 12 个用 with 持有；下一 wave 12 个用 prefetch_to_vram 预载；专家读取一律 cache=False（不写 RAM cache），wave 结束 release，槽立刻复用。staged 槽不会被 evict，直到 fetch 消费；用 slots.staged_count 监控是否有泄漏。
+4. **RAM pin** 与槽无关：会话热度 pin ≤20% 缓存（§7），预填充不参与 pin。
+
+接口（本模块已实现）：
+- VramSlotCache.preload(layer, expert, data) → bool；is_staged / has / staged_count；acquire 遇到 staged 直接接管（refs=1）。
+- ExpertStore.prefetch_to_vram(layer, ids, cache=False) → 预载数；fetch(layer, ids, cache=False) → 不写 RAM cache 的流式记录；stats()["vram"]["staged"] 可观测。
+- 槽不够时抛 "all VRAM expert slots are referenced or staged"；此时先 release 当前 wave，或把 vram_slots 调大。
+
+### 5.8 非专家权重驻留与 CUDA 总预算（AttnResidencyPlan / VramResidencyPlan）
+
+接口（loading.py）：
+
+    from tinyinfer.loading import AttnResidencyPlan, VramResidencyPlan, ModelGeometry
+    # 只看注意力预算
+    attn = AttnResidencyPlan.plan(ModelGeometry(), budget_bytes=5.78e9, mode="auto")
+    attn.is_resident(20)        # True/False
+    attn.streamed_layers        # 需要每 token 从 RAM 拷到 VRAM 的层
+    attn.stream_bytes_per_token # 6 × 170 MB = 1.02 GB
+    # 与槽/激活/KV/head 联动的总预算
+    plan = VramResidencyPlan.plan(vram_gb=8.0, slots=24, attn_mode="auto", head_gb=0.0)
+    plan.table(); plan.feasible; plan.warnings
+
+预算联动公式：
+
+    available = vram_gb − desktop_reserve(0.9) − runtime_reserve(0.35)      # 6.75 GB
+    attn_budget = available − activations(0.40) − kv(0.02) − head(0/0.66/1.32) − slots(0.451)
+    resident_layers = floor(attn_budget / 170.055 MB)    # auto
+    streamed_bytes_per_token = (40 − resident_layers) × 170.055 MB
+
+当前 8 GB / 24 槽 / head CPU 的 CLI 输出（python -m tinyinfer.loading vram）：
+
+| 项 | 值 |
+|---|---:|
+| available（扣桌面+runtime） | 6.75 GB |
+| 激活 + KV + head + 槽 | 0.40 + 0.02 + 0 + 0.451 = 0.871 GB |
+| 注意力常驻 | auto = **34 层 = 5.78 GB** |
+| 已用 / 余量 | 6.65 / **0.10 GB** |
+| 流式层 | 6 层 = 1.02 GB/token over PCIe |
+| 警告 | 6 层流式；无超预算 |
+
+模式与边界：
+- **auto（推荐）**：34 层；0.10 GB 余量偏紧，若运行时激活/碎片波动，实际可用 --attn-resident 33（余量 0.27 GB）。
+- **full**：40 层 = 6.80 GB。8 GB 卡上 6.80 > 6.75 available，**不可行**；即使把槽降到 12（−0.226 GB）也仍超。full 只适合 ≥10 GB 卡（或桌面 reserve 很小时 9 GB 级）。
+- **N（部分驻留）**：--attn-resident 20 → 常驻 3.40 GB、流式 20 层（3.40 GB/token，133 ms PCIe），余量 2.5 GB 可给更大 KV/head。
+- **head 放 GPU**：head fp8 0.66 GB → auto 降到 30 层；head bf16 1.32 GB → 26 层。按 §5.4.1 的结论，8 GB 卡默认 CPU。
+- **槽变化**：24→16 槽省 0.15 GB，auto 不会多出一层（仍 34），所以省不出东西；除非和 head/KV 一起腾。
+- 模型侧接口：对非驻留层，每 token 开始时把该层 fp8 权重从一个 170 MB VRAM scratch 拷入（与 NVMe 读并行）；驻留层直接引用。预填充时每层权重只用一次，流式层可以按同样方式处理（不额外占常驻预算）。
 
 ---
 
@@ -476,12 +607,16 @@ CPU 决策点（O6）：
 |---|---|---|
 | ShardIndex | region(name), expert_blob(l,e) | 文件偏移、两段 blob、张量短名映射 |
 | ShardReader | read_blob, read_many, stats, close | 同步/并行字节读取 |
-| ExpertCache | get, prefetch, contains, pin, unpin, pin_hot, hot_experts, stats | RAM 缓存 |
-| VramSlotCache | acquire, copy_in, release, stats | VRAM 暂存环 |
-| ExpertStore | fetch, experts, release, prefetch, pin_hot, stats | 门面 |
+| ExpertCache | get(admit=), prefetch(admit=), contains, pin, unpin, pin_hot, stats | RAM 缓存；admit=False 用于预填充流式 |
+| VramSlotCache | acquire, preload, is_staged, has, release, stats | VRAM 暂存环 + 双缓冲舞台 |
+| ExpertStore | fetch(cache=), experts(cache=), prefetch_to_vram, release, prefetch, pin_hot, stats | 门面 |
+| ExpertSlotPlan | plan(geo, slots), slots_for_phase, table | 24 槽 → decode 6+6 / prefill 12+12 |
+| AttnResidencyPlan | plan(geo, budget, mode), is_resident | 注意力常驻/流式 |
+| VramResidencyPlan | plan(vram, slots, attn_mode, head_gb), table | 总 VRAM 预算联动 |
+| PrefillPlanner | plan(routes), plan_layer, memory, pseudo_code | layer-major 预填充计划 |
 | Prefetcher | note_layer, note_step_start, wait, stats | 预测/预取/gate |
 | SessionScheduler | plan(sessions, phase) -> StepPlan | 多会话并集/wave |
-| TierBudget | plan(...), table(), io_scenarios() | 内存/IO 预算 |
+| TierBudget | plan(...), table(), io_scenarios() | RAM/IO 预算 |
 | IoBudget | compute(...) | 命中率→tok/s |
 
 ### 9.4 接入 moe.py 最关键的 3 个 API（短清单）
@@ -493,7 +628,9 @@ CPU 决策点（O6）：
 **陷阱（按踩坑概率排序）**
 - 不要把 rec.tensor(...) 的视图带到 with 之外使用：VRAM 槽会被复用（换 owner 后同一 slot 是脏数据）；RAM 条目也可能被驱逐。跨层/跨 token 要用时先复制到自有 buffer。
 - dtype/形状别转错：weight 是 **uint8 packed fp4（每字节 2 个 nibble）**，不要 .float()、不要 .view(int8) 后按 fp4 解；scale 是 **float8_e8m0fnu [out, in/32]**。dequant_fp4_block 期望 (packed [out,in//2], scale [out,in//32])，别 reshape 成 (in,out)。
-- 并发引用数不能超过 vram_slots：6 专家/层 + 双缓冲 6 + 预取 12 = 24；多会话时按 union 计算，否则抛 "all VRAM expert slots are referenced"。
+- 并发引用数不能超过 vram_slots：decode 6+6、prefill 12+12 = 24；多会话 decode 先按并集算需求，否则抛 "all VRAM expert slots are referenced or staged"。
+- prefill 用 fetch(cache=False) 只流式、不污染 RAM cache；但 record 仍要在 with 内释放，且 staged slot 必须被随后的 fetch 消费（用 slots.staged_count 查泄漏），否则 wave 的 12 个槽一直占着。
+- layer-major 的 attention 必须支持 start_pos>0 且 s>1（分块 prefill）；当前 compressed_attention.py 的 else 分支按 decode s=1 假设，直接复用会静默算错。H 的 hc 副本要保留 4 份对齐，不能先压成 mean 再算 HC。
 - fetch 异常也要 release（务必用 with）；close() 前等所有 prefetch future 结束（当前 close() 内部 shutdown）。
 - direct=True 只用于专家流；非专家权重仍用 buffered（17.7 GB 常驻 RAM）。ShardReader 每线程一个文件句柄，线程数默认 6。
 - 集成前先跑 `python -m tinyinfer.loading selftest` 与 `budget`；cache/gb 为 0 或分片缺失时会显式抛异常。
@@ -510,7 +647,7 @@ CPU 决策点（O6）：
 | E-L4 | 预测器训练 | train_lookahead.py | precision@k / recall@k（k=1,2,4） | precision@2 ≥ 0.6（否则只保留 n-gram/temporal） |
 | E-L5 | 预取端到端 A/B | Prefetcher gate 开/关；同 prompt/seed | tok/s、浪费字节、输出一致性 | tok/s +≥5%，浪费 <40%，输出逐 token 一致 |
 | E-L6 | 多会话调度 | SessionScheduler；2/4/8 会话 | 聚合 tok/s、单会话 p50/p99、dedupe | 聚合 ≥1.8× 单会话；p99/p50 ≤3 |
-| E-L7 | 逐层预填充 | 改造 model.py 为 layer-major | TTFT、prefill tok/s、RAM 峰值 | 1K TTFT ≤40 s；prefill ≥20 tok/s |
+| E-L7 | 逐层预填充 | PrefillPlanner（已实现）+ model.py 按 §4.2.4 改造；attention 加分块 prefill | TTFT、prefill tok/s、stream 读盘总量、RAM 峰值 | 1K 读盘 ≤300 GB（每专家一次）、TTFT ≤65 s@4.5 / ≤35 s@8.8、prefill ≥15 tok/s、logits 与 chunked 参考差 ≤1e-2 |
 | E-L8 | 长上下文 KV 分层 | --kv-resident 32K；128K 上下文 | RAM、tok/s 下降 | 128K 会话 RAM ≤1 GB；速度下降 ≤20% |
 | E-L9 | 命中率真实化 | E-L3 trace 代入 sim_router | 命中率/预取收益 | 给出 20/24/32 GB 三档真实命中率 |
 
@@ -530,6 +667,14 @@ CPU 决策点（O6）：
 - 下载日志：2026-10-21 00:24 重启后 baseline 11.13/510.3 GB，速率约 12 MB/s（≈11 h 到全量）；当前仅 layer 0 完整，layer 1–39、engram、MTP 未齐。
 - 因此 E-L3 只能先做 layer 0 预检；E-L4 的 lookahead 需要多层 hidden→logits 对，暂不能训练。
 - 权重齐后执行：collect_router_trace.py（128 token × 40 层，1–2 h）→ train_lookahead.py → sim_router.py --trace，替换本文 24.7%/32.1% 的合成数字。
+
+### E-L3 采集脚本已就绪（2026-10-21）
+
+- collect_router_trace.py 重写：每 decode step 记录 hidden_l{L} [steps, dim]（hc 平均）、logits_l{L} [steps, 384]、routes_l{L} [steps, 6]，train_lookahead.py 直接可用；文件内 _metadata 记录层数/步数/prompt/耗时/expert_store 统计。
+- --smoke 模式（仅 layer 0、2 步）实测 3.1 s、stream 0.3 GB，通过；用于权重未齐时验证机制。
+- 全量（40 层）需要全部分片；CPU 参考路径每 token 4.5 GB 专家读 + 240 次 fp4 反量化，建议先 --max-steps 16（预计 30–60 min，取决于 dequant/磁盘；GPU runner 落地后应 <10 min）。运行时脚本会临时替换 MoE._expert，避免 70.8 MB/专家的 bf16 缓存爆 RAM。
+- 推荐流程：--max-steps 16 先出 40×16 对 hidden/logits/routes → train_lookahead 验证 lead=1 的 precision@k → 再决定是否跑 64–128 步。
+- 命令见 scripts/prototypes/loading_research/README.md。
 
 ---
 
@@ -566,6 +711,7 @@ CPU 决策点（O6）：
    - 多 agent 默认 2 活跃（上限 4）、全局 ExpertCache、会话 pin ≤20%；
    - 集成顺序：ExpertStore → 预算开关 → SessionScheduler → Prefetcher gate；layer-major prefill 由 Lead 改 model.py。
 6. **接口冻结建议**：loading.py 的 ExpertStore/ExpertRecord/ShardReader 接口先冻结；Prefetcher/Scheduler 可在 E-L5/E-L6 后调整。
+7. **layer-major 方案已交付待实施**：§4.2.1–4.2.4 给出调度/伪代码/预算/实施清单；PrefillPlanner 已实现（prefill CLI 可跑）。关键改动在 attention 分块 prefill API 与 model.py 的 H buffer，属于你的写作用域。24 槽（12+12 prefill、6+6 decode）与驻留接口（§5.7/5.8）可直接接。
 
 ---
 
@@ -592,7 +738,13 @@ CPU 决策点（O6）：
 | --session-pin | 0.2 | 单会话 pin 不超过缓存的 20% |
 | --adapt-interval | 128 token | 重算热度/pin |
 | --expert-slots | 24 | VRAM 暂存槽 |
-| --attn-resident | auto（29–34） | 可配 full（全 40 层）/ partial（auto）/ N |
+| --attn-resident | auto（29–34） | 可配 full（全 40 层）/ partial（auto）/ N；8 GB 卡 full 不可行 |
+| --attn-mode | auto | auto/full/N，VramResidencyPlan 使用 |
+| --expert-slots-notes | 24 | decode 6+6、prefill 12+12；12 为底线，16 可用 |
+| --slot-double-buffer | on | prefill 12+12 / decode 6+6 |
+| --prefill-block | 1024 | 分块 attention 的 token 块 |
+| --prefill-cache | stream | 预填充 cache=False，不污染 decode 热缓存 |
+| --prefill-wave-policy | count-desc | 专家按 token 数降序分 wave |
 | --direct-io | on | 专家流 NO_BUFFERING |
 | --io-threads | 6 | 读取线程 |
 | --prefetch | on（gate） | 总开关 |
@@ -609,7 +761,9 @@ CPU 决策点（O6）：
 | --pcie-frac | 0.5 | missed expert GPU/CPU 分流 |
 | --max-sessions | 2 | 活跃解码会话 |
 | --head | **cpu**（bf16） | cpu/fp8/bf16；fp8/int8 见 5.4.1，默认不启用 |
-| --prefill-mode | layer-major | layer-major/chunked |
+| --prefill-mode | layer-major | layer-major/chunked（回退路径） |
+| --hidden-buffer | auto | auto/vram/ram（T≤8K 可 VRAM） |
+| --kv-bytes-per-token | 1400 | PrefillPlanner 的 KV 估算（待真实值校准） |
 
 ---
 
@@ -737,3 +891,70 @@ prefetch@0.7          0.0     0.700          0.451     1.20
 - layer 0 真实：232/384 专家，top-24 41.9%，单层 LRU(27) 34.4%，相邻位置重叠 0.85/6（14.2%）。
 - head CPU bf16：[129280,5120] 37.8–39.8 ms（16 线程）；fp32 80.9–84.7 ms；H2D bf16 pinned 46.3 ms；fp8 0.66 GB H2D 23–44 ms（抖动）、torch dequant+mv 24.4 ms；per-tensor fp8 _scaled_mm 2.0 ms 可用，但 rowwise fp8 在 sm_120 报 "Rowwise scaling is not currently supported on your device"。
 - 详见 §5.4.1、§10 E-L3 预检。
+
+### D.5 PrefillPlanner / VramResidencyPlan（2026-10-21，CLI 输出）
+
+~~~text
+PS> python -m tinyinfer.loading prefill --tokens 1024,8192,32768
+
+=== layer-major prefill: 1024 tokens, slots=24, block=1024 ===
+  prompt tokens                1024
+  token block                  1024
+  mode                         projected (routes unknown)
+  expert I/O                   288.78 GB
+  attention stream I/O         1.020 GB
+  engram row I/O               12.58 MB
+  I/O time @8.8GB/s            32.93 s
+  prefill throughput           31.1 tok/s
+  hidden buffer                0.04 GB
+  KV (prompt)                  0.00 GB
+  expert wave slots            0.23 GB
+  block attention scratch      83.9 MB
+
+=== layer-major prefill: 8192 tokens, slots=24, block=1024 ===
+  expert I/O                   288.78 GB
+  I/O time @8.8GB/s            32.94 s
+  prefill throughput           248.7 tok/s
+  hidden buffer                0.34 GB
+  KV (prompt)                  0.01 GB
+
+=== layer-major prefill: 32768 tokens, slots=24, block=1024 ===
+  expert I/O                   288.78 GB
+  I/O time @8.8GB/s            32.98 s
+  prefill throughput           993.7 tok/s
+  hidden buffer                1.34 GB
+  KV (prompt)                  0.05 GB
+
+PS> python -m tinyinfer.loading vram
+
+  VRAM total                             8.00 GB
+    desktop/WDDM reserve                 0.90 GB
+    CUDA/runtime reserve                 0.35 GB
+    activations                          0.40 GB
+    KV window                            0.020 GB
+    head on GPU                          0.00 GB
+    expert slots                         24 = 0.45 GB
+    attention pinned                     34 layers = 5.78 GB
+  VRAM used                              6.65 GB (free 0.10)
+  warnings: 6 attention layers stream 1.02 GB/token over PCIe
+
+  mode                auto
+  pinned layers       34 / 40 = 5.78 GB
+  streamed layers     6 = 1020.3 MB/token
+  total slots              24 = 451.2 MB
+  decode                   6 current + 6 staged
+  prefill                  12 compute + 12 staged
+~~~
+
+### D.6 40 层 trace 脚本冒烟（只有 layer 0 完整时）
+
+~~~text
+PS> python scripts/prototypes/loading_research/collect_router_trace.py --smoke
+SMOKE MODE: layer 0, 2 decode steps; arrays are not a real trace
+prompt tokens: 1, layers: [0], decode steps: 2
+saved router_trace_smoke.npz: 3 arrays, 3.1s, experts read 0.3 GB (stream)
+step0 routes: unique=6/384, top24_share=1.000, top96_share=1.000
+next: train_lookahead.py --trace router_trace_smoke.npz --lead 1
+~~~
+
+全量运行（40 层齐后）：collect_router_trace.py --layers 0-39 --max-steps 16 --prompt "Hello" → train_lookahead.py --trace router_trace.npz --lead 1 → sim_router.py --trace router_trace.npz。

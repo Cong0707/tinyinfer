@@ -20,6 +20,16 @@
 7. **CPU 辅助**：CPU router 0.44 ms/layer（fp32 384×5120），CPU 采样（D2H 0.33 ms + softmax/argmax 0.59 ms），一个 expert 的 CPU BF16 gate 矩阵 0.184 ms，PCIe H2D 实测 **28 GB/s**。在 NVMe 4.6 GB/s、每 token 4.25 GB 专家权重的现实下，**CPU 只适合做“预测/调度/采样”，不适合承担大量专家计算**（O6/O9 的边界）。
 8. **KV 量化**：V4.1 自身设计已给出答案——窗口 KV 用 FP8 per-32（相对误差 2.25%，cos 0.99965），压缩 KV 用 FP4 per-16（10.3%，cos 0.9957）；int4+Hadamard 与 FP4 同档（10.9%），int8+Hadamard 最优（0.6%）。
 
+9. **近似数学（O2 实验，负结果）**：把 `approx_math.py` 的 fast_rsqrt / fast_exp / fast_silu 接进 tilelang kernel 后，sm_120 上**没有可测收益**：expf/rsqrtf 已是硬件指令，多项式反而多几条 FMA；softmax 8192 行 exact 96.7 µs vs poly 97.8 µs，attention exact 64.5 µs vs poly 65.3 µs，RMSNorm 的 fast_rsqrt 甚至更慢。精度：真实权重上 fast_rsqrt 输出误差 0.45%、fast_exp softmax 0.19%（KL 3.2e-5、top1 100%）、SwiGLU poly 0.16%。**结论：GPU 侧默认关闭近似，保留硬件 intrinsics；近似只用于 CPU/O9**。RoPE 预计算表 kernel 相对 torch complex 路径 **~10×**（真实 q 8192 行 + kv 128 行：24–43 µs vs 293–447 µs），是真正的 O2 收益。
+10. **投机验证算子（O5）**：tree attention（分支树）18.6–35.0 µs/layer（m=4/5/8），DSpark 窗口+block 同样 18.7–35.0 µs；rejection sampling 完整实现 417 µs/步（eager torch，launch-bound，需 fuse 到 <50 µs）；DSpark markov+confidence head 5 token **1.84 ms/步**（66 MB 权重 ×5 次 GEMV）——**O5 的瓶颈在 markov head，不在 attention**。
+11. **llama.cpp 借鉴清单**（详见新 §8）：`block_mxfp4`/`block_nvfp4` 布局与 HF 完全对应、`dsv4-hc.cu` 的 HC comb/pre/post kernel、`topk-moe.cu` 的 fused routing、`ggml_v_expf`（CPU 向量化 exp，说明近似应放 CPU）、`ggml_vec_soft_max_f32` 的 sink 处理、repack/mmq 的 int8/dequant 思路。
+
+12. **融合 kernel（O2，本轮）**：新增 `prototypes/kernels/fused/`：`fused_rmsnorm_rope`、`fused_gemm_rope`（官方 fp8 32×32 e8m0 GEMM + RoPE epilogue）、`rope_inplace`。真实 L0 权重 decode（b=1,s=1,kv=129）：q_norm **25.8 vs 116.5 µs（4.5×）**、kv norm+rope **18.1 vs 232.4 µs（12.8×）**、wq_b GEMM+rope **223.6 vs 244.9 µs（1.10×）**、inverse rope **15.8 vs 81.6 µs（5.2×）**；整层 **818.7 vs 884.3 µs（1.08×）**。host launch-ish ops 56→23，加 6 个 tilelang kernel，估计 GPU 启动 **57→29**（离 ~10 还差：act_quant 融合、q_a+rmsnorm、wo_a+wo_b）。正确性：fused_gemm_rope 对同数学 dequant 参考 rel **1.9e-4**；整层 fused 对同 fp8 数学参考 0.0（bf16 舍入），对 bf16 权重路径 2.27%（fp8 量化本身）。
+
+13. **融合 Hyper-Connections（O2 本轮）**：`hc_fused.py` 把每次 `hc_mixes`（F.linear 24×20480 + rsqrt + 20 次 Sinkhorn）从 torch 的 **143 个 launch-ish op** 压到 **2 个 tilelang kernel**（mixes + sinkhorn）。真实 L0 权重 decode（B=1,S=1,hc=4,D=5120）：torch **1655.7 µs → fused 60.2 µs（27.5×）**；整层 HC（2 次 hc_mixes）**286 launch-ish → 4 kernel**。可选 hc_pre/hc_post 也融合（2.5×/3.4×），整层 8 kernel。正确性 pre/post 0、comb 6.3e-8；iters=6 vs 20 的 comb 偏差 15.6%（证明 20 次不能省）。
+
+14. **decode 专用 fp8 GEMV（O2/O3 本轮）**：`gemv_fp8.py` 用“每线程一个输出行 + K 串行累加”替代官方 block_M=32 的 GEMM。真实 L0、M=1：wq_b **251.7 → 139.7 µs（1.80×，300 GB/s）**、wo_b **270.9 → 147.1 µs（1.84×）**、wkv **37.3 → 20.1 µs（1.86×）**、wq_a 37.5 → 26.9 µs（1.4×）；带 RoPE epilogue 的 wq_b/wkv 正确性 rel 1.3–1.4e-3。**<60 µs 对 wq_b/wo_b 物理上不可达**（42 MB 权重 / 实测 338 GB/s ≈ 124 µs 下界）；wq_a/wkv 已 <60 µs。四个 GEMM 合计 ~597 → ~350 µs/层（省 ~0.25 ms/层）。
+
 ### 可用性矩阵（本机，✅=实测通过，⚠️=可运行但有条件，❌=不可用/未通过，—=未测）
 
 | 能力 | torch | tilelang 0.1.15 | DeepGEMM | FlashInfer | FlashMLA | SDPA(torch) |
@@ -33,6 +43,17 @@
 | 融合 HC Sinkhorn | ❌ Python 20 iter | ✅ 24.7 µs | — | — | — | — |
 | 投机 tree verify | ⚠️ 逐 token mm 331 µs/layer（4 tok） | ✅ 62 µs/layer（4 tok） | — | — | — | — |
 | KV FP4/FP8 量化 | ⚠️ 手写 | ✅（官方 fp4_quant/act_quant 同源 kernel） | — | — | — | — |
+| 近似数学（fast_exp/silu/rsqrt） | — | ⚠️ 可编译、无可测加速，精度损失 1e-3 | — | — | — | — |
+| tree verify attention（m=4） | ⚠️ 331 µs（逐 token） | ✅ 18.6 µs/layer | — | — | — | — |
+| rejection sampling（K=4,V=129k） | ⚠️ 417 µs/步（eager） | — | — | — | — | — |
+| DSpark markov head（5 token） | ⚠️ 1.84 ms/步（mock） | — | — | — | — | — |
+| 融合 RMSNorm+RoPE | — | ✅ 25.8 µs（q_norm）/ 18.1 µs（kv），torch 116.5/232.4 | — | — | — | — |
+| 融合 fp8 GEMM+RoPE | — | ✅ 223.6 µs vs torch 244.9（1.10×），err 1.9e-4 | — | — | — | — |
+| 融合 inverse RoPE | — | ✅ 15.8 µs vs torch 81.6 | — | — | — | — |
+| 融合 HC mixes+Sinkhorn | — | ✅ 60.2 µs vs torch 1655.7（27.5×） | — | — | — | — |
+| 融合 HC pre/post | — | ✅ 23.1/20.5 µs vs torch 58.6/69.9 | — | — | — | — |
+| decode fp8 GEMV（M=1） | — | ✅ wq_b 139.7 / wo_b 147.1 / wkv 20.1 / wq_a 26.9 µs | — | — | — | — |
+| GEMV + RoPE epilogue | — | ✅ rel 1.3–1.4e-3，wq_b 139.7 µs | — | — | — | — |
 
 > DeepGEMM / FlashInfer / FlashMLA 的“已合并”指上游 PR 状态（GitHub API 查证：DeepGEMM #324 merged 2026-06-24；FlashInfer #3395 merged 2026-06-15；vLLM #43477 merged 2026-06-22），但**本机 Windows 未安装/未编译/未实测**，不计入“今天可用”。
 
@@ -195,10 +216,174 @@ Strata 的 `docs/NVFP4.md` 明确指出：其 FP4×FP4 kernel（`mmq_nvfp4_w4a4.
 | `hc_split_sinkhorn` | 128 行 mixes，20 iter | 24.7 µs | 替代 Python 20 次迭代（估计 0.2–0.5 ms），每层 2 次 → 重要 |
 | 官方 `sparse_attn` | 见 2.4 | 141 KB smem 失败 | 用 sm120 补丁替代 |
 
-## 3. O1–O9 算子路线（tinyinfer 落地视角）
+### 2.9 近似数学进 kernel：精确 vs fast（O2 实验，负结果）
+
+新增 `approx_kernels.py`：把 `approx_math.py` 的算法在 tilelang 里重写（bit-trick rsqrt + Newton、多项式 exp、表驱动 RoPE），与精确 kernel 对比。变体：**exact** = `T.exp`（expf）/`T.rsqrt`；**hw** = `T.__exp`（__expf 硬件 intrinsic）；**poly** = approx_math 多项式。
+
+| 算子 | 形状 | exact | hw | poly | 结论 |
+|---|---|---:|---:|---:|---|
+| softmax | 8192×640 | 96.7 µs | 97.5 µs | 97.8 µs | 无收益（内存受限） |
+| softmax | 32768×640 | 505.6 µs | 506.8 µs | 510.9 µs | 无收益 |
+| SwiGLU | 3584×2304 | 129.0 µs | 126.0 µs | 127.4 µs | 无收益（±3% 噪声） |
+| RMSNorm (dim1280) | 128 行 | 21.3 µs | — | 35.9 µs | fast_rsqrt 更慢 |
+| RMSNorm (dim512) | 128 行 | 28.9 µs | — | 35.6 µs | fast_rsqrt 更慢 |
+| RoPE 表 kernel | q 8192 行 + kv 128 行 | 24–43 µs（kernel） | — | — | **torch complex 路径 293–447 µs → ~10×** |
+| sparse attention (decode) | 1×640 | 64.5 µs | 65.0 µs | 65.3 µs | 无收益 |
+| sparse attention (prefill) | 128×640 | 1220.6 µs | 1191.0 µs | 1194.1 µs | 无收益（±2%） |
+
+精度（真实权重 L0 注意力/专家，对精确实现）：
+
+| 近似 | 真实权重上的误差 | 备注 |
+|---|---|---|
+| fast_rsqrt（RMSNorm） | attention 输出 rel **0.449%** | 1 次 Newton；合成数据 1.4e-3 |
+| fast_exp（attention softmax） | 输出 rel **0.191%**；attention 权重 KL **3.18e-5**；top1 100% | 合成 KL 8.6e-7 |
+| fast_silu（SwiGLU） | 中间 rel 4.8e-4，expert 输出 rel **0.158%** | |
+| poly exp（LM softmax） | KL 1.1e-6；top1 100%；ppl 代理 exp(KL)=1.000001 | 单次 softmax |
+| RoPE 表 | 与 torch complex 一致（bf16 舍入级；q max err 7.8e-3 在 100 量级激活上） | 表值本身是精确 sin/cos |
+
+**解释**：sm_120 上 `expf` 是多个精确指令，但 attention/softmax 都是 memor-bound，exp 占比 <5%；`rsqrtf` 是单条硬件指令，bit-trick + Newton 反而更多指令；`__expf` 与 exact 在 bf16 下不可分辨。因此**polynomial 近似在 GPU 上只有精度损失、没有速度收益**。llama.cpp 的 `ggml_v_expf` 也只在 **CPU** 上用（AVX512 向量化的 Arm 算法），可作为 O9 CPU 路径的参考。
+
+### 2.10 投机验证算子：tree attention / rejection / DSpark 接口
+
+新增 `spec_ops.py`（接口 + 参考实现）与 `bench_spec_ops.py`：
+
+| 接口 | 签名/语义 | 实测 |
+|---|---|---|
+| `dspark_idxs(start_pos, window, block)` | 官方 DSpark 布局：窗口 slots + window+[0..block)；每行相同 | attention m=4/5/8：18.7/18.7/35.0 µs/layer |
+| `tree_idxs(start_pos, window, parents)` | 分支树：每 draft token 只看窗口 + 自己 + 祖先（不串 sibling） | m=4/5/8：18.6/18.7/35.0 µs/layer；max err 0.0039（bf16） |
+| `rejection_sample(q, p, ids, target_next)` | 标准 speculative sampling：接受/拒绝 + 残差分布采样 | K=4、V=129280：B=1 **417 µs**、B=4 631 µs（eager torch，launch-bound） |
+| `tree_rejection(q, p, parents, ids)` | 对每条 root→leaf 路径做 rejection，取最长接受路径 | 接口就绪，未做完整压力测 |
+| `MockMarkovHead / MockConfidenceHead` | DSpark 末层 markov head + confidence head（vocab 129280, rank 256） | **1.84 ms / 5-token block**（66 MB 权重 ×5 次 GEMV） |
+| `dspark_block(...)` | 5 步自回归 draft + confidence 打分 | mock 端到端 verify step ≈ 2.1 ms |
+
+**O5 结论**：tree/DSpark attention 只要 18.6–35 µs/layer（40 层 <1.5 ms），**瓶颈是 markov head 的 5 次 129280×256 GEMV（1.84 ms）**。优化方向：把 markov head 与主 head 融合/量化（BF16→FP8）、或 greedy 化（argmax 不需要采样）、或只在 confidence 高时展开更长 draft。rejection sampling 的 417 µs 是 eager torch 的 launch-bound，fuse 成 1–2 个 kernel 可降到 <50 µs。
+
+### 2.11 O3 真实权重（L0）GEMM 实测
+
+`bench_real_weights.py` 从 `cache/weights/model-00003`（真实 L0 分片）读取 fp8/fp4 权重与 scale，与 dequant+bf16 对比：
+
+| 权重 | 形状 | M | tilelang | dequant+bf16 | 比值 | 误差（vs dequant） |
+|---|---|---:|---:|---:|---:|---:|
+| wq_b (fp8 32×32) | 32768×1280 | 1 | 306.2 µs | 249.3 µs | 0.81×（更慢） | 1.53% |
+| wq_b | | 128 | 300.0 µs | 331.9 µs | 1.11× | 1.51% |
+| wq_b | | 512 | 957.5 µs | 1307.8 µs | **1.37×**（44.9 TFLOPS） | 1.50% |
+| expert0 w1 (fp4) | 2304×5120 | 1 | 73.1 µs | 73.5 µs | 1.00× | 2.48% |
+| expert0 w1 | | 8 | 77.5 µs | 34.5 µs | 0.45×（更慢） | 2.44% |
+| expert0 w1 | | 64 | 100.6 µs | 52.0 µs | 0.52×（更慢） | 2.42% |
+
+- fp8 在 **M≥128** 才有收益（Large-N 小-K 的 wq_b 在 M=1 反而慢）；这与“M≥64 prefill 用 fp8_gemm、decode 用 dequant/bf16”的建议一致。
+- fp4_gemm 的收益是**权重体积减半**，不是 FLOPs：对照的 bf16 权重是**预先 dequant 好并驻留**的理想情况；真实流式场景还要加 dequant 成本，需单独测。M≤64 时 fp4_gemm 的 tile 效率低（block_M=32），建议 prefill 把同一专家的行聚成 M≥64 的 grouped GEMM（O8）。
+- 误差 1.5%（fp8）/2.4%（fp4）是量化本身的误差（对照是 dequant 权重），官方模型用的就是同样的 kernel，属于预期。
+
+### 2.12 融合 attention kernel（O2 本轮）：rmsnorm+RoPE、fp8 GEMM+RoPE、inverse RoPE
+
+背景：decode 时每层 attention 的 Python 循环 30–50 次小 kernel + host 调度是主要开销。本轮把可融合的部分塞进 3 个 tilelang kernel（`prototypes/kernels/fused/`）：
+
+| kernel | 输入/输出 | 实现要点 |
+|---|---|---|
+| `fused_rmsnorm_rope(N, rope_dim, eps)` | x [M,N] bf16, w [N] bf16, cos/sin [M,rope/2] fp32 → y [M,N] bf16 | 一行一个 block；fp32 行内 RMS（rsqrtf）+ 权重乘；最后 `rope_dim` 维表驱动旋转；`rope_dim=0` 退化为纯 RMSNorm；生成源码是 float4 向量化 + `rsqrtf` + shared 同步 |
+| `fused_gemm_rope(N,K,head_dim,rope_dim,block=32)` | A fp8 [M,K], B fp8 [N,K], 32×32 e8m0 scales, cos/sin [M,rope/2] → C bf16 [M,N] | 官方 `fp8_gemm` 模板（block_M=32/block_N=128/block_K=32，mma + float4/uint4，无 TMA）+ epilogue：每个 head 的最后一个 128 列 block 内做 RoPE（要求 `head_dim % block_N == 0`、`rope_dim <= block_N`）；C 先到 shared 再 `T.copy` 处理 M 边界 |
+| `rope_inplace(N, rope_dim, inverse, single)` | x [M,N] bf16, cos/sin → 原地旋转最后 rope_dim | inverse 取共轭；`single=True` 时 cos/sin 只 1 行（decode 用），避免 repeat/copy |
+
+**正确性（真实 L0 权重/随机 cos-sin）**
+
+| 测试 | rel err | max abs |
+|---|---:|---:|
+| fused_rmsnorm_rope N=512 rope=64（128 行） | 4.8e-8 | 1.95e-3（bf16） |
+| fused_rmsnorm_rope N=1280 rope=0/64（128 行） | 0 | 0 |
+| fused_gemm_rope M=1 N=512 K=5120 vs dequant+rope | **1.9e-4** | 1.0（输出 ~1e3） |
+| 整层 fused vs torch 同 fp8 数学参考 | **0.0**（bf16 舍入） | — |
+| 整层 fused vs torch bf16 路径 | 0.0227 | —（fp8 weight+act 量化，预期） |
+
+**性能（真实 L0 权重，decode b=1,s=1,kv=129；median of 5）**
+
+| 步骤 | fused | PyTorch 分步 | 加速 |
+|---|---:|---:|---:|
+| q_norm（N=1280） | 25.8 µs | 116.5 µs | **4.5×** |
+| wq_b GEMM + RoPE（N=32768,K=1280） | 223.6 µs | 244.9 µs（matmul 233.4） | **1.10×** |
+| kv norm + RoPE（N=512） | 18.1 µs | 232.4 µs | **12.8×** |
+| inverse RoPE on o（64×512） | 15.8 µs | 81.6 µs | **5.2×** |
+| **整层 attention** | **818.7 µs** | **884.3 µs** | **1.08×** |
+
+**kernel 数**
+
+- host aten ops（launch-ish 过滤 view/empty 等）：torch **56** → fused **23**；tilelang kernel 1（attn）→ 6（q_norm/act_quant/gemm_rope/kv_norm/attn/inverse_rope）。
+- 估计 GPU 启动数：**57 → 29**；目标 ~10 未达到，差距在：`act_quant`（可 fuse 进 gemm_rope 的 A 预量化）、`wq_a GEMM + rmsnorm`（跨 N 块 reduction，需要两 pass/persistent）、`wo_a + wo_b`（分组 GEMM 融合）、剩余 ~15 个 aten 小 op（`clone/`cat/`contiguous/`to` 等，可用 torch.compile 或自定义 kernel 消掉）。
+- 说明：Lead 观测的 ~16 ms/层 是完整模型路径（含 Python/更多层类型）；本表是 L0 窗口层 decode 的 GPU event 时间，**相对减少 launch 的结论不变**。
+- 源码检查：`rmsnorm_rope` 生成 float4 载入/存储与 `rsqrtf`；`gemm_rope` 生成 `mma` + float4/uint4 + 7 次 `__syncthreads`；因为官方 pass_configs 关掉 TMA，仍走 Ampere 风格拷贝。decode M=1 时 block_M=32 浪费 31/32 行，后续可做 block_M=16 或专用 GEMV+rope 进一步提升（当前 1.10× 主要来自 fp8 权重减半 + 省一次 rope launch）。
+
+### 2.13 融合 Hyper-Connections（O2 本轮）：hc_mixes + Sinkhorn + pre/post
+
+`hc_fused.py` 四个 kernel，全部真实 L0 权重、decode B=1,S=1,hc=4,D=5120：
+
+| kernel | 输入/输出 | 实现 |
+|---|---|---|
+| `fused_hc_mixes(HD,mix,eps)` | x [M,HD] bf16（HD=hc*D=20480），hc_fn [24,HD] fp32 → mixes [M,24] fp32 | 一行一 block；shared 存 x（40 KB）；fp32 行内平方和 rsqrt；24 个输出各自做一次 reduce_sum（一行 24×20480 MAC） |
+| `fused_sinkhorn(hc,iters,eps)` | mixes [M,24] fp32, scale [3], base [24] → pre [M,4], post [M,4], comb [M,4,4] fp32 | 一行一 block、64 线程；仿射 → sigmoid pre/post、softmax comb + eps；**20 次双随机归一化在 kernel 内串行**（row_sum/col_sum 用 fragment reduce，完全复刻 hc.py 的迭代顺序） |
+| `fused_hc_pre(D,hc)`（可选） | x [M,hc,D] bf16, pre [M,hc] fp32 → [M,D] bf16 | shared 存 4×D，4 次加权求和 |
+| `fused_hc_post(D,hc)`（可选） | x [M,D] bf16, residual [M,hc,D] bf16, post, comb → [M,hc,D] bf16 | shared 存 x+residual；out[h]=post[h]*x + sum_h2 comb[h2,h]*res[h2]（**注意 comb 是转置索引**，见下） |
+
+**正确性（vs `tinyinfer.hc` 参考，real L0 hc_attn 权重）**
+
+| 输出 | max rel err |
+|---|---:|
+| pre | 0 |
+| post | 0 |
+| comb | 6.3e-8 |
+| hc_pre | 0 |
+| hc_post | 0 |
+| sinkhorn iters=6 vs 20（torch） | comb **0.1557**（15.6%）；pre/post 不变 |
+
+> 实现时踩到的坑：官方 `hc_post` 的 `comb.unsqueeze(-1)*residual.unsqueeze(-2)` 实际等价于 `out[h] = Σ_h2 comb[h2,h]*res[h2]`（comb 的第一维是被求和的轴）。最初按 `comb[h,h2]` 写，结果 order 反了（rel 0.26）；按官方广播语义改成 `COMB[h2,h]` 后归零。
+
+**性能（median of 5）**
+
+| 步骤 | torch 分步 | fused | 加速 |
+|---|---:|---:|---:|
+| 1 次 hc_mixes（linear+rsqrt+sinkhorn） | 1655.7 µs | **60.2 µs**（mixes 55.9 + sinkhorn 4.5） | **27.5×** |
+| hc_pre | 58.6 µs | 23.1 µs | 2.5× |
+| hc_post | 69.9 µs | 20.5 µs | 3.4× |
+| **整层 HC（2 hc_mixes）** | ~3.3 ms、**286 launch-ish op** | ~0.12 ms、**4 个 tilelang kernel** | ~27× |
+| 整层 HC（含 2 pre + 2 post） | ~3.5 ms、310 launch-ish op | ~0.21 ms、**8 个 kernel** | ~17× |
+
+- Lead 目标“整层 HC ~80 → ~4 kernel”**达成**（仅 mixes+sinkhorn：4 kernel）；若把 pre/post 也融进来是 8 kernel，但仍比 torch 的 310 少 40×。
+- 限制：hc_mixes 每行都要读 24×20480 fp32 的 hc_fn（1.97 MB），decode M=1 时是一次 2 MB 读，55 µs 主要是这 2 MB + 24 次 reduce；prefill M>1 会按行重复读（L2 可缓解，但建议后续按 block_M 聚行/把 hc_fn 分块常驻），当前优化目标是 decode。
+- 接入点：`hc.py::HCBlockMixin.hc_mixes`（返回 pre/post/comb）替换为 `fused_hc_mixes + fused_sinkhorn`；`hc_pre`/`hc_post` 替换为对应 kernel；`hc.py::hc_split_sinkhorn` 保留作参考/测试。
+
+### 2.14 decode 专用 fp8 GEMV（O2/O3 本轮）
+
+M=1 时官方 `fp8_gemm` 的 block_M=32 浪费 31/32 行，且实测只有 ~167 GB/s。`gemv_fp8.py` 改为“输出行 × K 串行”：
+
+| kernel | 输入 | 结构 |
+|---|---|---|
+| `gemv_bf16_kernel` | x bf16 [K], w fp8 [N,K], ws e8m0 | 每 block 先做一次激活 32-block 量化（shared Aq/As），再 rows=8 行 × 32 lane 每线程一个 (row,lane)，K 串行累加 |
+| `gemv_pq_kernel` | Aq fp8 [K], As [K/32], w, ws | 预量化激活（推荐，省去 per-block 重复量化）；rows=16，线程=rows×32；可选 RoPE epilogue |
+| `gemv_pq4_kernel` | 同上 | 每线程 4 个连续 k（lanes=8/行，rows=64），减少循环次数；wq_b 上最快 |
+
+**实测（真实 L0、M=1、median of 5；official = `kernel.fp8_gemm` 同一 aq/asc）**
+
+| 张量 | 形状 (N,K) | official µs | 最佳 fused µs | 加速 | 有效带宽 | rel err（同量化参考） |
+|---|---|---:|---:|---:|---:|---:|
+| wq_a | 1280×5120 | 37.5 | **26.9**（bf16 入口） | 1.39× | 244 GB/s | 1.40e-3 |
+| wq_b | 32768×1280 | 251.7 | **139.7**（pq4） | 1.80× | 300 GB/s | 1.40e-3 |
+| wkv | 512×5120 | 37.3 | **20.1**（bf16 入口） | 1.86× | 130 GB/s | 1.35e-3 |
+| wo_b | 5120×8192 | 270.9 | **147.1**（bf16 入口） | 1.84× | 285 GB/s | 1.41e-3 |
+
+- RoPE epilogue（wq_b / wkv，最后 64 列/head）：wq_b 139.7 µs 含 RoPE；正确性 rel **1.40e-3 / 1.32e-3**（对 dequant+RoPE 参考）。
+- 目标 <60 µs 的物理分析：wq_b/wo_b 权重 41.9 MB，本机实测有效带宽 338 GB/s（bf16 F.linear 83.9 MB / 248 µs）→ **下界 ~124 µs**；当前 139.7 µs ≈ 89% 的有效带宽，已接近极限。60 µs 需要 >700 GB/s，超出 RTX 5060 Laptop 的 HBM。wq_a（6.6 MB）和 wkv（2.6 MB）已 <60 µs（26.9/20.1，主要受 launch 限制）。
+- 推荐组合（M=1）：wq_a/wkv/wo_b 用 `gemv_bf16_kernel`（无额外 act_quant launch）；wq_b 用 `gemv_pq4`（先 `act_quant` 14 µs + GEMV 139.7 = ~154 µs，仍比 official 251.7 快 1.6×）；wkv 之后接 `fused_rmsnorm_rope`；wq_b 直接带 RoPE。四个 GEMM 合计从 ~597 µs 降到 ~350 µs/层（40 层省 ~10 ms/token）。
+- 变体 sweep：wq_b 上 pq4(32/64)=139.7 < pq8=170.6 < pq16=172.6；wo_b 上 bf16=147.1 < pq8=173.2 < pq4=200–222（K=8192 时 pq4 的 4-FMA/迭代不划算）；rows=64 的 32-lane 版本会超过 1024 线程上限而编译失败。
+- 限制/下一步：权重读仍是 32 B/warp/迭代的 sector 交易，未用 16 B 向量 load；下一步可做 16B/thread + 2 warps/行、或把 wq_b 与 `act_quant` 融合成单 kernel；wo_a 是分组 8×(1024×4096)，本表未按单 GEMV 计（Lead 列的 wo_b K=4096 应为 wo_a 的组形状）。
+- 接入点：`gemm.py` 增加 decode 分支（M==1 且 fp8 权重）→ `fused_fp8_gemv/_pq/_pq4`；prefill M≥64 仍走 `fp8_gemm`。
+
+---
+
+
 
 > 约定：收益均为**本机实测**或明确标注“预期”；接入点写到 tinyinfer 的文件/函数；原型脚本在 `prototypes/kernels/`。
 > 原则：**O1 正确性已由 Lead 完成；O2/O3 是本周可落地；O5/O6 是投机与 CPU 辅助；O7–O9 是系统级流水线，先定算子接口。**
+
+## 3. O1–O9 算子路线（tinyinfer 落地视角）
 
 ### O1 — 正确性优先（已有，PyTorch eager）
 
@@ -341,6 +526,28 @@ Strata 的 `docs/NVFP4.md` 明确指出：其 FP4×FP4 kernel（`mmq_nvfp4_w4a4.
 - Windows 上 SDPA 融合后端：torch wheel 未编译 flash，D=512 无 kernel；不要浪费时间试 SDPA。
 - 不要用 CPU 承担主专家计算（会从 IO-bound 变成 CPU-bound）。
 
+### O3 真实权重集成建议（给 Lead/实现的直接方案）
+
+V4.1 的 non-expert 权重只有 17.7 GB（fp8 + e8m0 scale），expert 296 GB（fp4 + 1×32 e8m0）。建议在 `gemm.py` 的 `fp8_linear` / `fp4_linear` 上增加“预量化 activation”入口，并按下表分流：
+
+| 张量 | 形状 | decode M=1 | prefill M≥64 | 备注 |
+|---|---|---|---|---|
+| attention wq_a / wkv / wo_b | 1280×5120 / 512×5120 / 5120×8192 | dequant→bf16（或 torch mm） | `fp8_linear` | M≥128 fp8 才明显快 |
+| attention wq_b | 32768×1280 | bf16（实测 fp8 306 µs vs bf16 249 µs） | `fp8_linear`（M=512 1.37×） | 大 N 小 K，decode 不用 fp8 |
+| attention wo_a（分组 block-diagonal） | 8×(1024×4096) | bf16 einsum | bf16 einsum（或 8 次 fp8，不划算） | 分组 GEMM 暂不 fp8 |
+| shared expert w1/w2/w3（fp8） | 2304×5120 等 | bf16 | `fp8_linear` | 与 expert 共用激活 |
+| routed expert w1/w2/w3（fp4） | 2304×5120 / 5120×2304 | **fp4_gemm**（权重减半；真实流式优先） | **fp4_gemm**，同一专家行聚成 M≥64 | 预 dequant 驻留时 bf16 更快（M≤64） |
+| gate（fp32） | 384×5120 | GPU/CPU 均可（0.44 ms CPU） | GPU | O6 可提前一层 |
+
+实现要点：
+1. **激活量化一次、复用 6 次**：当前 `gemm.fp4_linear` 每次调用都做 `act_quant`；MoE 一层 6 个专家应只量化一次 `x [M,5120]`，再把 `x_fp8, x_scale` 传给 6 次 `fp4_gemm`，省 5 次 quant（约 5×14 µs）。
+2. **M 阈值**：以本表为准——fp8 在 M≥128 才有稳定收益；decode 一律 dequant/bf16（wq_b 实测更慢）。expert fp4 即使在 M=1 也应该用（权重流式时 IO 减半），但驻留 bf16 时 M≤8 用 bf16 更快。
+3. **权重驻留**：非专家 fp8 常驻 RAM（17.7 GB）；GPU 只放当前层的 bf16/fp8 副本（~250 MB）；专家按 O7 预取。
+4. **精度**：保持 HF 的 32×32（非专家）/ 1×32（专家）scale 布局，不要为了用 torch tensorwise 而 requantize。
+5. **验证**：接入后用 `tests/test_nn.py` 以外的真实 L0 参考（`bench_real_weights.py` 的 dequant 对照）做端到端 logits 对比；fp8/fp4 误差已在 1.5%/2.4% 量级。
+
+
+
 ---
 
 ## 5. 风险清单
@@ -379,6 +586,20 @@ Strata 的 `docs/NVFP4.md` 明确指出：其 FP4×FP4 kernel（`mmq_nvfp4_w4a4.
 | `probe_kv_quant.py` | KV FP8/FP4/int4+Hadamard 误差 | ✅ |
 | `try_tilelang_jit.py` + `run_tilelang_jit.py`/`run_py.bat` | tilelang 最小 JIT 验证 | ✅ |
 | `probe_sdpa_d128.py` | D=128 indexer 形状 SDPA 探测 | ✅ |
+| `probe_tilelang_math.py` / `probe_tilelang_math2.py` | tilelang 数学 intrinsic / bit-trick 支持探测 | ✅ |
+| `approx_kernels.py` | 精确 vs fast 的 RMSNorm/SwiGLU/softmax/RoPE 表 kernel | ✅ |
+| `test_approx_kernels.py` | 近似 kernel 数值正确性 | ✅ |
+| `bench_approx.py` | 精确 vs hw vs poly 的 ms/精度（含 attention exp_mode） | ✅ |
+| `bench_real_weights.py` | L0 真实权重：近似误差 + fp8/fp4 GEMM vs dequant | ✅ |
+| `spec_ops.py` | tree/DSpark attention idx、rejection、DSpark head 接口 | ✅ |
+| `bench_spec_ops.py` | tree/DSpark attention、rejection、markov head 计时 | ✅ |
+| `fused/fused_ops.py` | fused_rmsnorm_rope / fused_gemm_rope / rope_inplace | ✅ |
+| `fused/test_fused_ops.py` | 三个融合 kernel 的正确性 + 单次耗时 | ✅ |
+| `fused/bench_fused_attn.py` | 真实 L0 权重：整层 PyTorch vs fused（耗时/kernel 数） | ✅ |
+| `fused/hc_fused.py` | fused_hc_mixes / fused_sinkhorn / fused_hc_pre / fused_hc_post | ✅ |
+| `fused/bench_hc_fused.py` | 真实 L0 HC 权重：torch vs fused，正确性/耗时/kernel 数 | ✅ |
+| `fused/gemv_fp8.py` | decode fp8 GEMV（bf16 入口 / 预量化 / pq4 / RoPE epilogue） | ✅ |
+| `fused/bench_gemv_fp8.py` | 真实 L0 四个 GEMM：official vs GEMV，带宽/正确性 | ✅ |
 
 ---
 
@@ -391,3 +612,26 @@ Strata 的 `docs/NVFP4.md` 明确指出：其 FP4×FP4 kernel（`mmq_nvfp4_w4a4.
 - DeepGEMM PR #324（SM120，merged 2026-06-24）：https://github.com/deepseek-ai/DeepGEMM/pull/324
 - FlashInfer PR #3395（SM120 sparse MLA，merged 2026-06-15）：https://github.com/flashinfer-ai/flashinfer/pull/3395
 - FlashMLA SM120：#124/#146/#189，Windows 构建 issue #119：https://github.com/deepseek-ai/FlashMLA/issues/119
+
+---
+
+## 8. 借鉴清单：llama.cpp（本机克隆 `repositories/llama.cpp`）
+
+> 只读参考；未修改 llama.cpp。下列条目都已定位到具体文件/行，按“能直接抄什么”排序。
+
+| # | 位置 | 可复用内容 | tinyinfer 用法 |
+|---|---|---|---|
+| 1 | `ggml/src/ggml-common.h:214` `block_mxfp4` | QK=32：1 字节 E8M0 + 16 字节 packed E2M1（去掉头部即 HF expert 的 1×32 布局） | **零拷贝校验**：HF 专家 fp4 与 MXFP4 同构；可直接借 `quantize_row_mxfp4_ref`/`dequantize_row_mxfp4`（ggml-quants.c）做参考实现 |
+| 2 | `ggml-common.h:221` `block_nvfp4` | QK=64：4 个 UE4M3 scale（每 16 个一组）+ 32 字节 packed FP4 | 与 V4.1 压缩 KV 的 fp4_act_quant(block=16, e4m3) 完全对应；KV cache 布局/量化可直接照抄 |
+| 3 | `ggml-common.h:251/327` `block_q8_0` / `block_q4_K` | Q8_0 = f16 d + int8[32]；Q4_K 超级块 256（8×32，6-bit scales+min，双超级 scale） | O9 CPU 专家：若 FP4 精度/速度不理想，可退到 Q4_K/Q8_0 的成熟 vec_dot；也可借 K-quant 的 super-block 设计做 KV 压缩 |
+| 4 | `ggml/src/ggml-cpu/vec.h:1191` `ggml_v_expf` + `vec.cpp:539` `ggml_vec_soft_max_f32` | AVX512/AVX2/NEON 向量化 exp（Arm 算法，1.45 ulp）、softmax/RMSNorm/GLU 的 SIMD 实现 | **O9 CPU 路径**：把 approx_math 的思路放 CPU 才有意义；可移植 `ggml_v_expf`/`ggml_v_silu` 到我们的 AVX512 kernel |
+| 5 | `ggml/src/ggml-cuda/softmax.cu:55` | fused softmax 支持 per-head attention sinks：max 从 sink 初始化、分母加 `exp(sink-max)`；GPU 用普通 `expf` | 与我们的 attn sink 数学完全一致，可作为独立参考/单测；证明 CUDA 侧不需要多项式 exp |
+| 6 | `ggml/src/ggml-cuda/dsv4-hc.cu` | **DeepSeek V4 Hyper-Connection CUDA kernel**：`dsv4_hc_comb_f32`（Sinkhorn comb）、`dsv4_hc_pre_f32`/`dsv4_hc_post_f32`（gated 变体） | 直接替换 `hc.py` 的 Python Sinkhorn + pre/post；官方 tilelang 只有 comb，pre/post 融合仍缺，这个文件是现成参考 |
+| 7 | `ggml/src/ggml-cuda/topk-moe.cu:139` | fused MoE top-k routing（bias、mask、1..576 experts/block 模板实例化、sink 处理） | O2：把 Gate 的 score+bias+topk+norm 融合成一个 kernel，减少 Python topk/gather |
+| 8 | `ggml/src/ggml-cuda/mmq.cuh` + `dequantize.cuh` | int8 tensor-core GEMM（MMQ）与 4/8-bit 反量化的向量化写法 | O4 fused int8 prompt experts；O3 fp4→fp8 的快速转换 |
+| 9 | `ggml/src/ggml-cpu/repack.cpp` + `arch/x86/repack.cpp` | 运行时把量化行重排成 SIMD 友好布局（每类型 traits/repack） | O9 CPU 专家：fp4/mxfp4 行按 AVX512 重排后再 dequant-dot |
+| 10 | `ggml/src/ggml-backend.cpp`（`ggml_backend_sched`） | 计算图按后端切分/调度（GPU/CPU 各自子图） | O9 异构流水线的调度接口参考：attention/专家在 GPU、尾部专家/采样在 CPU |
+| 11 | `ggml/src/ggml-cuda/rope.cu` | 即时 YaRN sin/cos（`rope_yarn`），无预计算表 | 与我们“预计算表”路线互补：可借 `rope_yarn` 公式做数值对拍；表在 GPU 上仍更快（本机 torch complex 慢 10×） |
+| 12 | `ggml/src/ggml-cuda/fattn.cu` 等 | GQA flash attention、量化 KV cache、paged 访问 | O4：paged/量化 KV 的 attention 参考 |
+
+**不要照抄的点**：llama.cpp 的 MoE 专家是**全驻留**模型（无 NVMe 流式），O7 的专家流式仍应参考 ds4/flash-moe 与 Strata；llama.cpp 的 CUDA 侧没有多项式 fast-math（这印证了第 2.9 节的负结果）。

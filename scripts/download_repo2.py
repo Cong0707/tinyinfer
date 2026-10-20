@@ -10,10 +10,13 @@ backbone, MTP heads, engram tables, and finally vision/small files.
 Usage:
   python download_repo2.py [--seg-mb 100] [--workers 4] [--only-small]
 """
-import argparse, json, os, re, subprocess, sys, threading, time, urllib.request
+import argparse, json, os, random, re, subprocess, sys, threading, time, urllib.request
 
 REPO = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
-BASE = f"https://hf-mirror.com/{REPO}/resolve/main/"
+BASE_HF = f"https://hf-mirror.com/{REPO}/resolve/main/"
+BASE_MS = f"https://www.modelscope.cn/api/v1/models/{REPO}/repo?Revision=master&FilePath="
+BASE = BASE_MS
+SOURCE = "ms"
 API = f"https://hf-mirror.com/api/models/{REPO}?blobs=true"
 DEST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cache", "weights")
 LOG = os.path.join(DEST, "download_repo.log")
@@ -59,17 +62,63 @@ def priority(name: str) -> int:
 def seg_path(name: str, i: int) -> str:
     return os.path.join(DEST, f"{name}.seg{i:04d}")
 
+# --- signed CloudFront URL cache: one /resolve per file per ~50min, then many ranges
+_resolve_lock = threading.Lock()
+_resolved = {}
+RESOLVE_TTL = 3000.0
+
+
+def resolve_url(name):
+    with _resolve_lock:
+        e = _resolved.get(name)
+        if e and time.time() - e[1] < RESOLVE_TTL:
+            return e[0]
+    loc = ""
+    try:
+        res = subprocess.run(["curl.exe", "-sS", "-o", os.devnull, "-w", "%{redirect_url}",
+                              "--max-time", "30", BASE + name], capture_output=True, timeout=45)
+        loc = (res.stdout or b"").decode("utf-8", "replace").strip()
+    except subprocess.TimeoutExpired:
+        loc = ""
+    if loc.startswith("http"):
+        with _resolve_lock:
+            _resolved[name] = (loc, time.time())
+        log(f"RESOLVED {name} (signed url cached)")
+        return loc
+    return BASE + name
+
+
+def invalidate_url(name):
+    with _resolve_lock:
+        _resolved.pop(name, None)
+
+
 def seg_complete(path, want):
     try:
         return os.path.exists(path) and os.path.getsize(path) == want
     except OSError:
         return False
 
-def download_seg(url, lo, hi, path, retries=6):
+_fail_lock = threading.Lock()
+_fail_times = []
+
+
+def failure_storm():
+    """True when many segments failed in the last 60s (mirror is throttling)."""
+    now = time.time()
+    with _fail_lock:
+        _fail_times.append(now)
+        while _fail_times and now - _fail_times[0] > 60:
+            _fail_times.pop(0)
+        return len(_fail_times) >= 4
+
+
+def download_seg(name, lo, hi, path, retries=8):
     want = hi - lo + 1
     if seg_complete(path, want):
         return True
     for attempt in range(1, retries + 1):
+        url = (BASE + name) if SOURCE == "ms" else resolve_url(name)
         have = os.path.getsize(path) if os.path.exists(path) else 0
         if have > want:
             try:
@@ -86,7 +135,7 @@ def download_seg(url, lo, hi, path, retries=6):
         try:
             res = subprocess.run(["curl.exe", "-sS", "-L", "--fail",
                                   "--connect-timeout", "30",
-                                  "--speed-limit", "20000", "--speed-time", "90",
+                                  "--speed-limit", "30000", "--speed-time", "30",
                                   "--max-time", "1800",
                                   "-r", f"{rlo}-{hi}", "-o", dst, url],
                                  timeout=1850, capture_output=True)
@@ -115,7 +164,14 @@ def download_seg(url, lo, hi, path, retries=6):
                 pass
             got = 0
         log(f"RETRY seg {os.path.basename(path)} attempt={attempt} size={got}/{want} rc={rc} err={err}")
-        time.sleep(min(60, 5 * attempt))
+        if "403" in err or "Expired" in err:
+            invalidate_url(name)
+        if "429" in err or "403" in err:
+            invalidate_url(name)
+        if failure_storm():
+            log("STORM BRAKE: >=4 seg failures in 60s, pausing 45s")
+            time.sleep(45)
+        time.sleep(min(120, 10 * (2 ** (attempt - 1))) * random.uniform(0.7, 1.4))
     return False
 
 SEG_RE = re.compile(r"\.seg\d{4}(?:\.part)?$")
@@ -267,7 +323,13 @@ def main():
     ap.add_argument("--seg-mb", type=int, default=SEG // 2**20)
     ap.add_argument("--workers", type=int, default=WORKERS)
     ap.add_argument("--only-small", action="store_true")
+    ap.add_argument("--source", choices=["ms", "hf"], default="ms")
     args = ap.parse_args()
+    global BASE, SOURCE
+    if args.source == "ms":
+        BASE, SOURCE = BASE_MS, "ms"
+    else:
+        BASE, SOURCE = BASE_HF, "hf"
     SEG = args.seg_mb * 1024 * 1024
     WORKERS = args.workers
 
@@ -282,7 +344,7 @@ def main():
     small = [(n, s) for n, s in files if not (n.endswith(".safetensors") and s >= SMALL)]
     big.sort(key=lambda x: (priority(x[0]), x[0]))
     total_bytes = sum(s for _, s in files)
-    log(f"START {len(files)} files / {total_bytes/1e9:.1f} GB, seg={SEG//2**20}MiB, workers={WORKERS}")
+    log(f"START {len(files)} files / {total_bytes/1e9:.1f} GB, seg={SEG//2**20}MiB, workers={WORKERS} source={SOURCE}")
 
     state = {"merged": 0, "fails": 0, "last_rate": 0.0}
     stop_ev = threading.Event()
@@ -332,7 +394,7 @@ def main():
 
         def do(task):
             _, _, name, size, nseg, i, lo, hi = task
-            return task, download_seg(BASE + name, lo, hi, seg_path(name, i))
+            return task, download_seg(name, lo, hi, seg_path(name, i))
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
         state["tasks"] = len(tasks)

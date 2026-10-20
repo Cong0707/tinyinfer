@@ -25,17 +25,32 @@ def e8m0_to_float(scale: torch.Tensor) -> torch.Tensor:
 
 
 def fp8_block_scale_to_dense(scale: torch.Tensor, out_features: int, in_features: int, block: int = 32) -> torch.Tensor:
-    s = e8m0_to_float(scale)
-    s = s.repeat_interleave(block, dim=0).repeat_interleave(block, dim=1)
-    return s[:out_features, :in_features]
+    """Expand [out/32, in/32] scales without materializing a repeat_interleave."""
+    s = e8m0_to_float(scale)  # [bo, bi]
+    bo, bi = s.shape
+    dense = s[:, None, :, None].expand(bo, block, bi, block)
+    dense = dense.reshape(bo * block, bi * block)
+    return dense[:out_features, :in_features]
 
 
 def dequant_fp8_block(weight: torch.Tensor, scale: torch.Tensor, block: int = 32) -> torch.Tensor:
-    """FP8 E4M3 weight with 32x32 block scales -> bf16 tensor [out, in]."""
+    """FP8 E4M3 weight with 32x32 block scales -> bf16 tensor [out, in].
+
+    On CUDA this dispatches to a single fused tilelang kernel (about 4x faster than the
+    torch elementwise path), which matters because wo_a is dequantized every token.
+    """
+    if weight.is_cuda and block == 32:
+        try:
+            from .dequant_kernel import dequant_fp8
+            return dequant_fp8(weight, scale)
+        except Exception:
+            pass
     out_features, in_features = weight.shape
-    w = weight.to(torch.float32)
-    s = fp8_block_scale_to_dense(scale, out_features, in_features, block)
-    return (w * s).to(torch.bfloat16)
+    bo, bi = out_features // block, in_features // block
+    s = e8m0_to_float(scale)[:bo, :bi]
+    w4 = weight.to(torch.float32).view(bo, block, bi, block)
+    out = (w4 * s[:, None, :, None]).reshape(out_features, in_features)
+    return out.to(torch.bfloat16)
 
 
 def unpack_fp4(packed: torch.Tensor) -> torch.Tensor:
@@ -59,6 +74,8 @@ def dequant_fp4_block(packed: torch.Tensor, scale: torch.Tensor, block: int = 32
     """FP4 E2M1 experts with 1x32 (K) block scales -> bf16 tensor [out, in]."""
     values = unpack_fp4(packed)
     out_features, in_features = values.shape
-    s = e8m0_to_float(scale)
-    s = s.repeat_interleave(block, dim=-1)[..., :in_features]
-    return (values * s).to(torch.bfloat16)
+    bi = in_features // block
+    s = e8m0_to_float(scale)[:, :bi]
+    v4 = values.view(out_features, bi, block)
+    out = (v4 * s[:, :, None]).reshape(out_features, in_features)
+    return out.to(torch.bfloat16)

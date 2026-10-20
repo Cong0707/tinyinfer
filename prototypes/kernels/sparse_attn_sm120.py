@@ -10,9 +10,25 @@ pass_configs = {
     tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
 }
 BF16 = "bfloat16"; FP32 = "float32"; INT32 = "int32"
+LOG2E = 1.4426950408889634
+
+
+def _exp_approx(d, mode):
+    """exp(d) for d<=0 (softmax); modes: exact (expf) / hw (__expf) / poly (approx_math)."""
+    if mode == "hw":
+        return T.__exp(d)
+    if mode == "poly":
+        d = T.max(d, -80.0)
+        z = d * LOG2E
+        zi = T.floor(z)
+        fr = z - zi
+        p = 1.0 + fr * (0.6931471805599453 + fr * (0.2402265069591007 + fr * 0.0555041086648216))
+        bits = T.Cast("int32", zi) + 127
+        return p * T.reinterpret(FP32, T.shift_left(bits, 23))
+    return T.exp(d)
 
 @tilelang.jit(pass_configs=pass_configs)
-def sparse_attn_kernel(h: int, d: int, h_chunk: int, block: int, scale=None):
+def sparse_attn_kernel(h: int, d: int, h_chunk: int, block: int, scale=None, exp_mode: str = "exact"):
     b = T.symbolic("b"); m = T.symbolic("m"); n = T.symbolic("n"); topk = T.symbolic("topk")
     if scale is None:
         scale = (1.0 / d) ** 0.5
@@ -62,9 +78,9 @@ def sparse_attn_kernel(h: int, d: int, h_chunk: int, block: int, scale=None):
                 T.copy(scores_max, scores_max_prev)
                 T.reduce_max(acc_s, scores_max, dim=1, clear=False)
                 for i in T.Parallel(h_chunk):
-                    scores_scale[i] = T.exp(scores_max_prev[i] - scores_max[i])
+                    scores_scale[i] = _exp_approx(scores_max_prev[i] - scores_max[i], exp_mode)
                 for i, j in T.Parallel(h_chunk, block):
-                    acc_s[i, j] = T.exp(acc_s[i, j] - scores_max[i])
+                    acc_s[i, j] = _exp_approx(acc_s[i, j] - scores_max[i], exp_mode)
                 T.reduce_sum(acc_s, scores_sum, dim=1)
                 for i in T.Parallel(h_chunk):
                     sum_exp[i] = sum_exp[i] * scores_scale[i] + scores_sum[i]
@@ -74,7 +90,7 @@ def sparse_attn_kernel(h: int, d: int, h_chunk: int, block: int, scale=None):
                 T.gemm(acc_s_cast, kv_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
             for i in T.Parallel(h_chunk):
-                sum_exp[i] += T.exp(sink_local[i] - scores_max[i])
+                sum_exp[i] += _exp_approx(sink_local[i] - scores_max[i], exp_mode)
             for i, j in T.Parallel(h_chunk, d):
                 acc_o[i, j] /= sum_exp[i]
             T.copy(acc_o, o_shared)
@@ -82,7 +98,7 @@ def sparse_attn_kernel(h: int, d: int, h_chunk: int, block: int, scale=None):
     return main
 
 
-def sparse_attn_sm120(q, kv, attn_sink, topk_idxs, softmax_scale, h_chunk=16, block=32):
+def sparse_attn_sm120(q, kv, attn_sink, topk_idxs, softmax_scale, h_chunk=16, block=32, exp_mode="exact"):
     b, s, h, d = q.shape
     if h_chunk > h or h % h_chunk:
         h_chunk = h
@@ -92,8 +108,8 @@ def sparse_attn_sm120(q, kv, attn_sink, topk_idxs, softmax_scale, h_chunk=16, bl
         q = torch.cat([q, q.new_zeros(b, s, pad, d)], dim=2)
         o = torch.empty_like(q)
         attn_sink = torch.cat([attn_sink, attn_sink.new_zeros(pad)])
-        kernel = sparse_attn_kernel(q.size(2), d, q.size(2), block, softmax_scale)
+        kernel = sparse_attn_kernel(q.size(2), d, q.size(2), block, softmax_scale, exp_mode)
     else:
-        kernel = sparse_attn_kernel(h, d, h_chunk, block, softmax_scale)
+        kernel = sparse_attn_kernel(h, d, h_chunk, block, softmax_scale, exp_mode)
     kernel(q, kv, o, attn_sink, topk_idxs)
     return o.narrow(2, 0, h).contiguous() if o.size(2) != h else o
