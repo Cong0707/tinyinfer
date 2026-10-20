@@ -16,7 +16,7 @@
 4. **冷解码时间预算**（no cache）：NVMe 513 ms + PCIe 与固定开销 ≈ 110 ms → **~1.55 tok/s**（8.8 GB/s）；4.5 GB/s 时 ~0.88 tok/s。
 5. **缓存是主杠杆，不是预取**。20 GB ARC 专家缓存在合成分布（Zipf 0.9 + topic + 25% temporal）下命中 **24.7%**，Zipf 1.2 下 **32.1%**；对应解码 **2.0–2.3 tok/s**。预取只能再拿 **+3%～+16%**，且必须过 gate，否则负收益（flash-moe 的 -18% 结论仍然成立）。
 6. **预填充是最大惊喜**：512-token chunk 会触及几乎全部 384 专家/层 → 288.7 GB，33 s，**15.6 tok/s**；但若按"逐层预填充（layer-major）"把整个 prompt 一次喂完（激活放 RAM，专家每层只读一遍），8K prompt 也只要 ~33 s + 计算 → **~240 tok/s 预填充**。这是 O9 的核心设计。
-7. **推荐默认配置（Lead 已拍板）**：MTP 关、head 放 CPU（实测 bf16 matvec 39–41 ms）、注意力 fp8 常驻 auto（29–34 层，可配全驻/部分驻）、24 个专家槽（451 MB）、RAM 专家缓存 20 GB 起步（可配）、ARC + 热度 pin、O_DIRECT 专家流、预取 lead=1 层 / k=2 / gate 开、活跃会话 2（上限 4）。fp8/int8 head 备选评估见 5.4.1：8 GB 卡上不划算，保持 CPU。
+7. **推荐默认配置（Lead 已拍板）**：MTP 关、head 放 CPU（实测 bf16 matvec 37.8–40.8 ms）、注意力 fp8 常驻 auto（29–34 层，可配全驻/部分驻）、24 个专家槽（451 MB）、RAM 专家缓存 20 GB 起步（可配）、ARC + 热度 pin、O_DIRECT 专家流、预取 lead=1 层 / k=2 / gate 开、活跃会话 2（上限 4）。fp8/int8 head 备选评估见 5.4.1：8 GB 卡上不划算，保持 CPU。
 8. **真实 router 分布：layer 0 已完成，全 40 层待权重**。layer 0 真实预检（159 token）给出 232/384 专家、top-24 41.9%、单层 LRU(27) 命中 34.4%，不低于合成 24.7%，可把 24.7% 当保守下限。完整 E-L3/E-L4 需要全部 40 层分片 + tokenizer（当前下载 baseline 11.13/510.3 GB，约 11 h）；只下载 40 层 gate 权重（~160 MB）不够，因为路由输入是完整前向 hidden。脚本已就绪（scripts/prototypes/loading_research/）。
 
 ---
@@ -73,7 +73,7 @@
 | Engram 行 | 12,288 B（2 层 × 24 行 × 256 B） | 随机行；4 KB 页粒度下 ≤196,608 B/token |
 | 非专家流（未常驻的注意力层） | 0–1.36 GB | 常驻 29 层时剩 11 层 × 170 MB = 1.87 GB；34 层时 6 层 = 1.02 GB |
 | KV 窗口 | 5.24 MB/会话 | 40 层 × 128 × 512 × 2 B（仅在 VRAM） |
-| head | 1.32 GB | CPU bf16 matvec 实测 39–41 ms；fp8/int8 备选见 5.4.1 |
+| head | 1.32 GB | CPU bf16 matvec 实测 37.8–40.8 ms；fp8/int8 备选见 5.4.1 |
 
 时间模型（解码，单会话）：
 
@@ -171,7 +171,8 @@ B_nvme = 4.5 GB/s 时：0.88 / 1.18 / 1.31 tok/s（0 / 27% / 35%）；B_nvme = 3
 | 专家条目（18.8 MB/条） | 1,180（7.7%） | 756（4.9%） | 63（0.4%） |
 
 说明：
-- "可用 RAM"必须**启动时实测**（psutil.virtual_memory().available），不能写死 47.2。本次测量时下载器把 page cache 占满，available 只有 19.85 GB；重启后通常 40–42 GB。TierBudget.plan(ram_available_gb=...) 支持。
+- **Lead 拍板默认：专家缓存 20 GB 起步**（CLI --expert-cache-gb 20，对应 1,063 条 / 6.9% 覆盖）；表 A 的 22.2 GB 是 41 GB 可用 RAM 时的上限，不是默认值。
+- "可用 RAM"必须**启动时实测**（psutil.virtual_memory().available），不能写死 47.2。本次测量时下载器把 page cache 占满，available 在 19.8–29.7 GB 波动；重启后通常 40–42 GB。TierBudget.plan(ram_available_gb=...) 支持。
 - **Windows page-lock 上限约为物理 RAM 的一半（WDDM 共享预算）**（Strata DETAILS 的实测经验）。非专家 9.76 GB + staging 0.8 GB + KV pinned 0.25 GB = 10.8 GB < 23.6 GB，安全。专家 cache 用普通（非 pinned）内存，靠页表换入换出；不要 pin 20 GB 专家，会触发 pinned 耗尽并挤掉 OS。
 - MTP 开 = 用 8 GB 专家缓存换投机解码。带宽受限时 MTP 的净收益存疑（flash-moe 实测 break-even），**默认关闭**，等 O5 实测后再决定。
 
@@ -276,7 +277,7 @@ Strata 在 RAM↔VRAM 间按热度搬专家。本项目的对应设计：
 - 17.78 GB 非专家全驻 RAM（pinned 10.8 GB 以内），每 token 从 RAM 取。
 - VRAM 常驻 29–34 层注意力（fp8 原样），剩余 6–11 层按 token 流：每层 170 MB，26 GB/s → 6.5 ms/层；11 层 = 72 ms/token，可与 NVMe 并行。
 - **不要**把注意力反量化成 bf16 常驻 VRAM（340 MB/层 × 40 = 13.6 GB，不可能）。需要 bf16 计算时，在 kernel 内联反量化或每层临时 dequant 到 scratch（340 MB 峰值）。
-- head：129280×5120 bf16 = 1.32 GB。默认 **CPU bf16 matvec**，实测 39–41 ms/次（16 线程；读 1.32 GB RAM，有效 33 GB/s），见 5.4.1。
+- head：129280×5120 bf16 = 1.32 GB。默认 **CPU bf16 matvec**，实测 37.8–40.8 ms/次（16 线程；读 1.32 GB RAM，有效 33 GB/s），见 5.4.1。
 - embedding：只做行 gather（10 KB/token），放 RAM。
 
 #### 5.4.1 head 放哪里：实测与 fp8/int8 备选
@@ -285,13 +286,13 @@ Strata 在 RAM↔VRAM 间按热度搬专家。本项目的对应设计：
 
 | 方案 | 实测/估算 | 结论 |
 |---|---:|---|
-| **CPU bf16 matvec（默认）** | **39–41 ms**（8/16/32 线程 40.8/39.8/40.3） | 推荐：0 VRAM，速度可接受 |
-| CPU fp32 matvec（当前 model.py 路径 .float()） | 80.9 ms + 2.65 GB 转换 | 不要；除非 logits 精度验证必须 |
+| **CPU bf16 matvec（默认）** | **37.8–40.8 ms**（8/16/32 线程 40.8 / 37.8–39.8 / 40.3） | 推荐：0 VRAM，速度可接受 |
+| CPU fp32 matvec（当前 model.py 路径 .float()） | 80.9–84.7 ms + 2.65 GB 转换 | 不要；除非 logits 精度验证必须 |
 | GPU bf16 常驻 VRAM | GEMV 3.6 ms，但占 1.32 GB → 挤掉 8 层注意力 ≈ +52 ms PCIe/token | 不划算 |
 | GPU bf16 每 token pinned 上卡 | H2D 46.3 ms + GEMV 3.6 ms ≈ 50 ms | 不如 CPU |
-| fp8 head 0.66 GB（per-row scale）常驻 RAM | H2D 28.2 ms + torch dequant+GEMV 29.4 ms ≈ 58 ms；若自定义 fused fp8 GEMV（~3 ms）≈ 31 ms | 备选 B：需 tilelang 内核；torch._scaled_mm 在 sm_120 不支持 rowwise scale（实测报错） |
-| fp8 head 常驻 VRAM 0.66 GB | 挤掉 4 层注意力 ≈ +26 ms + GEMV ~3 ms ≈ 29 ms | 比 CPU 略快，但 0.66 GB VRAM + 量化质量风险；8 GB 卡不推荐 |
-| int8 head 0.66 GB | 与 fp8 同尺寸：H2D 28.0 ms；torch 无 rowwise int8 GEMM | 备选 C：收益与 fp8 同量级，质量更差，暂不做 |
+| fp8 head 0.66 GB（per-row scale）常驻 RAM | H2D 23–44 ms（抖动大）+ torch dequant+GEMV 24.4 ms ≈ 48–69 ms；per-tensor fp8 _scaled_mm 实测可用（2.0 ms）但精度风险，rowwise scale 在 sm_120 上不支持（实报错），需自定义 fused GEMV | 备选 B：收益不明确，需 tilelang 内核 + 质量验证 |
+| fp8 head 常驻 VRAM 0.66 GB | 挤掉 4 层注意力 ≈ +26 ms + per-tensor fp8 GEMM 2.0 ms ≈ 28 ms | 比 CPU 快 ~10 ms，但 0.66 GB VRAM + per-tensor 量化风险；8 GB 卡不推荐 |
+| int8 head 0.66 GB | 与 fp8 同尺寸（H2D 23–44 ms）；torch 无 rowwise int8 GEMM | 备选 C：收益与 fp8 同量级，质量更差，暂不做 |
 
 **拍板**：默认 CPU bf16；把 model.py 的 head 计算从 h.float()/head.float() 改为 bf16（否则 81 ms + 2.65 GB）。fp8/int8 只有在 (a) 自定义 fused GEMV 内核落地且 (b) 真实权重质量验证通过后才考虑；在 8 GB 卡上收益仅 5–10 ms，不值得抢先做。若未来换 12–16 GB 卡，可把 fp8 head 常驻 VRAM 作为省 CPU 的方案。
 
@@ -344,7 +345,7 @@ CPU 决策点（O6）：
 - **lead=1 层**：在 layer L 的 attention 输出（router 输入）拿到后，CPU 立刻用 lookahead 预测 L+1 的 6 个专家；此时 GPU 正在算 L 的 FFN（3–5 ms），NVMe 空闲，正好读 L+1 的 2 个高置信专家。**这是唯一真正能隐藏 I/O 的窗口**。
 - **lead=2 层**：只有当每层计算 ≥6 ms（PyTorch fallback/长上下文）时才值得；否则预取字节超过窗口，负收益。
 - **transformer 依赖决定了不可能提前更多**：layer L+1 的 router 输入依赖 layer L 的 FFN 输出，而 FFN 输出依赖专家本身。任何"提前 2 层以上"的预测都是对 hidden 的猜测，误差累积。
-- CPU 还负责：采样（head 1.3 GFLOP，CPU bf16 39–41 ms，见 5.4.1）、n-gram 查表、PCIe/CPU 分流决策（6.4）、gate 统计。
+- CPU 还负责：采样（head 1.3 GFLOP，CPU bf16 37.8–40.8 ms，见 5.4.1）、n-gram 查表、PCIe/CPU 分流决策（6.4）、gate 统计。
 
 ### 6.3 预测器实现（loading.py 已提供）
 
@@ -560,7 +561,7 @@ CPU 决策点（O6）：
 4. **真实 router 分布（进行中）**：需要全部 40 层分片 + tokenizer；只给 40 层 gate.weight（~160 MB）不够，因为路由输入是完整前向的 hidden。截至 2026-10-21 00:29 下载 baseline 11.13/510.3 GB、~12 MB/s（≈11 h），仅 layer 0 完整。已完成 layer-0 真实预检（见 §10）：232/384 专家、top-24 41.9%、单层 LRU(27) 命中 34.4%，不低于合成的 24.7%。权重齐后我按 E-L3/E-L4 跑全 40 层（1–2 h）替换合成数字。
 5. **已拍板默认值（2026-10-21 Lead）**：
    - MTP/DSpark 默认关（省 8 GB 给专家缓存，作为可选档，用真实接受率再评估）；
-   - head 默认 CPU bf16（实测 39–41 ms；fp8/int8 备选见 5.4.1，8 GB 卡不划算）；
+   - head 默认 CPU bf16（实测 37.8–40.8 ms；fp8/int8 备选见 5.4.1，8 GB 卡不划算）；
    - 专家缓存 20 GB 起步（可配，CLI --expert-cache-gb）；非专家/attn 常驻策略做成配置（auto 29–34 层 / 可全驻 / 可部分驻）；
    - 多 agent 默认 2 活跃（上限 4）、全局 ExpertCache、会话 pin ≤20%；
    - 集成顺序：ExpertStore → 预算开关 → SessionScheduler → Prefetcher gate；layer-major prefill 由 Lead 改 model.py。
@@ -734,5 +735,5 @@ prefetch@0.7          0.0     0.700          0.451     1.20
 ### D.4 真实 layer-0 预检与 head 实测
 
 - layer 0 真实：232/384 专家，top-24 41.9%，单层 LRU(27) 34.4%，相邻位置重叠 0.85/6（14.2%）。
-- head CPU bf16：[129280,5120] 39–41 ms（16 线程）；fp32 80.9 ms；H2D bf16 pinned 46.3 ms、fp8 pinned 28.2 ms；torch rowwise fp8 _scaled_mm 在 sm_120 报 "Rowwise scaling is not currently supported on your device"。
+- head CPU bf16：[129280,5120] 37.8–39.8 ms（16 线程）；fp32 80.9–84.7 ms；H2D bf16 pinned 46.3 ms；fp8 0.66 GB H2D 23–44 ms（抖动）、torch dequant+mv 24.4 ms；per-tensor fp8 _scaled_mm 2.0 ms 可用，但 rowwise fp8 在 sm_120 报 "Rowwise scaling is not currently supported on your device"。
 - 详见 §5.4.1、§10 E-L3 预检。
