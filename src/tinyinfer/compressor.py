@@ -126,8 +126,13 @@ class Indexer:
 
     def _kcache(self, b: int, compress_len: int, device) -> torch.Tensor:
         need = max(compress_len, 1)
-        if self._k_cache is None or self._k_cache.shape[0] != b or self._k_cache.shape[1] < need:
+        if self._k_cache is None or self._k_cache.shape[0] != b:
             self._k_cache = torch.zeros(b, need, self.head_dim, dtype=torch.bfloat16, device=device)
+        elif self._k_cache.shape[1] < need:
+            # grow while keeping the already published index keys
+            grown = torch.zeros(b, need, self.head_dim, dtype=self._k_cache.dtype, device=self._k_cache.device)
+            grown[:, : self._k_cache.shape[1]] = self._k_cache
+            self._k_cache = grown
         return self._k_cache
 
     def forward(self, x, qr, latent, start_pos: int, offset: int):
@@ -169,7 +174,7 @@ class Indexer:
         elif self.uses_candidates:
             score = score.masked_fill(~shared_attn.candidates, -torch.inf)
 
-        topk = min(self.index_topk, end_pos // ratio)
+        topk = min(self.index_topk, end_pos // ratio, score.size(-1))
         if topk <= 0:
             return torch.empty(b, s, 0, dtype=torch.int32, device=x.device)
         idxs = score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
