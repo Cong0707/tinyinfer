@@ -165,9 +165,9 @@ except Exception as e:
 # ---------------- hc_split_sinkhorn ----------------
 try:
     b, s, hcm = 2, 64, 4
-    mixes = torch.randn(b, s, (2 + hcm) * hcm, device=dev)
-    hc_scale = torch.randn(3, device=dev)
-    hc_base = torch.randn((2 + hcm) * hcm, device=dev)
+    mixes = torch.randn(b, s, (2 + hcm) * hcm, device=dev, dtype=torch.float32)
+    hc_scale = torch.randn(3, device=dev, dtype=torch.float32)
+    hc_base = torch.randn((2 + hcm) * hcm, device=dev, dtype=torch.float32)
     t0 = time.time()
     pre, post, comb = kern.hc_split_sinkhorn(mixes, hc_scale, hc_base, hcm, 20, 1e-6)
     torch.cuda.synchronize(); ct = time.time() - t0

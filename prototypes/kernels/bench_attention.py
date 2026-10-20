@@ -94,8 +94,8 @@ print("\n=== dense fallback: scores/softmax/out without gather ===")
 def dense_attn(q, kv, sink, scale):
     # q [b,m,h,d], kv [b,n,d] shared; no masks
     scores = torch.einsum("bmhd,bnd->bmhn", q.float(), kv.float()) * scale
-    mx = torch.maximum(scores.max(-1).values, sink.view(1,1,1,H))
-    p = torch.exp(scores - mx.unsqueeze(-1)); den = p.sum(-1) + torch.exp(sink.view(1,1,1,H)-mx)
+    mx = torch.maximum(scores.max(-1).values, sink.view(1,1,H))
+    p = torch.exp(scores - mx.unsqueeze(-1)); den = p.sum(-1) + torch.exp(sink.view(1,1,H)-mx)
     return torch.einsum("bmhn,bnd->bmhd", p, kv.float()).div(den.unsqueeze(-1)).to(q.dtype)
 q6=torch.randn(1,1,H,D,device=dev); kv6=torch.randn(1,WIN+TOPK,D,device=dev); sink6=torch.randn(H,device=dev)
 ms=bench(lambda: dense_attn(q6,kv6,sink6,D**-0.5),5,50)
