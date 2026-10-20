@@ -1,0 +1,63 @@
+"""Reference dequantizers for the HF checkpoint's fp8/fp4 block formats.
+
+The released weights store:
+  - dense/attention weights as FP8 E4M3 with one E8M0 (ue8m0) scale per 32x32 block;
+  - routed experts as FP4 E2M1 packed two-per-byte with one E8M0 scale per 32
+    elements along K (one scale row per expert output row).
+This module turns them back into plain bf16/fp32 tensors for PyTorch fallback paths.
+"""
+from __future__ import annotations
+
+import torch
+
+# E2M1 magnitudes by 3-bit code (0..7); sign is the high nibble bit.
+E2M1_VALUES = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
+E2M1_TABLE = torch.cat([E2M1_VALUES, -E2M1_VALUES])  # 16 entries, code 8..15 == negatives
+
+
+def e8m0_to_float(scale: torch.Tensor) -> torch.Tensor:
+    """Decode E8M0 scales (stored as uint8 bit patterns) to float32 powers of two."""
+    if scale.dtype == torch.float8_e8m0fnu:
+        return scale.to(torch.float32)
+    bits = scale.view(torch.uint8).to(torch.int32)
+    # E8M0: value = 2^(exp - 127); 0xFF is NaN, 0x00 is 2^-127.
+    return torch.pow(2.0, (bits - 127).to(torch.float32))
+
+
+def fp8_block_scale_to_dense(scale: torch.Tensor, out_features: int, in_features: int, block: int = 32) -> torch.Tensor:
+    s = e8m0_to_float(scale)
+    s = s.repeat_interleave(block, dim=0).repeat_interleave(block, dim=1)
+    return s[:out_features, :in_features]
+
+
+def dequant_fp8_block(weight: torch.Tensor, scale: torch.Tensor, block: int = 32) -> torch.Tensor:
+    """FP8 E4M3 weight with 32x32 block scales -> bf16 tensor [out, in]."""
+    out_features, in_features = weight.shape
+    w = weight.to(torch.float32)
+    s = fp8_block_scale_to_dense(scale, out_features, in_features, block)
+    return (w * s).to(torch.bfloat16)
+
+
+def unpack_fp4(packed: torch.Tensor) -> torch.Tensor:
+    """[out, in//2] uint8 (two E2M1 values per byte) -> [out*2?] float32 in column order.
+
+    HF stores each byte as (even column in low nibble, odd column in high nibble); the
+    returned tensor is laid out [out, in].
+    """
+    if packed.dtype != torch.uint8:
+        packed = packed.view(torch.uint8)
+    lo = packed & 0x0F
+    hi = (packed >> 4) & 0x0F
+    out = torch.empty(packed.shape[:-1] + (packed.shape[-1] * 2,), dtype=torch.float32, device=packed.device)
+    out[..., 0::2] = E2M1_TABLE[lo.long()]
+    out[..., 1::2] = E2M1_TABLE[hi.long()]
+    return out
+
+
+def dequant_fp4_block(packed: torch.Tensor, scale: torch.Tensor, block: int = 32) -> torch.Tensor:
+    """FP4 E2M1 experts with 1x32 (K) block scales -> bf16 tensor [out, in]."""
+    values = unpack_fp4(packed)
+    out_features, in_features = values.shape
+    s = e8m0_to_float(scale)
+    s = s.repeat_interleave(block, dim=-1)[..., :in_features]
+    return (values * s).to(torch.bfloat16)

@@ -1,0 +1,96 @@
+"""Minimal numeric building blocks used by the reference forward."""
+from __future__ import annotations
+
+import math
+
+import torch
+import torch.nn.functional as F
+
+
+def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """HF-style RMSNorm: normalize in fp32, scale by the stored weight."""
+    orig_dtype = x.dtype
+    xf = x.float()
+    y = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
+    return (y * weight.float()).to(orig_dtype)
+
+
+def window_idxs_prefill(seqlen: int, window: int, device=None) -> torch.Tensor:
+    """Causal sliding-window slot indexes for a fresh prefill (see official get_window_topk_idxs)."""
+    end = torch.arange(seqlen, device=device).unsqueeze(1)
+    idxs = (end - window + 1).clamp(0) + torch.arange(min(seqlen, window), device=device)
+    idxs = torch.where(idxs > end, torch.full_like(idxs, -1), idxs)
+    return idxs.int()
+
+
+def sparse_attn_ref(
+    q: torch.Tensor, kv: torch.Tensor, sink: torch.Tensor, idxs: torch.Tensor, scale: float
+) -> torch.Tensor:
+    """Naive gather-sparse MQA attention with a learned attn-sink logit per head.
+
+    q: [b, s, h, d]; kv: [b, n, d]; sink: [h]; idxs: [b, s, t] (-1 = empty slot).
+    Equivalent to the tilelang sparse_attn kernel: scores = q.k / sqrt(d), softmax over
+    gathered slots PLUS one virtual sink slot whose logit is attn_sink[h].
+    """
+    b, s, h, d = q.shape
+    t = idxs.shape[-1]
+    valid = idxs >= 0  # [b, s, t]
+    safe = idxs.clamp(min=0)  # [b, s, t]
+    # gather kv for every query: [b, s, t, d]
+    flat = safe.reshape(b, s * t, 1).expand(b, s * t, d)
+    k = kv.gather(1, flat).reshape(b, s, t, d)
+    scores = torch.einsum("bshd,bstd->bsht", q.float(), k.float()) * scale  # [b, s, h, t]
+    scores = scores.masked_fill(~valid.unsqueeze(2), float("-inf"))
+    max_scores = scores.max(dim=-1).values  # [b,s,h]
+    # fold the sink in as an extra logit; a finite bound keeps fully-empty rows finite (all-zero out)
+    max_final = torch.max(max_scores, sink.view(1, 1, h))
+    p = torch.exp(scores - max_final.unsqueeze(-1))
+    denom = p.sum(-1) + torch.exp(sink.view(1, 1, h) - max_final)
+    p = p / denom.unsqueeze(-1)
+    o = torch.einsum("bsht,bstd->bshd", p, k.float())
+    return o.to(q.dtype)
+
+
+def softmax_sample(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    """Greedy multinomial sampling (same math as the official sample())."""
+    if temperature == 0:
+        return logits.argmax(dim=-1)
+    logits = logits / max(temperature, 1e-5)
+    probs = torch.softmax(logits.float(), dim=-1)
+    return probs.div_(torch.empty_like(probs).exponential_(1)).argmax(dim=-1)
+
+
+def apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) -> torch.Tensor:
+    """Rotate adjacent element pairs as complex numbers; accepts [b,s,d] or [b,s,h,d].
+
+    Used both for queries/keys and, with inverse=True, to un-rotate the attention output.
+    """
+    y = x
+    xc = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
+    if inverse:
+        freqs_cis = freqs_cis.conj()
+    if xc.ndim == 3:
+        f = freqs_cis.view(1, xc.size(1), xc.size(-1))
+    else:
+        f = freqs_cis.view(1, xc.size(1), 1, xc.size(-1))
+    out = torch.view_as_real(xc * f).flatten(-2)
+    y.copy_(out)
+    return y
+
+
+def precompute_freqs_cis(
+    dim: int, seqlen: int, original_seq_len: int, base: float, factor: float, beta_fast: float, beta_slow: float
+) -> torch.Tensor:
+    """Rotary frequencies (complex exponentials), one row per position; YaRN when original_seq_len > 0."""
+    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    if original_seq_len > 0:
+        def corrected_dim(rotations: float) -> float:
+            return dim * math.log(original_seq_len / (rotations * 2 * math.pi)) / (2 * math.log(base))
+
+        low = max(math.floor(corrected_dim(beta_fast)), 0)
+        high = min(math.ceil(corrected_dim(beta_slow)), dim - 1)
+        ramp = ((torch.arange(dim // 2, dtype=torch.float32) - low) / max(high - low, 1e-3)).clamp(0, 1)
+        smooth = 1 - ramp
+        freqs = freqs / factor * (1 - smooth) + freqs * smooth
+    freqs = torch.outer(torch.arange(seqlen), freqs)
+    return torch.polar(torch.ones_like(freqs), freqs)
