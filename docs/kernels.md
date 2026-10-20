@@ -50,6 +50,8 @@
 | tilelang | 0.1.15（PyPI win_amd64 wheel），依赖 apache-tvm-ffi 0.1.12、z3-solver 4.15 |
 | 计时 | CUDA events，预热 3–10 次，取 3 轮最小值；桌面占用 ~1.6 GB VRAM，未做功耗/温度控制 |
 
+> 说明：同一脚本多次运行会有 ±10–20% 波动（桌面 GPU 争用/频率）。表中数字是代表性测量；**跨实现的相对结论比绝对值可靠**。重跑命令见第 6 节。
+
 复现（PowerShell）：
 
 ```powershell
@@ -302,6 +304,7 @@ Strata 的 `docs/NVFP4.md` 明确指出：其 FP4×FP4 kernel（`mmq_nvfp4_w4a4.
 ### O9 — 异构流水线（GPU attention / 部分专家 + CPU 专家）
 
 - 现状：CPU 单 expert BF16 0.184 ms（24 MB 权重），6×40 层 ≈ 44 ms/token（仅 gate/up 之一），全部 expert 约 130 ms/token；PCIe 4.25 GB/token = 151 ms；**CPU 路径与 PCIe 路径都不如 NVMe 直读 + GPU 计算**（0.92 s/token 是全 IO 的上限，但 GPU 计算几乎免费）。
+- Strata 的 CPU 多 token kernel 经验：一个权重块只 dequant 一次，供同一 verify window 的 1–4 个 token 复用（1 tok 0.058 ms → 4 tok 0.125 ms，约 3.3×）；tinyinfer 若做 CPU 尾部专家，应沿用这个“按 token 复用 dequant”的接口，而不是每 token 重解。
 - 真正有意义的分工：
   1. **CPU 做“缺失专家”尾部**（Strata `--pcie-frac` 思路）：GPU 处理命中专家，CPU 处理未命中的少量专家，PCIe 只传 hidden/结果（KB 级），不传 17.7 MB 权重 → 避免 PCIe 成为瓶颈。
   2. **CPU 做 router/采样/验证**（O6），GPU 做 attention + 专家 GEMM。

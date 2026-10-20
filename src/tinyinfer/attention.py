@@ -5,7 +5,8 @@ import torch
 import torch.nn.functional as F
 
 from .config import TinyConfig
-from .nn import apply_rope, precompute_freqs_cis, rms_norm, sparse_attn_ref, window_idxs_prefill
+from .kernels import sparse_attn_dispatch
+from .nn import apply_rope, precompute_freqs_cis, rms_norm, window_idxs_prefill
 from .quant import dequant_fp8_block
 from .weights import ShardStore
 
@@ -84,13 +85,13 @@ class MLAWindowAttention:
                 self._kv_cache[:, cutoff:self.window] = tail[:, : self.window - cutoff]
                 self._kv_cache[:, :cutoff] = tail[:, self.window - cutoff:]
             kv_att = kv
-            idxs = window_idxs_prefill(s, self.window).unsqueeze(0).expand(b, -1, -1).contiguous()
+            idxs = window_idxs_prefill(s, self.window, device=x.device).unsqueeze(0).expand(b, -1, -1).contiguous()
         else:
             self._kv_cache[:, start_pos % self.window] = kv[:, 0]
             kv_att = self._kv_cache
             idxs = self._decode_idxs(start_pos, b, x.device)
 
-        o = sparse_attn_ref(q, kv_att, self.sink, idxs, self.scale)
+        o = sparse_attn_dispatch(q, kv_att, self.sink, idxs, self.scale)
         apply_rope(o[..., -self.rope_dim:], freqs, inverse=True)
 
         o = o.view(b, s, self.o_groups, -1)

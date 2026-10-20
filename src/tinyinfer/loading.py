@@ -186,7 +186,7 @@ class TierBudget:
         kv_window_gb: float = 0.02,
         expert_slots: int = 24,
         os_reserve_gb: float = 6.0,
-        include_mtp: bool = True,
+        include_mtp: bool = False,  # Lead decision: trade the 8 GB MTP set for expert cache
         staging_gb: float = 0.8,
         headroom_gb: float = 2.0,
         target_expert_cache_gb: float | None = None,
@@ -2064,14 +2064,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_budget.add_argument("--vram", type=float, default=8.0)
     p_budget.add_argument("--ram", type=float, default=47.2)
     p_budget.add_argument("--ram-available", type=float, default=None)
-    p_budget.add_argument("--no-mtp", action="store_true")
+    p_budget.add_argument("--mtp", action="store_true", help="include the 8 GB MTP/DSpark set")
+    p_budget.add_argument("--expert-cache-gb", type=float, default=20.0,
+                          help="recommended default expert-cache size (0 = computed max)")
     args = parser.parse_args(list(argv) if argv is not None else None)
     if args.cmd == "sim":
         print(format_sim_table(run_simulation_suite(steps=args.steps)))
         return 0
     if args.cmd == "budget":
+        cap = args.expert_cache_gb if args.expert_cache_gb > 0 else None
         b = TierBudget.plan(vram_gb=args.vram, ram_gb=args.ram,
-                            ram_available_gb=args.ram_available, include_mtp=not args.no_mtp)
+                            ram_available_gb=args.ram_available, include_mtp=args.mtp,
+                            target_expert_cache_gb=cap)
         print(b.table())
         print()
         for io in b.io_scenarios():
