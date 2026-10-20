@@ -1,0 +1,2085 @@
+"""Tiered weight loading, expert caches and router prefetching for tinyinfer.
+
+This module is the storage/IO half of tinyinfer.  The model code (tinyinfer.moe)
+only knows how to compute; this module decides *where* the bytes live and *when*
+they are read:
+
+    NVMe (510 GB checkpoint) -> RAM expert cache (LRU/ARC/S3-FIFO + pin)
+                              -> VRAM expert slots (fixed staging ring)
+    RAM (17.7 GB non-expert) -> VRAM attention weights (fp8, pinned layers)
+
+The reference numbers used by the planner come from the HF checkpoint itself
+(see docs/loading.md):
+
+* routed expert blob = 18,800,640 B (w1/w2/w3 fp4 + their ue8m0 scales)
+* one decode token reads 6 experts x 40 layers = 240 blobs = 4.512 GB
+* non-expert weights per layer = 170,055,128 B (attention + shared expert + HC)
+* Engram tables are 2 x 101.38 GB and are read by row (24 rows x 256 B per token
+  per Engram layer), never in bulk.
+
+Nothing here imports tinyinfer.weights at import time.  A ShardStore from
+tinyinfer.weights can be passed through ExpertStore.from_store; the only
+attributes used are model_dir and weight_map.
+"""
+from __future__ import annotations
+
+import ctypes
+import json
+import math
+import os
+import random
+import struct
+import threading
+import time
+from collections import OrderedDict, defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequence
+
+__all__ = [
+    "ModelGeometry", "TierBudget", "IoBudget", "TensorRegion", "ExpertBlob",
+    "ShardIndex", "ShardReader", "ExpertCache", "VramSlotCache", "ExpertStore",
+    "ExpertRecord", "Prediction", "PredictionContext", "Predictor",
+    "TemporalPredictor", "LookaheadRouterPredictor", "NgramRouterPredictor",
+    "OraclePredictor", "EnsemblePredictor", "PrefetchConfig", "Prefetcher",
+    "SessionScheduler", "StepPlan", "simulate_workload", "simulate_cache",
+    "simulate_prefetch", "run_simulation_suite", "format_sim_table", "selftest",
+]
+
+# ---------------------------------------------------------------------------
+# Geometry and budgets
+# ---------------------------------------------------------------------------
+
+DEFAULT_LAYER_OTHER_BYTES = 170_055_128  # attention + shared expert + HC, fp8/bf16
+DEFAULT_EMBED_BYTES = 1_323_827_200      # [129280, 5120] bf16
+DEFAULT_HEAD_BYTES = 1_323_827_200
+DEFAULT_ENGRAM_TABLE_BYTES = 101_377_628_352  # weight + ue8m0 scale per table
+DEFAULT_ENGRAM_LAYERS = (1, 14)
+DEFAULT_MTP_LAYERS = 3
+DEFAULT_MTP_LAYER_BYTES = 2_655_000_000  # ~128 experts + attention/HC of one DSpark layer
+ENGRAM_ROWS_PER_TOKEN = (4 - 1) * 8  # (max_ngram_size-1) * n_heads = 24
+ENGRAM_ROW_BYTES = 256
+PAGE_BYTES = 4096
+
+
+@dataclass(frozen=True)
+class ModelGeometry:
+    """Shape of the released checkpoint; used only for budgets, not for loading."""
+
+    dim: int = 5120
+    moe_inter_dim: int = 2304
+    n_layers: int = 40
+    n_experts: int = 384
+    n_activated: int = 6
+    weight_block: int = 32
+    fp4_bits: int = 4
+
+    def expert_weight_bytes(self) -> int:
+        """w1 + w2 + w3 with fp4 packing: 3 * (dim * moe_inter_dim / 2)."""
+        return 3 * (self.dim * self.moe_inter_dim) // 2
+
+    def expert_scale_bytes(self) -> int:
+        """3 * (dim * moe_inter_dim / weight_block) one-byte ue8m0 scales."""
+        return 3 * (self.dim * self.moe_inter_dim) // self.weight_block
+
+    def expert_bytes(self) -> int:
+        return self.expert_weight_bytes() + self.expert_scale_bytes()
+
+    def layer_expert_bytes(self) -> int:
+        return self.n_experts * self.expert_bytes()
+
+    def token_expert_bytes(self) -> int:
+        return self.n_layers * self.n_activated * self.expert_bytes()
+
+    def token_expert_bytes_with_engram(self) -> int:
+        return self.token_expert_bytes() + len(DEFAULT_ENGRAM_LAYERS) * ENGRAM_ROWS_PER_TOKEN * ENGRAM_ROW_BYTES
+
+
+@dataclass(frozen=True)
+class IoBudget:
+    """Per-token IO cost under a given cache hit rate and drive bandwidth."""
+
+    expert_bytes_per_token: int
+    hit_rate: float
+    read_bytes_per_token: int
+    nvme_ms: float
+    pcie_ms: float
+    engram_logical_bytes: int
+    engram_page_bytes: int
+    tokens_per_second: float
+    note: str = ""
+
+    @classmethod
+    def compute(
+        cls,
+        geo: ModelGeometry,
+        hit_rate: float = 0.0,
+        nvme_gbs: float = 8.8,
+        pcie_gbs: float = 26.0,
+        attention_stream_gb: float = 1.36,
+        fixed_ms: float = 60.0,
+        engram_hit_rate: float = 0.15,
+    ) -> "IoBudget":
+        experts = geo.token_expert_bytes()
+        read = int(experts * (1.0 - hit_rate))
+        nvme_ms = read / (nvme_gbs * 1e9) * 1e3
+        pcie_bytes = read + int(attention_stream_gb * 1e9)
+        pcie_ms = pcie_bytes / (pcie_gbs * 1e9) * 1e3
+        engram_logical = len(DEFAULT_ENGRAM_LAYERS) * ENGRAM_ROWS_PER_TOKEN * ENGRAM_ROW_BYTES
+        engram_pages = int(engram_logical / ENGRAM_ROW_BYTES * PAGE_BYTES * (1.0 - engram_hit_rate))
+        total_ms = nvme_ms + pcie_ms * 0.35 + fixed_ms  # PCIe partly overlaps NVMe
+        return cls(
+            expert_bytes_per_token=experts,
+            hit_rate=hit_rate,
+            read_bytes_per_token=read,
+            nvme_ms=nvme_ms,
+            pcie_ms=pcie_ms,
+            engram_logical_bytes=engram_logical,
+            engram_page_bytes=engram_pages,
+            tokens_per_second=1000.0 / total_ms if total_ms > 0 else 0.0,
+            note="PCIe counted at 35% of its standalone cost (overlaps NVMe/GPU).",
+        )
+
+
+@dataclass(frozen=True)
+class TierBudget:
+    """VRAM/RAM/NVMe split for the target laptop (8 GB VRAM, 47 GB RAM)."""
+
+    vram_total: float
+    vram_desktop_reserve: float
+    vram_runtime_reserve: float
+    vram_available: float
+    attention_layer_bytes: int
+    pinned_attention_layers: int
+    streamed_attention_layers: int
+    attention_pinned_bytes: int
+    attention_stream_bytes: int
+    expert_slots: int
+    expert_slot_bytes: int
+    activation_bytes: int
+    kv_window_bytes: int
+    vram_used: int
+    ram_total: float
+    ram_os_reserve: float
+    ram_non_expert: float
+    ram_mtp: float
+    ram_kv: float
+    ram_staging: float
+    ram_expert_cache: float
+    ram_headroom: float
+    ram_expert_entries: int
+    cache_coverage: float
+
+    @classmethod
+    def plan(
+        cls,
+        geo: ModelGeometry = ModelGeometry(),
+        *,
+        vram_gb: float = 8.0,
+        ram_gb: float = 47.2,
+        ram_available_gb: float | None = None,
+        desktop_reserve_gb: float = 0.9,
+        runtime_reserve_gb: float = 0.35,
+        activation_gb: float = 0.40,
+        kv_window_gb: float = 0.02,
+        expert_slots: int = 24,
+        os_reserve_gb: float = 6.0,
+        include_mtp: bool = True,
+        staging_gb: float = 0.8,
+        headroom_gb: float = 2.0,
+        target_expert_cache_gb: float | None = None,
+    ) -> "TierBudget":
+        attn_layer = DEFAULT_LAYER_OTHER_BYTES
+        slot_bytes = geo.expert_bytes()
+        vram_avail = vram_gb - desktop_reserve_gb - runtime_reserve_gb
+        fixed = activation_gb + kv_window_gb + expert_slots * slot_bytes / 1e9
+        attn_budget = vram_avail - fixed
+        pinned = int(max(0, min(geo.n_layers, math.floor(attn_budget / (attn_layer / 1e9)))))
+        streamed = geo.n_layers - pinned
+        non_expert = (geo.n_layers * DEFAULT_LAYER_OTHER_BYTES + DEFAULT_EMBED_BYTES + DEFAULT_HEAD_BYTES
+                      + len(DEFAULT_ENGRAM_LAYERS) * 157_440_000) / 1e9
+        mtp = (DEFAULT_MTP_LAYERS * DEFAULT_MTP_LAYER_BYTES / 1e9) if include_mtp else 0.0
+        kv = 0.25
+        avail = ram_available_gb if ram_available_gb is not None else ram_gb
+        cache = avail - os_reserve_gb - non_expert - mtp - kv - staging_gb - headroom_gb
+        if target_expert_cache_gb is not None:
+            cache = min(cache, target_expert_cache_gb)
+        cache = max(0.0, cache)
+        entries = int(cache * 1e9 // slot_bytes)
+        coverage = entries / (geo.n_layers * geo.n_experts)
+        return cls(
+            vram_total=vram_gb,
+            vram_desktop_reserve=desktop_reserve_gb,
+            vram_runtime_reserve=runtime_reserve_gb,
+            vram_available=vram_avail,
+            attention_layer_bytes=attn_layer,
+            pinned_attention_layers=pinned,
+            streamed_attention_layers=streamed,
+            attention_pinned_bytes=pinned * attn_layer,
+            attention_stream_bytes=streamed * attn_layer,
+            expert_slots=expert_slots,
+            expert_slot_bytes=expert_slots * slot_bytes,
+            activation_bytes=int(activation_gb * 1e9),
+            kv_window_bytes=int(kv_window_gb * 1e9),
+            vram_used=int((pinned * attn_layer + expert_slots * slot_bytes
+                           + activation_gb * 1e9 + kv_window_gb * 1e9)),
+            ram_total=ram_gb,
+            ram_os_reserve=os_reserve_gb,
+            ram_non_expert=non_expert,
+            ram_mtp=mtp,
+            ram_kv=kv,
+            ram_staging=staging_gb,
+            ram_expert_cache=cache,
+            ram_headroom=headroom_gb,
+            ram_expert_entries=entries,
+            cache_coverage=coverage,
+        )
+
+    def table(self) -> str:
+        gb = 1e9
+        rows = [
+            ("VRAM total", f"{self.vram_total:.2f} GB"),
+            ("  - desktop/WDDM reserve", f"{self.vram_desktop_reserve:.2f} GB"),
+            ("  - CUDA/runtime reserve", f"{self.vram_runtime_reserve:.2f} GB"),
+            ("  attention weights pinned (fp8, 170 MB/layer)", f"{self.pinned_attention_layers} layers = {self.attention_pinned_bytes / gb:.2f} GB"),
+            ("  attention weights streamed per token", f"{self.streamed_attention_layers} layers = {self.attention_stream_bytes / gb:.2f} GB"),
+            ("  expert slots (18.8 MB each)", f"{self.expert_slots} = {self.expert_slot_bytes / gb:.2f} GB"),
+            ("  activations + KV window", f"{(self.activation_bytes + self.kv_window_bytes) / gb:.2f} GB"),
+            ("VRAM used", f"{self.vram_used / gb:.2f} GB (free {self.vram_total - self.vram_used / gb:.2f})"),
+            ("RAM total", f"{self.ram_total:.2f} GB"),
+            ("  - OS + apps reserve", f"{self.ram_os_reserve:.2f} GB"),
+            ("  non-expert resident (40 layers + embed + head + engram proj)", f"{self.ram_non_expert:.2f} GB"),
+            ("  MTP/DSpark layers (3)", f"{self.ram_mtp:.2f} GB"),
+            ("  KV cache (RAM)", f"{self.ram_kv:.2f} GB"),
+            ("  pinned staging buffers", f"{self.ram_staging:.2f} GB"),
+            ("  headroom", f"{self.ram_headroom:.2f} GB"),
+            ("  expert cache", f"{self.ram_expert_cache:.2f} GB = {self.ram_expert_entries} experts "
+                               f"({self.cache_coverage * 100:.1f}% of all 15360)"),
+        ]
+        return "\n".join(f"{a:<62s} {b}" for a, b in rows)
+
+    def io_scenarios(self, geo: ModelGeometry = ModelGeometry(), nvme_gbs: float = 8.8) -> list[IoBudget]:
+        stream_gb = self.attention_stream_bytes / 1e9
+        return [IoBudget.compute(geo, h, nvme_gbs=nvme_gbs, attention_stream_gb=stream_gb)
+                for h in (0.0, 0.2, 0.3, 0.5)]
+
+
+# ---------------------------------------------------------------------------
+# safetensors index and expert blobs
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TensorRegion:
+    name: str
+    shard: str
+    file_offset: int
+    nbytes: int
+    shape: tuple[int, ...]
+    dtype: str
+
+    @property
+    def end(self) -> int:
+        return self.file_offset + self.nbytes
+
+
+@dataclass(frozen=True)
+class ReadSegment:
+    """One contiguous file read that lands at dest_offset of a blob buffer."""
+
+    shard: str
+    file_offset: int
+    nbytes: int
+    dest_offset: int
+
+
+@dataclass(frozen=True)
+class TensorSlot:
+    name: str
+    dest_offset: int
+    nbytes: int
+    shape: tuple[int, ...]
+    dtype: str
+
+
+@dataclass(frozen=True)
+class ExpertBlob:
+    layer: int
+    expert: int
+    total_bytes: int
+    segments: tuple[ReadSegment, ...]
+    tensors: Mapping[str, TensorSlot]
+
+    @property
+    def key(self) -> tuple[int, int]:
+        return (self.layer, self.expert)
+
+
+class ShardIndex:
+    """Read-only view of the HF safetensors index (headers parsed lazily)."""
+
+    INDEX_FILE = "model.safetensors.index.json"
+
+    def __init__(self, model_dir: str | Path):
+        self.model_dir = Path(model_dir)
+        index = json.loads((self.model_dir / self.INDEX_FILE).read_text(encoding="utf-8"))
+        self.weight_map: dict[str, str] = index["weight_map"]
+        self.total_bytes: int = int(index.get("metadata", {}).get("total_size", 0))
+        self._headers: dict[str, dict[str, Any]] = {}
+        self._data_start: dict[str, int] = {}
+        self._blob_cache: dict[tuple[int, int], ExpertBlob] = {}
+        self._lock = threading.Lock()
+
+    def _header(self, shard: str) -> dict[str, Any]:
+        header = self._headers.get(shard)
+        if header is not None:
+            return header
+        with self._lock:
+            header = self._headers.get(shard)
+            if header is not None:
+                return header
+            with (self.model_dir / shard).open("rb") as f:
+                prefix = f.read(8)
+                if len(prefix) != 8:
+                    raise ValueError(f"truncated safetensors header: {shard}")
+                size = struct.unpack("<Q", prefix)[0]
+                raw = f.read(size)
+                if len(raw) != size:
+                    raise ValueError(f"truncated safetensors header: {shard}")
+            header = json.loads(raw)
+            self._headers[shard] = header
+            self._data_start[shard] = 8 + size
+            return header
+
+    def region(self, name: str) -> TensorRegion:
+        shard = self.weight_map[name]
+        header = self._header(shard)
+        entry = header[name]
+        start = entry["data_offsets"][0]
+        nbytes = entry["data_offsets"][1] - start
+        return TensorRegion(
+            name=name,
+            shard=shard,
+            file_offset=self._data_start[shard] + start,
+            nbytes=nbytes,
+            shape=tuple(entry["shape"]),
+            dtype=str(entry["dtype"]),
+        )
+
+    @staticmethod
+    def expert_tensor_names(layer: int, expert: int) -> tuple[str, ...]:
+        prefix = f"layers.{layer}.ffn.experts.{expert}."
+        return tuple(prefix + f"{w}.{kind}" for w in ("w1", "w2", "w3") for kind in ("weight", "scale"))
+
+    def expert_blob(self, layer: int, expert: int, *, merge_gap: int = 0) -> ExpertBlob:
+        key = (layer, expert)
+        cached = self._blob_cache.get(key)
+        if cached is not None:
+            return cached
+        regions = [self.region(n) for n in self.expert_tensor_names(layer, expert)]
+        regions.sort(key=lambda r: r.file_offset)
+        groups: list[list[TensorRegion]] = []
+        for r in regions:
+            if groups and groups[-1][-1].shard == r.shard and r.file_offset <= groups[-1][-1].end + merge_gap:
+                groups[-1].append(r)
+            else:
+                groups.append([r])
+        tensors: dict[str, TensorSlot] = {}
+        segments: list[ReadSegment] = []
+        dest = 0
+        prefix = f"layers.{layer}.ffn.experts.{expert}."
+        for group in groups:
+            start = group[0].file_offset
+            end = max(r.end for r in group)
+            segments.append(ReadSegment(shard=group[0].shard, file_offset=start,
+                                        nbytes=end - start, dest_offset=dest))
+            for r in group:
+                # short name ("w1.weight") is what moe.py asks for
+                short = r.name[len(prefix):] if r.name.startswith(prefix) else r.name
+                tensors[short] = TensorSlot(
+                    name=short,
+                    dest_offset=dest + (r.file_offset - start),
+                    nbytes=r.nbytes,
+                    shape=r.shape,
+                    dtype=r.dtype,
+                )
+            dest += end - start
+        blob = ExpertBlob(layer=layer, expert=expert, total_bytes=dest,
+                          segments=tuple(segments), tensors=tensors)
+        self._blob_cache[key] = blob
+        return blob
+
+    def expert_blob_bytes(self, layer: int = 0, expert: int = 0) -> int:
+        try:
+            return self.expert_blob(layer, expert).total_bytes
+        except Exception:
+            return ModelGeometry().expert_bytes()
+
+    def layer_of_shard(self, shard: str) -> int | None:
+        for name in self.weight_map:
+            if ".ffn.experts.0.w1.weight" in name and self.weight_map[name] == shard:
+                return int(name.split(".")[1])
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Readers
+# ---------------------------------------------------------------------------
+
+class _WindowsDirect:
+    """Synchronous FILE_FLAG_NO_BUFFERING reads (Windows O_DIRECT analogue).
+
+    Used for the expert stream: the checkpoint is 510 GB, far larger than the
+    OS page cache, so read-ahead caching would only evict the non-expert set.
+    Every call reads a 4 KiB-aligned superset and copies the wanted bytes out.
+    """
+
+    GENERIC_READ = 0x80000000
+    FILE_SHARE_READ = 1
+    OPEN_EXISTING = 3
+    FILE_FLAG_NO_BUFFERING = 0x20000000
+    FILE_ATTRIBUTE_NORMAL = 0x80
+
+    def __init__(self, max_scratch: int = 32 << 20):
+        self._k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._k32.CreateFileW.restype = ctypes.c_void_p
+        self._k32.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
+                                          ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
+        self._k32.ReadFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+                                       ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p]
+        self._k32.SetFilePointerEx.argtypes = [ctypes.c_void_p, ctypes.c_longlong,
+                                               ctypes.c_void_p, ctypes.c_uint32]
+        self._k32.VirtualAlloc.restype = ctypes.c_void_p
+        self._k32.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_uint32]
+        self._k32.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32]
+        self._k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        self._scratch = self._k32.VirtualAlloc(None, max_scratch, 0x1000 | 0x2000, 0x04)
+        self._scratch_size = max_scratch
+        self._handles: dict[str, int] = {}
+        self.bytes_read = 0
+
+    def _handle(self, path: str) -> int:
+        h = self._handles.get(path)
+        if h is None:
+            h = self._k32.CreateFileW(path, self.GENERIC_READ, self.FILE_SHARE_READ, None,
+                                      self.OPEN_EXISTING, self.FILE_FLAG_NO_BUFFERING, None)
+            if h in (None, -1, 0xFFFFFFFFFFFFFFFF):
+                raise OSError(ctypes.get_last_error(), f"CreateFileW({path})")
+            self._handles[path] = h
+        return h
+
+    def read(self, path: str, offset: int, nbytes: int, dest: memoryview) -> None:
+        start = offset & ~(PAGE_BYTES - 1)
+        end = (offset + nbytes + PAGE_BYTES - 1) & ~(PAGE_BYTES - 1)
+        span = end - start
+        if span > self._scratch_size:
+            raise ValueError(f"direct read of {span} exceeds scratch {self._scratch_size}")
+        if self._k32.SetFilePointerEx(self._handle(path), start, None, 0) == 0:
+            raise OSError("SetFilePointerEx")
+        got = ctypes.c_uint32(0)
+        if self._k32.ReadFile(self._handle(path), self._scratch, span, ctypes.byref(got), None) == 0:
+            raise OSError(ctypes.get_last_error(), f"ReadFile({path})")
+        if got.value != span:
+            raise OSError(f"short direct read {got.value}/{span}")
+        head = offset - start
+        # memmove, not a ctypes slice: slicing a ctypes array builds a Python
+        # list of ints and is ~100x slower than the copy itself.
+        ctypes.memmove((ctypes.c_char * nbytes).from_buffer(dest), self._scratch + head, nbytes)
+        self.bytes_read += nbytes
+
+    def close(self) -> None:
+        for h in self._handles.values():
+            self._k32.CloseHandle(h)
+        self._handles.clear()
+        if self._scratch:
+            self._k32.VirtualFree(self._scratch, 0, 0x8000)
+            self._scratch = None
+
+
+class ShardReader:
+    """Parallel byte-range reader over the HF shards.
+
+    Per-thread file handles, so no lock is held during reads.  direct=True
+    uses unbuffered reads on Windows (recommended for the expert stream).
+    """
+
+    def __init__(self, index: ShardIndex, threads: int = 6, direct: bool = False):
+        self.index = index
+        self.threads = max(1, int(threads))
+        self.direct = bool(direct)
+        self._local = threading.local()
+        self._directs: list[_WindowsDirect] = []
+        self._direct_lock = threading.Lock()
+        self._closed = False
+        self._stats_lock = threading.Lock()
+        self.bytes_read = 0
+        self.read_calls = 0
+        self.read_seconds = 0.0
+        self._executor: ThreadPoolExecutor | None = None
+
+    def _file(self, shard: str):
+        files = getattr(self._local, "files", None)
+        if files is None:
+            files = self._local.files = {}
+        f = files.get(shard)
+        if f is None:
+            f = files[shard] = (self.index.model_dir / shard).open("rb", buffering=0)
+        return f
+
+    def _direct_reader(self) -> _WindowsDirect:
+        # one buffered reader per thread: a shared 32 MB scratch buffer would
+        # serialize the reads and corrupt interleaved copies.
+        direct = getattr(self._local, "direct", None)
+        if direct is None:
+            direct = self._local.direct = _WindowsDirect(max_scratch=32 << 20)
+            with self._direct_lock:
+                self._directs.append(direct)
+        return direct
+
+    def read_into(self, segments: Sequence[ReadSegment], dest: Any, *, offset: int = 0) -> int:
+        """Read segments into dest (a writable buffer); returns bytes read."""
+        started = time.perf_counter()
+        view = memoryview(dest)
+        total = 0
+        for seg in sorted(segments, key=lambda s: s.file_offset):
+            n = seg.nbytes
+            if n == 0:
+                continue
+            d = seg.dest_offset + offset
+            if self.direct and os.name == "nt":
+                self._direct_reader().read(str(self.index.model_dir / seg.shard),
+                                           seg.file_offset, n, view[d:d + n])
+            else:
+                f = self._file(seg.shard)
+                f.seek(seg.file_offset)
+                filled = 0
+                while filled < n:
+                    got = f.readinto(view[d + filled:d + n])
+                    if not got:
+                        raise EOFError(f"short read {seg.shard}:{seg.file_offset}+{filled}/{n}")
+                    filled += got
+            total += n
+        with self._stats_lock:
+            self.bytes_read += total
+            self.read_calls += len(segments)
+            self.read_seconds += time.perf_counter() - started
+        return total
+
+    def read_blob(self, blob: ExpertBlob) -> bytearray:
+        buf = bytearray(blob.total_bytes)
+        self.read_into(blob.segments, buf)
+        return buf
+
+    def read_many(self, blobs: Sequence[ExpertBlob], max_workers: int | None = None) -> list[bytearray]:
+        if not blobs:
+            return []
+        workers = max_workers or min(self.threads, len(blobs))
+        if workers <= 1 or len(blobs) == 1:
+            return [self.read_blob(b) for b in blobs]
+        executor = self._executor
+        if executor is None:
+            executor = self._executor = ThreadPoolExecutor(max_workers=self.threads,
+                                                           thread_name_prefix="tinyinfer-io")
+        futures = [executor.submit(self.read_blob, b) for b in blobs]
+        return [f.result() for f in futures]
+
+    def stats(self) -> dict[str, float]:
+        return {
+            "bytes_read": float(self.bytes_read),
+            "read_calls": float(self.read_calls),
+            "read_seconds": self.read_seconds,
+            "gbps": (self.bytes_read / 1e9 / self.read_seconds) if self.read_seconds else 0.0,
+        }
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
+        with self._direct_lock:
+            direct_readers, self._directs = self._directs, []
+        for direct in direct_readers:
+            direct.close()
+        files = getattr(self._local, "files", None)
+        if files:
+            for f in files.values():
+                f.close()
+            files.clear()
+
+
+# ---------------------------------------------------------------------------
+# Replacement policies
+# ---------------------------------------------------------------------------
+
+class _Policy:
+    """Eviction policy interface.  Keys are (layer, expert) tuples."""
+
+    name = "base"
+
+    def __init__(self, capacity: int):
+        self.capacity = max(1, int(capacity))
+
+    def on_hit(self, key: tuple[int, int]) -> None:
+        raise NotImplementedError
+
+    def on_insert(self, key: tuple[int, int]) -> None:
+        raise NotImplementedError
+
+    def on_remove(self, key: tuple[int, int]) -> None:
+        raise NotImplementedError
+
+    def evict_one(self, is_pinned: Callable[[tuple[int, int]], bool]) -> tuple[int, int] | None:
+        raise NotImplementedError
+
+    def __len__(self) -> int:
+        raise NotImplementedError
+
+
+class LRUPolicy(_Policy):
+    name = "lru"
+
+    def __init__(self, capacity: int):
+        super().__init__(capacity)
+        self.order: OrderedDict[tuple[int, int], None] = OrderedDict()
+
+    def on_hit(self, key):
+        if key in self.order:
+            self.order.move_to_end(key)
+
+    def on_insert(self, key):
+        self.order[key] = None
+        self.order.move_to_end(key)
+
+    def on_remove(self, key):
+        self.order.pop(key, None)
+
+    def evict_one(self, is_pinned):
+        for key in list(self.order):
+            if not is_pinned(key):
+                del self.order[key]
+                return key
+        return None
+
+    def __len__(self):
+        return len(self.order)
+
+
+class ARCPolicy(_Policy):
+    """Adaptive Replacement Cache with ghost lists (recency/frequency blend)."""
+
+    name = "arc"
+
+    def __init__(self, capacity: int):
+        super().__init__(capacity)
+        self.t1: OrderedDict = OrderedDict()
+        self.t2: OrderedDict = OrderedDict()
+        self.b1: OrderedDict = OrderedDict()
+        self.b2: OrderedDict = OrderedDict()
+        self.p = 0.0
+
+    def _trim_ghost(self):
+        while len(self.b1) + len(self.b2) > self.capacity:
+            if len(self.b1) > len(self.b2):
+                self.b1.popitem(last=False)
+            else:
+                self.b2.popitem(last=False)
+
+    def on_hit(self, key):
+        if key in self.t1:
+            self.t1.pop(key)
+            self.t2[key] = None
+        elif key in self.t2:
+            self.t2.move_to_end(key)
+
+    def on_insert(self, key):
+        if key in self.b1:
+            self.b1.pop(key)
+            self.p = min(float(self.capacity), self.p + max(1.0, len(self.b2) / max(1, len(self.b1))))
+            self.t2[key] = None
+        elif key in self.b2:
+            self.b2.pop(key)
+            self.p = max(0.0, self.p - max(1.0, len(self.b1) / max(1, len(self.b2))))
+            self.t2[key] = None
+        else:
+            self.t1[key] = None
+        while len(self.t1) + len(self.t2) > self.capacity:
+            victim = self.evict_one(lambda k: False)
+            if victim is None:
+                break
+
+    def on_remove(self, key):
+        self.t1.pop(key, None)
+        self.t2.pop(key, None)
+
+    def evict_one(self, is_pinned):
+        if self.t1 and len(self.t1) > self.p:
+            for key in list(self.t1):
+                if not is_pinned(key):
+                    self.t1.pop(key)
+                    self.b1[key] = None
+                    self._trim_ghost()
+                    return key
+        for key in list(self.t2):
+            if not is_pinned(key):
+                self.t2.pop(key)
+                self.b2[key] = None
+                self._trim_ghost()
+                return key
+        for key in list(self.t1):
+            if not is_pinned(key):
+                self.t1.pop(key)
+                self.b1[key] = None
+                self._trim_ghost()
+                return key
+        return None
+
+    def __len__(self):
+        return len(self.t1) + len(self.t2)
+
+
+class S3FIFOPolicy(_Policy):
+    """S3-FIFO: 10% small FIFO + 90% main FIFO with a 2-bit frequency count."""
+
+    name = "s3fifo"
+
+    def __init__(self, capacity: int, small_ratio: float = 0.1):
+        super().__init__(capacity)
+        self.small_cap = max(1, int(self.capacity * small_ratio))
+        self.small: OrderedDict = OrderedDict()
+        self.main: OrderedDict = OrderedDict()
+        self.freq: dict[tuple[int, int], int] = {}
+
+    def on_hit(self, key):
+        self.freq[key] = min(3, self.freq.get(key, 0) + 1)
+        if key in self.main:
+            self.main.move_to_end(key)
+
+    def on_insert(self, key):
+        self.small[key] = None
+        self.small.move_to_end(key)
+        self.freq.setdefault(key, 0)
+        for _ in range(len(self.small) + 2):
+            if len(self.small) <= self.small_cap:
+                break
+            if self._small_step(lambda k: False) is not None:
+                break
+
+    def _small_step(self, is_pinned) -> tuple[int, int] | None:
+        """Pop the oldest unpinned small entry: promote it or drop it.
+
+        Returns the key only when it leaves the policy (a real victim); a
+        promotion returns None and must be retried.
+        """
+        for key in list(self.small):
+            if is_pinned(key):
+                continue
+            self.small.pop(key)
+            if self.freq.get(key, 0) > 0 and len(self.main) < self.capacity:
+                self.main[key] = None
+                self.main.move_to_end(key)
+                return None
+            self.freq.pop(key, None)
+            return key
+        return None
+
+    def _main_step(self, is_pinned) -> tuple[int, int] | None:
+        for key in list(self.main):
+            if is_pinned(key):
+                continue
+            if self.freq.get(key, 0) > 0:
+                self.freq[key] -= 1
+                self.main.move_to_end(key)
+                continue
+            self.main.pop(key)
+            self.freq.pop(key, None)
+            return key
+        return None
+
+    def on_remove(self, key):
+        self.small.pop(key, None)
+        self.main.pop(key, None)
+        self.freq.pop(key, None)
+
+    def evict_one(self, is_pinned):
+        for _ in range(len(self.small) + len(self.main) + 4):
+            if len(self.small) > self.small_cap:
+                victim = self._small_step(is_pinned)
+                if victim is not None:
+                    return victim
+                continue
+            victim = self._main_step(is_pinned)
+            if victim is not None:
+                return victim
+            victim = self._small_step(is_pinned)
+            if victim is not None:
+                return victim
+            if not self.small and not self.main:
+                break
+        return None
+
+    def __len__(self):
+        return len(self.small) + len(self.main)
+
+
+def make_policy(name: str, capacity: int) -> _Policy:
+    name = name.lower()
+    if name == "lru":
+        return LRUPolicy(capacity)
+    if name == "arc":
+        return ARCPolicy(capacity)
+    if name in ("s3fifo", "s3-fifo", "s3"):
+        return S3FIFOPolicy(capacity)
+    raise ValueError(f"unknown cache policy {name!r} (use lru|arc|s3fifo)")
+
+
+# ---------------------------------------------------------------------------
+# Expert caches
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CacheStats:
+    hits: int = 0
+    misses: int = 0
+    disk_reads: int = 0
+    disk_bytes: int = 0
+    evictions: int = 0
+    loads: int = 0
+    prefetch_issued: int = 0
+    prefetch_hits: int = 0
+    load_seconds: float = 0.0
+
+    def as_dict(self) -> dict[str, float]:
+        total = self.hits + self.misses
+        return {
+            "hits": self.hits,
+            "misses": self.misses,
+            "hit_rate": self.hits / total if total else 0.0,
+            "disk_reads": self.disk_reads,
+            "disk_gb": self.disk_bytes / 1e9,
+            "evictions": self.evictions,
+            "load_seconds": self.load_seconds,
+        }
+
+
+class ExpertCache:
+    """RAM cache of raw fp4 expert blobs (18.8 MB each), shared by all sessions.
+
+    The bytes are kept exactly as stored on disk (no dequantization, no dtype
+    conversion): dequantization happens on the device that consumes the blob.
+    """
+
+    def __init__(
+        self,
+        index: ShardIndex,
+        reader: ShardReader,
+        capacity_bytes: int,
+        policy: str = "arc",
+        *,
+        max_pinned_bytes: int | None = None,
+        executor_threads: int | None = None,
+    ):
+        self.index = index
+        self.reader = reader
+        self.blob_bytes = index.expert_blob_bytes()
+        self.capacity_entries = max(1, int(capacity_bytes) // max(1, self.blob_bytes))
+        self.policy = make_policy(policy, self.capacity_entries)
+        self.max_pinned = (self.capacity_entries if max_pinned_bytes is None
+                           else max(0, int(max_pinned_bytes) // max(1, self.blob_bytes)))
+        self._entries: dict[tuple[int, int], bytearray] = {}
+        self._pinned: set[tuple[int, int]] = set()
+        self._refs: dict[tuple[int, int], int] = defaultdict(int)
+        self._freq: dict[tuple[int, int], int] = defaultdict(int)
+        self._lock = threading.RLock()
+        self._stats = CacheStats()
+        self._executor = ThreadPoolExecutor(max_workers=executor_threads or reader.threads,
+                                            thread_name_prefix="tinyinfer-prefetch")
+        self._closed = False
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    @property
+    def pinned_entries(self) -> int:
+        return len(self._pinned)
+
+    def _is_pinned(self, key: tuple[int, int]) -> bool:
+        return key in self._pinned
+
+    def _evict_locked(self) -> bool:
+        victim = self.policy.evict_one(self._is_pinned)
+        if victim is None:
+            return False
+        self._entries.pop(victim, None)
+        self._refs.pop(victim, None)
+        self._freq.pop(victim, None)
+        self._stats.evictions += 1
+        return True
+
+    def _insert_locked(self, key: tuple[int, int], data: bytearray, *, pinned: bool = False) -> None:
+        old = self._entries.get(key)
+        if old is not None:
+            self._stats.hits += 1
+            self.policy.on_hit(key)
+            return
+        while len(self._entries) >= self.capacity_entries:
+            if not self._evict_locked():
+                break
+        self._entries[key] = data
+        self.policy.on_insert(key)
+        if pinned:
+            self.pin(key)
+        self._stats.loads += 1
+
+    def get(self, layer: int, expert: int, *, blocking: bool = True) -> bytearray | None:
+        key = (layer, expert)
+        with self._lock:
+            data = self._entries.get(key)
+            if data is not None:
+                self._stats.hits += 1
+                self._freq[key] += 1
+                self.policy.on_hit(key)
+                return data
+        if not blocking:
+            return None
+        blob = self.index.expert_blob(layer, expert)
+        started = time.perf_counter()
+        data = self.reader.read_blob(blob)
+        with self._lock:
+            self._stats.misses += 1
+            self._stats.disk_reads += 1
+            self._stats.disk_bytes += len(data)
+            self._stats.load_seconds += time.perf_counter() - started
+            self._insert_locked(key, data)
+            self._freq[key] += 1
+        return data
+
+    def prefetch(self, layer: int, experts: Iterable[int]) -> Future:
+        """Read a set of experts into RAM in the background (deduplicated)."""
+
+        def work() -> int:
+            loaded = 0
+            for expert in experts:
+                key = (layer, expert)
+                with self._lock:
+                    if key in self._entries:
+                        continue
+                blob = self.index.expert_blob(layer, expert)
+                data = self.reader.read_blob(blob)
+                with self._lock:
+                    if key not in self._entries:
+                        self._stats.disk_reads += 1
+                        self._stats.disk_bytes += len(data)
+                        self._insert_locked(key, data)
+                        loaded += 1
+                    self._stats.prefetch_issued += 1
+            return loaded
+
+        if self._closed:
+            raise RuntimeError("cache closed")
+        return self._executor.submit(work)
+
+    def contains(self, layer: int, expert: int) -> bool:
+        with self._lock:
+            return (layer, expert) in self._entries
+
+    def pin(self, layer: int, expert: int) -> bool:
+        key = (layer, expert)
+        with self._lock:
+            if key in self._entries:
+                self._pinned.add(key)
+                return True
+            return False
+
+    def unpin(self, layer: int, expert: int) -> None:
+        with self._lock:
+            self._pinned.discard((layer, expert))
+
+    def pin_hot(self, per_layer: int = 20, *, skip_layers: Iterable[int] = ()) -> int:
+        """Pin the most frequently routed experts of each layer (weight selection)."""
+        skip = set(skip_layers)
+        by_layer: dict[int, list[tuple[int, int]]] = defaultdict(list)
+        with self._lock:
+            for key, count in self._freq.items():
+                if key[0] in skip:
+                    continue
+                by_layer[key[0]].append((count, key[1]))
+            pinned = 0
+            for layer, rows in by_layer.items():
+                rows.sort(reverse=True)
+                for count, expert in rows[:per_layer]:
+                    key = (layer, expert)
+                    if key in self._entries and key not in self._pinned and pinned < self.max_pinned:
+                        self._pinned.add(key)
+                        pinned += 1
+            return pinned
+
+    def hot_experts(self, per_layer: int = 8) -> dict[int, list[int]]:
+        with self._lock:
+            by_layer: dict[int, list[tuple[int, int]]] = defaultdict(list)
+            for key, count in self._freq.items():
+                by_layer[key[0]].append((count, key[1]))
+            return {layer: [e for _, e in sorted(rows, reverse=True)[:per_layer]]
+                    for layer, rows in by_layer.items()}
+
+    def stats(self) -> dict[str, float]:
+        with self._lock:
+            out = self._stats.as_dict()
+            out.update({"entries": len(self._entries), "pinned": len(self._pinned),
+                        "capacity": self.capacity_entries, "policy": self.policy.name,
+                        "blob_bytes": float(self.blob_bytes)})
+            return out
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._executor.shutdown(wait=True)
+        self.reader.close()
+
+
+class VramSlotCache:
+    """Fixed ring of device buffers, one expert blob per slot.
+
+    Slots are staging memory, not a second copy of the RAM cache: evicting a
+    slot never loses data (the RAM cache still has it).  This keeps VRAM usage
+    explainable and bounded (24 slots x 18.8 MB = 451 MB by default).
+    """
+
+    def __init__(self, slots: int, blob_bytes: int, device: str = "cuda",
+                 dtype: Any = None, pin_staging: bool = True):
+        self.slots = max(0, int(slots))
+        self.blob_bytes = int(blob_bytes)
+        self.device = device
+        self.pin_staging = pin_staging
+        self._dtype = dtype
+        self._torch = None
+        self._buffers: list[Any] = []
+        self._staging: Any = None
+        self._owner: list[tuple[int, int] | None] = [None] * self.slots
+        self._refs: list[int] = [0] * self.slots
+        self._lru: list[tuple[int, int]] = []
+        self._lock = threading.RLock()
+        self.hits = 0
+        self.loads = 0
+        self.evictions = 0
+
+    def _ensure(self):
+        if self._buffers or self.slots == 0:
+            return
+        import torch
+        self._torch = torch
+        dtype = self._dtype or torch.uint8
+        dev = torch.device(self.device)
+        self._buffers = [torch.empty(self.blob_bytes, dtype=dtype, device=dev) for _ in range(self.slots)]
+        if self.pin_staging and dev.type == "cuda":
+            self._staging = torch.empty(self.blob_bytes, dtype=dtype, pin_memory=True)
+
+    def acquire(self, layer: int, expert: int) -> int:
+        self._ensure()
+        key = (layer, expert)
+        with self._lock:
+            if key in self._lru:
+                idx = self._lru.index(key)
+                self._owner[idx] = key
+                self._refs[idx] += 1
+                self.hits += 1
+                return idx
+            free = next((i for i, o in enumerate(self._owner) if o is None), None)
+            if free is None:
+                for i in self._lru:
+                    idx = self._lru.index(i)
+                    if self._refs[idx] == 0:
+                        free = idx
+                        break
+            if free is None:
+                raise RuntimeError("all VRAM expert slots are referenced")
+            if self._owner[free] is not None:
+                self.evictions += 1
+                self._lru.remove(self._owner[free])
+            self._owner[free] = key
+            self._refs[free] = 1
+            self._lru.append(key)
+            self.loads += 1
+            return free
+
+    def copy_in(self, slot: int, data: Any) -> None:
+        self._ensure()
+        import torch
+        if isinstance(data, bytearray):
+            cpu = torch.frombuffer(data, dtype=torch.uint8)
+        elif isinstance(data, (bytes, memoryview)):
+            cpu = torch.frombuffer(bytearray(data), dtype=torch.uint8)
+        else:
+            cpu = data
+        if cpu.dtype != self._buffers[slot].dtype:
+            cpu = cpu.view(self._buffers[slot].dtype)
+        if self._staging is not None:
+            self._staging.copy_(cpu)
+            self._buffers[slot].copy_(self._staging, non_blocking=True)
+        else:
+            self._buffers[slot].copy_(cpu, non_blocking=True)
+
+    def release(self, layer: int, expert: int) -> None:
+        key = (layer, expert)
+        with self._lock:
+            for i, owner in enumerate(self._owner):
+                if owner == key and self._refs[i] > 0:
+                    self._refs[i] -= 1
+                    return
+
+    @property
+    def buffer(self):
+        def get(slot: int):
+            self._ensure()
+            return self._buffers[slot]
+        return get
+
+    def stats(self) -> dict[str, float]:
+        with self._lock:
+            return {"slots": self.slots, "blob_bytes": self.blob_bytes,
+                    "hits": self.hits, "loads": self.loads, "evictions": self.evictions,
+                    "gb": self.slots * self.blob_bytes / 1e9}
+
+
+# ---------------------------------------------------------------------------
+# Expert store (facade used by tinyinfer.moe)
+# ---------------------------------------------------------------------------
+
+_DTYPES = {"I8": "int8", "U8": "uint8", "F8_E4M3": "float8_e4m3fn",
+           "F8_E8M0": "float8_e8m0fnu", "BF16": "bfloat16", "F16": "float16",
+           "F32": "float32", "I32": "int32", "I64": "int64", "BOOL": "bool"}
+
+
+class ExpertRecord:
+    """One materialized expert; tensor(name) returns a zero-copy view."""
+
+    __slots__ = ("key", "buffer", "tensors", "device")
+
+    def __init__(self, key: tuple[int, int], buffer: Any, tensors: Mapping[str, TensorSlot], device: str):
+        self.key = key
+        self.buffer = buffer  # torch.uint8 tensor (CPU or CUDA) or bytearray
+        self.tensors = tensors
+        self.device = device
+
+    def tensor(self, name: str):
+        import torch
+        slot = self.tensors[name]
+        torch_dtype = getattr(torch, _DTYPES.get(slot.dtype, "uint8"))
+        if not torch.is_tensor(self.buffer):
+            buf = torch.frombuffer(self.buffer, dtype=torch.uint8)
+        else:
+            buf = self.buffer
+        view = buf.narrow(0, slot.dest_offset, slot.nbytes).view(torch_dtype)
+        return view.view(slot.shape) if len(slot.shape) != 1 else view.view(slot.shape[0])
+
+    def names(self) -> tuple[str, ...]:
+        return tuple(self.tensors)
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return f"ExpertRecord(layer={self.key[0]}, expert={self.key[1]}, device={self.device})"
+
+
+class ExpertStore:
+    """Glue between ShardStore-style weights and the tiered caches.
+
+    Typical use from moe.py:
+
+        with store.experts(layer_id, expert_ids) as records:
+            for rec in records:
+                w1 = rec.tensor("w1.weight")      # uint8 [2304, 2560]
+                s1 = rec.tensor("w1.scale")       # float8_e8m0fnu [2304, 160]
+                expert = Expert(dequant_fp4_block(w1, s1), ...)
+
+    If vram_slots > 0 and CUDA is available, records point at device buffers;
+    otherwise they point directly at the RAM cache (zero-copy).
+    """
+
+    def __init__(
+        self,
+        model_dir: str | Path,
+        *,
+        cache_bytes: int = 16 << 30,
+        policy: str = "arc",
+        vram_slots: int = 0,
+        device: str = "cuda",
+        reader_threads: int = 6,
+        direct: bool = False,
+        max_pinned_bytes: int | None = None,
+        index: ShardIndex | None = None,
+    ):
+        self.index = index or ShardIndex(model_dir)
+        self.reader = ShardReader(self.index, threads=reader_threads, direct=direct)
+        self.ram = ExpertCache(self.index, self.reader, cache_bytes, policy,
+                               max_pinned_bytes=max_pinned_bytes)
+        self.slots = VramSlotCache(vram_slots, self.index.expert_blob_bytes(), device=device) if vram_slots else None
+        self.device = device
+        self._open: dict[tuple[int, int], int] = defaultdict(int)
+        self._lock = threading.RLock()
+
+    @classmethod
+    def from_store(cls, store: Any, **kwargs) -> "ExpertStore":
+        """Build from a tinyinfer.weights.ShardStore (duck-typed)."""
+        model_dir = getattr(store, "model_dir", None)
+        if model_dir is None:
+            raise TypeError("store must expose model_dir (tinyinfer.weights.ShardStore does)")
+        index = ShardIndex(model_dir)
+        weight_map = getattr(store, "weight_map", None)
+        if weight_map:
+            index.weight_map = weight_map
+        return cls(model_dir, index=index, **kwargs)
+
+    def _materialize(self, layer: int, expert: int) -> ExpertRecord:
+        data = self.ram.get(layer, expert)
+        blob = self.index.expert_blob(layer, expert)
+        if self.slots is None or self.slots.slots == 0:
+            return ExpertRecord((layer, expert), data, blob.tensors, "cpu")
+        slot = self.slots.acquire(layer, expert)
+        self.slots.copy_in(slot, data)
+        return ExpertRecord((layer, expert), self.slots.buffer(slot), blob.tensors, self.device)
+
+    def fetch(self, layer: int, experts: Iterable[int]) -> list[ExpertRecord]:
+        records = []
+        for expert in experts:
+            expert = int(expert)
+            records.append(self._materialize(layer, expert))
+            with self._lock:
+                self._open[(layer, expert)] += 1
+        return records
+
+    def release(self, records: Iterable[ExpertRecord]) -> None:
+        for rec in records:
+            layer, expert = rec.key
+            with self._lock:
+                self._open[(layer, expert)] = max(0, self._open[(layer, expert)] - 1)
+            if self.slots is not None:
+                self.slots.release(layer, expert)
+
+    @contextmanager
+    def experts(self, layer: int, experts: Iterable[int]) -> Iterator[list[ExpertRecord]]:
+        records = self.fetch(layer, experts)
+        try:
+            yield records
+        finally:
+            self.release(records)
+
+    def prefetch(self, layer: int, experts: Iterable[int]) -> Future:
+        return self.ram.prefetch(layer, experts)
+
+    def pin(self, layer: int, expert: int) -> bool:
+        return self.ram.pin(layer, expert)
+
+    def pin_hot(self, per_layer: int = 20) -> int:
+        return self.ram.pin_hot(per_layer=per_layer)
+
+    def stats(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"ram": self.ram.stats(), "reader": self.reader.stats()}
+        if self.slots is not None:
+            out["vram"] = self.slots.stats()
+        return out
+
+    def close(self) -> None:
+        self.ram.close()
+
+
+# ---------------------------------------------------------------------------
+# Router prediction (branch prediction)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Prediction:
+    layer: int
+    experts: tuple[int, ...]
+    confidence: float = 0.0
+
+    def __len__(self) -> int:
+        return len(self.experts)
+
+
+@dataclass
+class PredictionContext:
+    session: str = "default"
+    step: int = 0
+    layer: int = 0
+    token_ids: tuple[int, ...] = ()
+    hidden: Any = None                 # CPU tensor/array for lookahead predictors
+    last_routes: Mapping[int, Sequence[int]] = field(default_factory=dict)  # previous token
+    routes_so_far: Mapping[int, Sequence[int]] = field(default_factory=dict)
+    phase: str = "decode"
+
+
+class Predictor(Protocol):
+    def predict(self, ctx: PredictionContext, target_layer: int) -> Prediction:
+        ...
+
+    def observe(self, ctx: PredictionContext, layer: int, experts: Sequence[int]) -> None:
+        ...
+
+
+class TemporalPredictor:
+    """Previous token's route at the same layer (the classic baseline)."""
+
+    name = "temporal"
+
+    def __init__(self, n_experts: int, keep: int = 1):
+        self.n_experts = n_experts
+        self.keep = keep
+        self._last: dict[str, dict[int, tuple[int, ...]]] = defaultdict(dict)
+        self._hits: dict[int, int] = defaultdict(int)
+        self._seen: dict[int, int] = defaultdict(int)
+
+    def observe(self, ctx: PredictionContext, layer: int, experts: Sequence[int]) -> None:
+        self._last[ctx.session][layer] = tuple(int(e) for e in experts)
+
+    def predict(self, ctx: PredictionContext, target_layer: int) -> Prediction:
+        routes = self._last.get(ctx.session, {})
+        experts = routes.get(target_layer)
+        if not experts:
+            return Prediction(target_layer, ())
+        rate = self._hits.get(target_layer, 0) / max(1, self._seen.get(target_layer, 0))
+        return Prediction(target_layer, tuple(experts), confidence=max(0.15, rate))
+
+    def feedback(self, layer: int, hits: int) -> None:
+        self._hits[layer] += hits
+        self._seen[layer] += 1
+
+
+class NgramRouterPredictor:
+    """Route from the last n token ids: repetitive agent loops reuse routes.
+
+    This is the router-side analogue of an n-gram draft model: token ids are
+    known before the layer runs, so this predictor can be evaluated on CPU
+    without any hidden state.
+    """
+
+    name = "ngram"
+
+    def __init__(self, n: int = 4, max_entries: int = 200_000):
+        self.n = n
+        self.max_entries = max_entries
+        self._table: OrderedDict[tuple[int, ...], dict[int, tuple[int, ...]]] = OrderedDict()
+        self._last: dict[str, dict[int, tuple[int, ...]]] = defaultdict(dict)
+
+    @staticmethod
+    def context_key(token_ids: Sequence[int], n: int) -> tuple[int, ...] | None:
+        if len(token_ids) < n:
+            return None
+        return tuple(int(t) for t in token_ids[-n:])
+
+    def observe(self, ctx: PredictionContext, layer: int, experts: Sequence[int]) -> None:
+        self._last[ctx.session][layer] = tuple(int(e) for e in experts)
+        key = self.context_key(ctx.token_ids, self.n)
+        if key is None:
+            return
+        entry = self._table.get(key)
+        if entry is None:
+            entry = self._table[key] = {}
+            if len(self._table) > self.max_entries:
+                self._table.popitem(last=False)
+        entry[layer] = tuple(int(e) for e in experts)
+        self._table.move_to_end(key)
+
+    def predict(self, ctx: PredictionContext, target_layer: int) -> Prediction:
+        key = self.context_key(ctx.token_ids, self.n)
+        if key is not None:
+            entry = self._table.get(key)
+            if entry and target_layer in entry:
+                return Prediction(target_layer, entry[target_layer], confidence=0.8)
+        experts = self._last.get(ctx.session, {}).get(target_layer)
+        if experts:
+            return Prediction(target_layer, tuple(experts), confidence=0.25)
+        return Prediction(target_layer, ())
+
+
+class LookaheadRouterPredictor:
+    """CPU lookahead router: linear map hidden -> gate logits for a target layer.
+
+    The released router is sqrt(softplus(W_gate @ h)) with a small top-k bias.
+    We cannot know h of a future layer exactly, but the current sublayer hidden
+    state is available on CPU, and a ridge-regressed linear map (5120 -> 384
+    per target layer, 2M params = 8 MB fp32) is enough to run on the CPU while
+    the GPU works.  fit() consumes logged pairs; the prototype script in
+    scripts/prototypes/loading_research contains the collection/training loop.
+    """
+
+    name = "lookahead"
+
+    def __init__(self, weights: Mapping[int, Any] | None = None, top_k: int = 8, bias: Any = None):
+        self.weights: dict[int, Any] = dict(weights or {})
+        self.bias: dict[int, Any] = dict(bias or {})
+        self.top_k = top_k
+
+    @staticmethod
+    def fit(pairs: Sequence[tuple[Any, Any]], ridge: float = 1e-3) -> tuple[Any, Any]:
+        """Ridge fit on CPU: pairs of (hidden [dim], target logits [n_experts])."""
+        import numpy as np
+        X = np.stack([np.asarray(h, dtype=np.float32) for h, _ in pairs])
+        Y = np.stack([np.asarray(y, dtype=np.float32) for _, y in pairs])
+        X = np.concatenate([X, np.ones((len(X), 1), dtype=np.float32)], axis=1)
+        A = X.T @ X + ridge * len(X) * np.eye(X.shape[1], dtype=np.float32)
+        W = np.linalg.solve(A, X.T @ Y).astype(np.float32)
+        return W[:-1].T.copy(), W[-1].copy()
+
+    def load_npz(self, path: str | Path) -> None:
+        import numpy as np
+        with np.load(path) as data:
+            for key in data.files:
+                if key.startswith("w"):
+                    self.weights[int(key[1:])] = data[key]
+                elif key.startswith("b"):
+                    self.bias[int(key[1:])] = data[key]
+
+    def save_npz(self, path: str | Path) -> None:
+        import numpy as np
+        payload = {f"w{k}": v for k, v in self.weights.items()}
+        payload.update({f"b{k}": v for k, v in self.bias.items()})
+        np.savez(path, **payload)
+
+    def predict(self, ctx: PredictionContext, target_layer: int) -> Prediction:
+        W = self.weights.get(target_layer)
+        if W is None or ctx.hidden is None:
+            return Prediction(target_layer, ())
+        import numpy as np
+        h = np.asarray(ctx.hidden, dtype=np.float32).reshape(-1)
+        logits = W @ h + self.bias.get(target_layer, 0.0)
+        k = min(self.top_k, logits.shape[0])
+        idx = np.argpartition(-logits, k - 1)[:k]
+        idx = idx[np.argsort(-logits[idx])]
+        p = np.exp(logits[idx] - logits[idx].max())
+        p = p / p.sum()
+        return Prediction(target_layer, tuple(int(i) for i in idx), confidence=float(p[0]))
+
+    def observe(self, ctx: PredictionContext, layer: int, experts: Sequence[int]) -> None:
+        return None
+
+
+class OraclePredictor:
+    """Ground-truth routes for tests/simulations (upper bound)."""
+
+    name = "oracle"
+
+    def __init__(self, routes: Mapping[tuple[str, int], Sequence[int]] | None = None):
+        self.routes = dict(routes or {})
+
+    def set_routes(self, key: tuple[str, int], experts: Sequence[int]) -> None:
+        self.routes[key] = tuple(int(e) for e in experts)
+
+    def predict(self, ctx: PredictionContext, target_layer: int) -> Prediction:
+        experts = self.routes.get((ctx.session, target_layer))
+        return Prediction(target_layer, tuple(experts or ()), confidence=1.0)
+
+    def observe(self, ctx: PredictionContext, layer: int, experts: Sequence[int]) -> None:
+        return None
+
+
+class EnsemblePredictor:
+    def __init__(self, members: Sequence[tuple[Predictor, float]]):
+        self.members = list(members)
+
+    def predict(self, ctx: PredictionContext, target_layer: int) -> Prediction:
+        score: dict[int, float] = {}
+        for predictor, weight in self.members:
+            pred = predictor.predict(ctx, target_layer)
+            for rank, expert in enumerate(pred.experts):
+                score[expert] = max(score.get(expert, 0.0), weight * pred.confidence * (1.0 / (1 + rank)))
+        if not score:
+            return Prediction(target_layer, ())
+        ranked = sorted(score.items(), key=lambda kv: -kv[1])
+        return Prediction(target_layer, tuple(e for e, _ in ranked), confidence=ranked[0][1])
+
+    def observe(self, ctx: PredictionContext, layer: int, experts: Sequence[int]) -> None:
+        for predictor, _ in self.members:
+            observe = getattr(predictor, "observe", None)
+            if observe:
+                observe(ctx, layer, experts)
+
+
+# ---------------------------------------------------------------------------
+# Prefetcher
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PrefetchConfig:
+    lead_layers: int = 1                 # predict this many layers ahead on CPU
+    max_experts_per_layer: int = 2       # only high-value predictions
+    min_confidence: float = 0.35
+    free_compute_ms: float = 5.0         # GPU time available to hide reads
+    bandwidth_gbs: float = 8.8
+    enabled: bool = True
+    gate: bool = True                    # decode gate: off when not paying
+    gate_window: int = 16
+    gate_min_useful: float = 0.10        # fraction of prefetched experts later used
+    gate_min_saved_ms: float = 0.5
+    prefetch_next_token: bool = False
+    next_token_max_experts: int = 8
+    prefetch_to_vram: bool = False
+
+    def free_bytes(self) -> int:
+        return max(0, int(self.free_compute_ms / 1e3 * self.bandwidth_gbs * 1e9))
+
+    def max_experts(self, blob_bytes: int) -> int:
+        by_bw = self.free_bytes() // max(1, blob_bytes)
+        return int(max(0, min(self.max_experts_per_layer, by_bw)))
+
+
+class Prefetcher:
+    """Predicts future experts on CPU and warms the RAM cache during GPU work.
+
+    Prediction never reduces bytes: a wrong prediction is wasted bandwidth.
+    It only helps when the predicted reads fit in otherwise idle NVMe time
+    (the GPU is busy with attention/FFN) and the prediction is precise.  The
+    gate measures precision/usage over a window and switches prefetch off when
+    it does not pay, the same lesson as Strata decode gate and flash-moe's
+    negative temporal-prediction result.
+    """
+
+    def __init__(self, store: ExpertStore, predictor: Predictor, cfg: PrefetchConfig | None = None):
+        self.store = store
+        self.predictor = predictor
+        self.cfg = cfg or PrefetchConfig()
+        self.blob_bytes = store.index.expert_blob_bytes()
+        self._pending: dict[tuple[str, int], tuple[tuple[int, ...], int]] = {}
+        self._futures: list[Future] = []
+        self._lock = threading.RLock()
+        self._enabled = self.cfg.enabled
+        self._window_hits = 0
+        self._window_pred = 0
+        self._window_wasted_bytes = 0
+        self._window = 0
+        self.total_issued = 0
+        self.total_hits = 0
+        self.total_wasted_bytes = 0
+        self.total_predicted = 0
+        self.gate_trips = 0
+
+    def _budget_experts(self) -> int:
+        return self.cfg.max_experts(self.blob_bytes)
+
+    def _predict(self, ctx: PredictionContext, target_layer: int) -> tuple[int, ...]:
+        pred = self.predictor.predict(ctx, target_layer)
+        if not pred.experts:
+            return ()
+        k = self._budget_experts()
+        experts = pred.experts[:k]
+        if pred.confidence < self.cfg.min_confidence and len(experts) > 1:
+            return ()
+        return tuple(int(e) for e in experts)
+
+    def note_layer(self, ctx: PredictionContext, layer: int, experts: Sequence[int]) -> None:
+        """Call after layer layer routed; schedules a lookahead prefetch."""
+        actual = tuple(int(e) for e in experts)
+        self._score_pending(ctx.session, layer, actual)
+        observe = getattr(self.predictor, "observe", None)
+        if observe:
+            observe(ctx, layer, actual)
+        if not self._enabled or self.cfg.lead_layers <= 0:
+            return
+        target = layer + self.cfg.lead_layers
+        if target >= 40:
+            return
+        predicted = self._predict(ctx, target)
+        if not predicted:
+            return
+        if all(self.store.ram.contains(target, e) for e in predicted):
+            return
+        with self._lock:
+            self._pending[(ctx.session, target)] = (predicted, len(predicted) * self.blob_bytes)
+        self._futures.append(self.store.prefetch(target, predicted))
+        self._futures = [f for f in self._futures if not f.done()]
+        self.total_issued += len(predicted)
+        self.total_predicted += 1
+
+    def note_step_start(self, ctx: PredictionContext) -> None:
+        """Optional temporal warm-up across tokens (disabled by default)."""
+        if not self.cfg.prefetch_next_token or not self._enabled:
+            return
+        for target in range(0, 40):
+            predicted = self._predict(ctx, target)
+            if predicted:
+                self.store.prefetch(target, predicted)
+
+    def _score_pending(self, session: str, layer: int, actual: Sequence[int]) -> None:
+        with self._lock:
+            item = self._pending.pop((session, layer), None)
+        if item is None:
+            return
+        predicted, issued_bytes = item
+        hits = len(set(predicted) & set(actual))
+        wasted = (len(predicted) - hits) * self.blob_bytes
+        self.total_hits += hits
+        self.total_wasted_bytes += wasted
+        self._window_hits += hits
+        self._window_pred += len(predicted)
+        self._window_wasted_bytes += wasted
+        self._window += 1
+        if self.cfg.gate and self._window >= self.cfg.gate_window:
+            used = self._window_hits / max(1, self._window_pred)
+            if used < self.cfg.gate_min_useful:
+                self.gate_trips += 1
+                self._enabled = False
+            self._window = self._window_hits = self._window_pred = self._window_wasted_bytes = 0
+
+    def wait(self, timeout: float | None = None) -> None:
+        for fut in list(self._futures):
+            fut.result(timeout=timeout)
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "enabled": self._enabled,
+                "issued_experts": self.total_issued,
+                "predictions": self.total_predicted,
+                "hits": self.total_hits,
+                "precision": self.total_hits / max(1, self.total_issued),
+                "wasted_gb": self.total_wasted_bytes / 1e9,
+                "gate_trips": self.gate_trips,
+            }
+
+
+# ---------------------------------------------------------------------------
+# Multi-session scheduler
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LayerPlan:
+    layer: int
+    experts: tuple[int, ...]
+    per_session: dict[str, tuple[int, ...]]
+    nbytes: int
+    waves: tuple[tuple[int, ...], ...] = ()
+
+    @property
+    def sharing(self) -> float:
+        requested = sum(len(v) for v in self.per_session.values())
+        return requested / max(1, len(self.experts))
+
+
+@dataclass
+class StepPlan:
+    phase: str
+    layers: list[LayerPlan]
+    total_bytes: int
+    dedupe_ratio: float
+
+    def table(self) -> str:
+        rows = [f"phase={self.phase} layers={len(self.layers)} bytes={self.total_bytes / 1e9:.3f} GB "
+                f"dedupe={self.dedupe_ratio:.2f}"]
+        for lp in self.layers[:8]:
+            rows.append(f"  L{lp.layer:02d} experts={len(lp.experts):3d} "
+                        f"bytes={lp.nbytes / 1e6:7.2f} MB sharing={lp.sharing:.2f}"
+                        + (f" waves={len(lp.waves)}" if lp.waves else ""))
+        if len(self.layers) > 8:
+            rows.append(f"  ... {len(self.layers) - 8} more layers")
+        return "\n".join(rows)
+
+
+class SessionScheduler:
+    """Plans which experts to load per decode/prefill step for N sessions.
+
+    Decode: one token per session, union of the 6 experts per layer is loaded
+    once and shared by all sessions (dedupe is free throughput).
+    Prefill: a chunk touches most of a layer's 384 experts; the plan splits the
+    expert set into waves that fit VRAM slots (Wave-Partitional Prefill) so each
+    expert is read once per chunk instead of once per token.
+    """
+
+    def __init__(self, geo: ModelGeometry = ModelGeometry(), *, vram_slots: int = 24,
+                 max_step_bytes: int | None = None):
+        self.geo = geo
+        self.vram_slots = max(1, vram_slots)
+        self.max_step_bytes = max_step_bytes
+
+    def plan(self, sessions: Mapping[str, Mapping[int, Sequence[int]]],
+             *, phase: str = "decode") -> StepPlan:
+        layers = sorted({layer for routes in sessions.values() for layer in routes})
+        plans: list[LayerPlan] = []
+        requested = 0
+        for layer in layers:
+            per_session: dict[str, tuple[int, ...]] = {}
+            counts: dict[int, int] = defaultdict(int)
+            for session, routes in sessions.items():
+                ids = tuple(int(e) for e in routes.get(layer, ()))
+                per_session[session] = ids
+                requested += len(ids)
+                for e in ids:
+                    counts[e] += 1
+            union = tuple(sorted(counts, key=lambda e: (-counts[e], e)))
+            waves: tuple[tuple[int, ...], ...] = ()
+            if phase == "prefill" and len(union) > self.vram_slots:
+                wave = max(1, (self.vram_slots - self.geo.n_activated) // 2)
+                waves = tuple(union[i:i + wave] for i in range(0, len(union), wave))
+            plans.append(LayerPlan(layer=layer, experts=union, per_session=per_session,
+                                   nbytes=len(union) * self.geo.expert_bytes(), waves=waves))
+        total = sum(p.nbytes for p in plans)
+        if self.max_step_bytes and total > self.max_step_bytes:
+            plans = plans[: max(1, len(plans) // 2)]
+            total = sum(p.nbytes for p in plans)
+        return StepPlan(phase=phase, layers=plans, total_bytes=total,
+                        dedupe_ratio=requested / max(1, sum(len(p.experts) for p in plans)))
+
+
+# ---------------------------------------------------------------------------
+# Simulation (no weights required)
+# ---------------------------------------------------------------------------
+
+def simulate_workload(
+    steps: int = 48,
+    n_layers: int = 40,
+    n_experts: int = 384,
+    k: int = 6,
+    *,
+    zipf_s: float = 0.9,
+    topic_concentration: float = 0.35,
+    topic_reuse: float = 0.5,
+    temporal_reuse: float = 0.25,
+    seed: int = 0,
+) -> list[list[tuple[int, ...]]]:
+    """Synthetic per-token routes with Zipf + topic + temporal structure.
+
+    Returns tokens[token][layer] -> expert ids.  The parameters are priors
+    taken from published MoE routing traces (heavy-tailed recency/frequency,
+    ~25% same-layer temporal overlap); they are not a measurement of this
+    model -- collect_router_trace.py replaces them with real routes.
+    """
+    rng = random.Random(seed)
+    import numpy as np
+    prng = np.random.default_rng(seed)
+    base = 1.0 / np.arange(1, n_experts + 1) ** zipf_s
+    base /= base.sum()
+    topic = prng.dirichlet(np.full(n_experts, topic_concentration))
+    prev: list[tuple[int, ...]] = [() for _ in range(n_layers)]
+    out: list[list[tuple[int, ...]]] = []
+    for t in range(steps):
+        if t % 8 == 0:
+            topic = prng.dirichlet(np.full(n_experts, topic_concentration))
+        dist = topic_reuse * topic + (1.0 - topic_reuse) * base
+        dist = dist / dist.sum()
+        token: list[tuple[int, ...]] = []
+        for layer in range(n_layers):
+            chosen: list[int] = []
+            if prev[layer] and rng.random() < temporal_reuse:
+                n_copy = rng.choice([1, 2])
+                chosen.extend(rng.sample(prev[layer], min(n_copy, len(prev[layer]))))
+            while len(chosen) < k:
+                e = int(prng.choice(n_experts, p=dist))
+                if e not in chosen:
+                    chosen.append(e)
+            token.append(tuple(chosen))
+        prev = token
+        out.append(token)
+    return out
+
+
+def simulate_cache(routes: Sequence[Sequence[Sequence[int]]], capacity_entries: int,
+                   policy: str = "lru", *, pin_per_layer: int = 0) -> dict[str, float]:
+    """Replay routes through a cache; returns hit rate and disk bytes."""
+    n_experts = max((e for tok in routes for layer in tok for e in layer), default=0) + 1
+    cap = max(1, capacity_entries)
+    pol = make_policy(policy, cap)
+    store: dict[tuple[int, int], None] = {}
+    freq: dict[tuple[int, int], int] = defaultdict(int)
+    pinned: set[tuple[int, int]] = set()
+    hits = misses = 0
+    bytes_read = 0
+    warmup = max(1, len(routes) // 4)
+    blob = ModelGeometry().expert_bytes()
+    for t, token in enumerate(routes):
+        for layer, experts in enumerate(token):
+            for e in experts:
+                key = (layer, e)
+                freq[key] += 1
+                if key in store:
+                    hits += 1
+                    pol.on_hit(key)
+                else:
+                    misses += 1
+                    bytes_read += blob
+                    while len(store) >= cap:
+                        victim = pol.evict_one(lambda k: k in pinned)
+                        if victim is None:
+                            break
+                        store.pop(victim, None)
+                    store[key] = None
+                    pol.on_insert(key)
+        if pin_per_layer and t == warmup:
+            by_layer: dict[int, list[tuple[int, int]]] = defaultdict(list)
+            for (layer, e), c in freq.items():
+                by_layer[layer].append((c, e))
+            for layer, rows in by_layer.items():
+                for _, e in sorted(rows, reverse=True)[:pin_per_layer]:
+                    key = (layer, e)
+                    if key in store:
+                        pinned.add(key)
+    total = hits + misses
+    return {
+        "policy": policy,
+        "capacity": cap,
+        "hit_rate": hits / total if total else 0.0,
+        "disk_gb": bytes_read / 1e9,
+        "disk_gb_per_token": bytes_read / 1e9 / max(1, len(routes)),
+        "pinned": len(pinned),
+    }
+
+
+def simulate_prefetch(
+    routes: Sequence[Sequence[Sequence[int]]],
+    *,
+    precision: float = 0.6,
+    recall: float = 0.5,
+    k_prefetch: int = 2,
+    read_gbs: float = 8.8,
+    compute_ms: float = 5.0,
+    blob_bytes: int | None = None,
+    seed: int = 0,
+) -> dict[str, float]:
+    """Layer-time model for CPU lookahead prefetch.
+
+    Each layer reads k_prefetch experts during the previous layer's compute_ms
+    of GPU work, then the remaining 6 - hits experts on the critical path.
+    A prefetched miss costs bandwidth later (wasted), but the model charges it
+    only when it exceeds the free window.
+    """
+    blob = blob_bytes or ModelGeometry().expert_bytes()
+    n_layers_total = len(routes) * (len(routes[0]) if routes else 0)
+    read_ms_per_expert = blob / (read_gbs * 1e9) * 1e3
+    baseline_ms = n_layers_total * (compute_ms + ModelGeometry().n_activated * read_ms_per_expert)
+    free_bytes = compute_ms / 1e3 * read_gbs * 1e9  # NVMe idle while the GPU computes
+    total_ms = 0.0
+    hits = predicted = 0
+    wasted = 0
+    for token in routes:
+        for experts in token:
+            n_pred = min(k_prefetch, len(experts))
+            # hits = min(k * precision, K * recall): precision caps false positives,
+            # recall caps how much of the 6-expert set a k-sized prediction can cover.
+            hits_this = min(float(n_pred) * precision, float(len(experts)) * recall)
+            hits_this = max(0.0, min(float(n_pred), hits_this))
+            hits += hits_this
+            predicted += n_pred
+            wasted += (n_pred - hits_this) * blob
+            critical_bytes = (len(experts) - hits_this) * blob
+            prefetch_bytes = n_pred * blob
+            # Prefetched bytes beyond the compute window extend the layer.
+            overflow = max(0.0, prefetch_bytes - free_bytes)
+            total_ms += compute_ms + (critical_bytes + overflow) / (read_gbs * 1e9) * 1e3
+    return {
+        "precision": hits / max(1, predicted),
+        "k_prefetch": k_prefetch,
+        "baseline_ms_per_layer": baseline_ms / max(1, n_layers_total),
+        "prefetch_ms_per_layer": total_ms / max(1, n_layers_total),
+        "speedup": baseline_ms / total_ms if total_ms else 0.0,
+        "wasted_gb": wasted / 1e9,
+        "total_gb_per_token": (sum(len(e) for tok in routes for e in tok) * blob / max(1, len(routes))
+                               + wasted / max(1, len(routes))) / 1e9,
+    }
+
+
+def run_simulation_suite(
+    *,
+    steps: int = 64,
+    capacities_gb: Sequence[float] = (4, 8, 16, 24, 32),
+    policies: Sequence[str] = ("lru", "arc", "s3fifo"),
+    seed: int = 0,
+) -> list[dict[str, Any]]:
+    routes = simulate_workload(steps=steps, seed=seed)
+    blob = ModelGeometry().expert_bytes()
+    rows: list[dict[str, Any]] = []
+    for gb in capacities_gb:
+        cap = int(gb * 1e9 // blob)
+        for policy in policies:
+            row = simulate_cache(routes, cap, policy)
+            row.update({"capacity_gb": gb, "tokens": steps})
+            rows.append(row)
+        row = simulate_cache(routes, cap, "arc", pin_per_layer=20)
+        row["policy"] = "arc+pin20"
+        row.update({"capacity_gb": gb, "tokens": steps})
+        rows.append(row)
+    for precision in (0.4, 0.5, 0.6, 0.7):
+        row = simulate_prefetch(routes, precision=precision, recall=0.5, k_prefetch=2)
+        rows.append({"policy": f"prefetch@{precision:.1f}", "capacity_gb": 0.0,
+                     "hit_rate": row["precision"], "disk_gb": row["wasted_gb"],
+                     "disk_gb_per_token": row["wasted_gb"] / max(1, steps),
+                     "speedup": row["speedup"]})
+    return rows
+
+
+def format_sim_table(rows: Sequence[Mapping[str, Any]]) -> str:
+    lines = [f"{'policy':<16s} {'cache GB':>8s} {'hit rate':>9s} {'disk GB/token':>14s} {'speedup':>8s}"]
+    for row in rows:
+        lines.append(f"{str(row.get('policy', '')):<16s} {row.get('capacity_gb', 0):>8.1f} "
+                     f"{row.get('hit_rate', 0):>9.3f} {row.get('disk_gb_per_token', 0):>14.3f} "
+                     f"{row.get('speedup', 0):>8.2f}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Self test / CLI
+# ---------------------------------------------------------------------------
+
+def _write_fake_model(root: Path, *, layers: int = 1, experts: int = 6) -> None:
+    """Create a tiny safetensors checkpoint with the real expert naming scheme."""
+    import torch
+    from safetensors.torch import save_file
+
+    torch.manual_seed(0)
+    all_tensors: list[tuple[str, str, Any]] = []
+    weight_map: dict[str, str] = {}
+    for layer in range(layers):
+        shard = f"model-{layer + 3:05d}-of-00048.safetensors"
+        names: dict[str, Any] = {}
+        names["layers.%d.ffn.gate.weight" % layer] = torch.zeros(experts, 8)
+        for expert in range(experts):
+            p = f"layers.{layer}.ffn.experts.{expert}."
+            names[p + "w1.weight"] = torch.randint(0, 255, (8, 4), dtype=torch.uint8)
+            names[p + "w1.scale"] = torch.ones(8, 1, dtype=torch.uint8)
+            names[p + "w2.weight"] = torch.randint(0, 255, (8, 4), dtype=torch.uint8)
+            names[p + "w2.scale"] = torch.ones(8, 1, dtype=torch.uint8)
+            names[p + "w3.weight"] = torch.randint(0, 255, (8, 4), dtype=torch.uint8)
+            names[p + "w3.scale"] = torch.ones(8, 1, dtype=torch.uint8)
+        save_file(names, str(root / shard))
+        for name in names:
+            weight_map[name] = shard
+    (root / ShardIndex.INDEX_FILE).write_text(json.dumps({"weight_map": weight_map}), encoding="utf-8")
+
+
+def selftest(tmpdir: str | Path | None = None) -> bool:
+    import tempfile
+
+    ctx = tempfile.TemporaryDirectory() if tmpdir is None else None
+    root = Path(ctx.name if ctx else tmpdir)
+    opened: list[Any] = []
+    try:
+        _selftest_body(root, opened)
+        return True
+    finally:
+        for obj in reversed(opened):
+            try:
+                obj.close()
+            except Exception:
+                pass
+        if ctx is not None:
+            import gc
+            gc.collect()
+            ctx.cleanup()
+
+
+def _selftest_body(root: Path, opened: list[Any]) -> None:
+    import numpy as np
+
+    _write_fake_model(root, layers=2, experts=6)
+    index = ShardIndex(root)
+    blob = index.expert_blob(0, 0)
+    assert blob.total_bytes == 6 * 20, blob.total_bytes
+    reader = ShardReader(index, threads=2)
+    opened.append(reader)
+    data = reader.read_blob(blob)
+    assert isinstance(data, bytearray) and len(data) == blob.total_bytes
+
+    store = ExpertStore.from_store(type("S", (), {"model_dir": root})(),
+                                   cache_bytes=4 * blob.total_bytes, policy="lru",
+                                   vram_slots=2, device="cpu", reader_threads=2)
+    opened.append(store)
+    recs = store.fetch(0, [0, 1])
+    assert len(recs) == 2
+    w1 = recs[0].tensor("w1.weight")
+    assert tuple(w1.shape) == (8, 4), w1.shape
+    store.release(recs)
+    before = store.ram.stats()["disk_reads"]
+    recs = store.fetch(0, [0, 1])
+    store.release(recs)
+    assert store.ram.stats()["disk_reads"] == before, store.ram.stats()
+
+    tiny = ExpertCache(index, ShardReader(index, threads=1),
+                       capacity_bytes=2 * blob.total_bytes, policy="s3fifo")
+    opened.append(tiny)
+    for e in range(6):
+        tiny.get(0, e)
+    assert len(tiny) <= 2, len(tiny)
+
+    for name in ("lru", "arc", "s3fifo"):
+        pol = make_policy(name, 4)
+        for e in range(8):
+            pol.on_insert((0, e))
+            while len(pol) > 4:
+                pol.evict_one(lambda k: False)
+        assert len(pol) <= 4, (name, len(pol))
+
+    sched = SessionScheduler(vram_slots=8)
+    sessions = {"a": {0: (1, 2, 3, 4, 5, 6)}, "b": {0: (1, 2, 3, 9, 10, 11)}}
+    plan = sched.plan(sessions, phase="decode")
+    assert len(plan.layers[0].experts) == 9, plan.layers[0].experts
+    assert plan.dedupe_ratio > 1.0
+    big = {"a": {0: tuple(range(40))}}
+    plan = sched.plan(big, phase="prefill")
+    assert plan.layers[0].waves and len(plan.layers[0].waves) > 1
+
+    ctxp = PredictionContext(session="a", step=1, layer=3, token_ids=(1, 2, 3, 4),
+                             hidden=np.zeros(8, dtype=np.float32))
+    trend = TemporalPredictor(384)
+    trend.observe(ctxp, 4, (1, 2))
+    assert trend.predict(ctxp, 4).experts == (1, 2)
+    ng = NgramRouterPredictor(n=4)
+    ng.observe(ctxp, 4, (5, 6))
+    assert ng.predict(ctxp, 4).experts == (5, 6)
+    W, b = LookaheadRouterPredictor.fit([(np.zeros(8), np.arange(6, dtype=np.float32)),
+                                        (np.ones(8), np.arange(6, dtype=np.float32)[::-1])])
+    look = LookaheadRouterPredictor({4: W}, bias={4: b})
+    assert look.predict(ctxp, 4).experts
+
+    store2 = ExpertStore.from_store(type("S", (), {"model_dir": root})(),
+                                    cache_bytes=8 * blob.total_bytes, policy="arc", device="cpu")
+    opened.append(store2)
+    oracle = OraclePredictor({("a", 1): (0, 1)})
+    prefetcher = Prefetcher(store2, oracle, PrefetchConfig(lead_layers=1, gate=False))
+    for _ in range(3):
+        prefetcher.note_layer(ctxp, 0, (0, 1))
+    prefetcher.wait()
+    assert prefetcher.total_issued > 0, prefetcher.stats()
+
+    budget = TierBudget.plan()
+    assert budget.ram_expert_entries > 0
+    io = IoBudget.compute(ModelGeometry(), hit_rate=0.3)
+    assert io.tokens_per_second > 0
+    rows = run_simulation_suite(steps=16, capacities_gb=(4, 16), policies=("lru", "arc"))
+    assert rows
+    print("budget plan:\n" + budget.table())
+    print("\nIO scenarios (8.8 GB/s):")
+    for b in budget.io_scenarios():
+        print(f"  hit={b.hit_rate:4.1%} read={b.read_bytes_per_token/1e9:5.2f} GB "
+              f"nvme={b.nvme_ms:6.0f} ms pcie={b.pcie_ms:5.0f} ms ~{b.tokens_per_second:4.2f} tok/s")
+    print("\nsimulation:\n" + format_sim_table(rows))
+    print("\nSELFTEST PASSED")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    import argparse
+    parser = argparse.ArgumentParser(description="tinyinfer tiered loading utilities")
+    sub = parser.add_subparsers(dest="cmd")
+    sub.add_parser("selftest")
+    p_sim = sub.add_parser("sim")
+    p_sim.add_argument("--steps", type=int, default=64)
+    p_budget = sub.add_parser("budget")
+    p_budget.add_argument("--vram", type=float, default=8.0)
+    p_budget.add_argument("--ram", type=float, default=47.2)
+    p_budget.add_argument("--ram-available", type=float, default=None)
+    p_budget.add_argument("--no-mtp", action="store_true")
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    if args.cmd == "sim":
+        print(format_sim_table(run_simulation_suite(steps=args.steps)))
+        return 0
+    if args.cmd == "budget":
+        b = TierBudget.plan(vram_gb=args.vram, ram_gb=args.ram,
+                            ram_available_gb=args.ram_available, include_mtp=not args.no_mtp)
+        print(b.table())
+        print()
+        for io in b.io_scenarios():
+            print(f"hit={io.hit_rate:4.1%}  read/token={io.read_bytes_per_token/1e9:5.2f} GB  "
+                  f"NVMe={io.nvme_ms:6.0f} ms  PCIe={io.pcie_ms:5.0f} ms  ~{io.tokens_per_second:4.2f} tok/s")
+        return 0
+    return 0 if selftest() else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

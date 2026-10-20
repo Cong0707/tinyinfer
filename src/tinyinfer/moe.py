@@ -47,6 +47,7 @@ class Expert:
         self.swiglu_limit = swiglu_limit
 
     def forward(self, x: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
+        x = x.to(self.w1.dtype)
         gate = F.linear(x, self.w1).float()
         up = F.linear(x, self.w3).float()
         if self.swiglu_limit > 0:
@@ -55,7 +56,7 @@ class Expert:
         y = F.silu(gate) * up
         if weights is not None:
             y = weights * y
-        return F.linear(y, self.w2)
+        return F.linear(y.to(self.w2.dtype), self.w2)
 
 
 class MoE:

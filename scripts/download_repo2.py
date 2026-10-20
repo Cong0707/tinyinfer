@@ -65,25 +65,61 @@ def seg_complete(path, want):
     except OSError:
         return False
 
-def download_seg(url, lo, hi, path, retries=5):
+def download_seg(url, lo, hi, path, retries=6):
     want = hi - lo + 1
     if seg_complete(path, want):
         return True
     for attempt in range(1, retries + 1):
+        have = os.path.getsize(path) if os.path.exists(path) else 0
+        if have > want:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            have = 0
+        if have == want:
+            return True
+        append = have > 0
+        dst = path + ".part" if append else path
+        rlo = lo + have
+        rc, err = None, ""
         try:
-            subprocess.run(["curl.exe", "-sS", "-L", "--fail",
-                            "--connect-timeout", "30",
-                            "--speed-limit", "20000", "--speed-time", "90",
-                            "--max-time", "3600",
-                            "-r", f"{lo}-{hi}", "-o", path, url],
-                           timeout=3700, capture_output=True)
+            res = subprocess.run(["curl.exe", "-sS", "-L", "--fail",
+                                  "--connect-timeout", "30",
+                                  "--speed-limit", "20000", "--speed-time", "90",
+                                  "--max-time", "1800",
+                                  "-r", f"{rlo}-{hi}", "-o", dst, url],
+                                 timeout=1850, capture_output=True)
+            rc = res.returncode
+            err = (res.stderr or b"").decode("utf-8", "replace").strip().replace("\n", " ")[-160:]
         except subprocess.TimeoutExpired:
-            pass
+            rc = "timeout"
+        if append and os.path.exists(dst):
+            try:
+                with open(path, "ab") as fo, open(dst, "rb") as fi:
+                    while True:
+                        b = fi.read(16 * 1024 * 1024)
+                        if not b:
+                            break
+                        fo.write(b)
+                os.remove(dst)
+            except OSError as e:
+                log(f"APPEND FAIL {os.path.basename(path)} {e}")
         if seg_complete(path, want):
             return True
-        log(f"RETRY seg {os.path.basename(path)} attempt={attempt} size={os.path.getsize(path) if os.path.exists(path) else 0}/{want}")
+        got = os.path.getsize(path) if os.path.exists(path) else 0
+        if got > want:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            got = 0
+        log(f"RETRY seg {os.path.basename(path)} attempt={attempt} size={got}/{want} rc={rc} err={err}")
         time.sleep(min(60, 5 * attempt))
     return False
+
+SEG_RE = re.compile(r"\.seg\d{4}(?:\.part)?$")
+
 
 def seg_bytes():
     total = 0
@@ -91,7 +127,7 @@ def seg_bytes():
         with os.scandir(DEST) as it:
             for e in it:
                 try:
-                    if ".seg" in e.name and e.is_file():
+                    if SEG_RE.search(e.name) and e.is_file():
                         total += e.stat().st_size
                 except OSError:
                     pass
@@ -99,22 +135,53 @@ def seg_bytes():
         pass
     return total
 
+
+def seg_file_count():
+    n = 0
+    try:
+        with os.scandir(DEST) as it:
+            for e in it:
+                if SEG_RE.search(e.name):
+                    n += 1
+    except OSError:
+        pass
+    return n
+
+
+def finished_bytes(files):
+    tot = 0
+    for name, size in files.items():
+        p = os.path.join(DEST, name)
+        try:
+            if os.path.exists(p) and os.path.getsize(p) == size:
+                tot += size
+        except OSError:
+            pass
+    return tot
+
+def progress_bytes(files):
+    return finished_bytes(files) + seg_bytes()
+
+
 class Heartbeat(threading.Thread):
-    def __init__(self, stop, state):
+    def __init__(self, stop, state, files):
         super().__init__(daemon=True)
         self.stop_ev = stop
         self.state = state
+        self.files = files
+        self.total = sum(files.values())
 
     def run(self):
-        last = seg_bytes()
+        last = progress_bytes(self.files)
         last_t = time.time()
         while not self.stop_ev.wait(60):
-            now = seg_bytes()
+            now = progress_bytes(self.files)
             dt = max(1e-6, time.time() - last_t)
             rate = (now - last) / dt / 1e6
-            with _log_lock:
-                state["last_rate"] = rate
-            log(f"HB segs={now/1e9:.2f}GB rate={rate:.2f}MB/s merged={self.state.get('merged', 0)} fails={self.state.get('fails', 0)}")
+            self.state["last_rate"] = rate
+            self.state["segfiles"] = seg_file_count()
+            log(f"HB bytes={now/1e9:.2f}/{self.total/1e9:.1f}GB ({100*now/self.total:.2f}%) rate={rate:.2f}MB/s "
+                f"merged={self.state.get('merged', 0)} fails={self.state.get('fails', 0)} segfiles={self.state['segfiles']}")
             last, last_t = now, time.time()
 
 def merge_file(name: str, total: int, nseg: int) -> bool:
@@ -219,8 +286,9 @@ def main():
 
     state = {"merged": 0, "fails": 0, "last_rate": 0.0}
     stop_ev = threading.Event()
-    hb = Heartbeat(stop_ev, state)
+    hb = Heartbeat(stop_ev, state, dict(files))
     hb.start()
+    log(f"BASELINE {progress_bytes(dict(files))/1e9:.2f} / {total_bytes/1e9:.1f} GB")
 
     merged_bytes = 0
     for name, size in big:

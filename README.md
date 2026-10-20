@@ -73,3 +73,27 @@ tinyinfer/
 - [ ] P3 HF 直接加载器
 - [ ] P4 分层执行
 - [ ] P5 端到端
+## 优化分级（O1 → O4）
+
+像编译器的 -O 级别一样，tinyinfer 的加速按可验证的阶梯推进；每一级都保留上一级的正确性基准：
+
+| 级别 | 内容 | 状态 |
+|---|---|---|
+| **O1 正确性** | 纯 PyTorch 参考实现：HF 直接加载、MLA + sink、压缩 KV/Indexer、Hyper-Connections、MoE（fp8/fp4 反量化） | ✅ 已实现 + 数值单测 |
+| **O2 融合** | tilelang kernel：RMSNorm+RoPE、SwiGLU、MoE combine、sparse-MLA gather | 研究中（kernel-researcher） |
+| **O3 量化加速** | FP8 E4M3 / NVFP4（e2m1）tensor core 直接计算、KV 量化（8bit / 4bit+Hadamard / K8V4） | 研究中 |
+| **O4 系统级** | 专家分层与 tier 交换、路由预测/预取、SSD streaming、KV streaming、投机解码（DSpark/MTP）、多 agent batching | 设计中（loading-researcher） |
+
+## 团队分工
+
+- **Lead**：架构与正确性——模型/注意力/MoE/HC 集成、端到端验证、记忆维护
+- **kernel-researcher**：sm_120 算子矩阵（torch / tilelang / DeepGEMM / FlashInfer / SDPA）与原型
+- **loading-researcher**：三层内存（VRAM/RAM/NVMe）预算、专家缓存与路由预测、权重选择加载
+- **api-engineer**：OpenAI 兼容 API（多 agent 会话、SSE、slot）
+- **data-manager**：完整仓库（510GB）下载、续传、校验与状态维护
+
+## 参考思想来源
+
+- DeepInfer：HF 直接加载器、EPLB、压缩 KV/Engram/MTP 的官方实现
+- Strata（docs/DETAILS.md）：融合 int8 tensor-core、KV streaming、专家 tier 交换、PCIe 分担、O1-O4 式工程优化
+- ds4 / flash-moe / llama.cpp #25294：SSD 专家流式与缓存策略
