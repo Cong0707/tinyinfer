@@ -37,6 +37,37 @@ class Block(HCBlockMixin):
         self.hc_ffn_base = store.get(p + "hc_ffn_base").float()
         self.hc_ffn_scale = store.get(p + "hc_ffn_scale").float()
 
+    def to(self, device):
+        """Move this block's weights to a device (in place; returns self)."""
+        for name, value in list(vars(self).items()):
+            if isinstance(value, torch.Tensor):
+                setattr(self, name, value.to(device))
+        for mod_name in ("attn", "ffn"):
+            mod = getattr(self, mod_name)
+            for name, value in list(vars(mod).items()):
+                if isinstance(value, torch.Tensor):
+                    setattr(mod, name, value.to(device))
+            if mod_name == "ffn":
+                for name, value in list(vars(mod.shared).items()):
+                    if isinstance(value, torch.Tensor):
+                        setattr(mod.shared, name, value.to(device))
+                for tname in ("weight", "bias", "bias_vl"):
+                    g = getattr(mod.gate, tname, None)
+                    if isinstance(g, torch.Tensor):
+                        setattr(mod.gate, tname, g.to(device))
+            if mod_name == "attn":
+                comp = getattr(mod, "compressor", None)
+                if comp is not None:
+                    for name, value in list(vars(comp).items()):
+                        if isinstance(value, torch.Tensor):
+                            setattr(comp, name, value.to(device))
+                idx = getattr(mod, "indexer", None)
+                if idx is not None:
+                    for name, value in list(vars(idx).items()):
+                        if isinstance(value, torch.Tensor):
+                            setattr(idx, name, value.to(device))
+        return self
+
     def forward(self, x: torch.Tensor, start_pos: int, pre_mix: torch.Tensor):
         residual = x
         attn_pre, attn_post, attn_comb = self.hc_mixes(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)

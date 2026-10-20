@@ -28,7 +28,7 @@ def main():
     store = ShardStore(MODEL)
     es = ExpertStore.from_store(store, cache_bytes=2 << 30, policy="arc", vram_slots=0, device="cpu", direct=False)
     moe_direct = MoE(store, 0, cfg)
-    moe_es = MoE(store, 0, cfg, expert_store=es)
+    moe_es = MoE(store, 0, cfg, expert_store=es, max_bf16_experts=32)
 
     torch.manual_seed(0)
     x = (torch.randn(4, cfg.dim, dtype=torch.bfloat16) * 0.02)

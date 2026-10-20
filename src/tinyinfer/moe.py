@@ -45,6 +45,22 @@ class Expert:
     def __init__(self, w1, w2, w3, swiglu_limit: float):
         self.w1, self.w2, self.w3 = w1, w2, w3
         self.swiglu_limit = swiglu_limit
+        self.fp4 = None  # optional (w1,s1,w2,s2,w3,s3) tuple: compute without bf16 dequant
+
+    def forward_fp4(self, x: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
+        """Official fp4 kernel path: fp8 activations x fp4 weights (no bf16 dequant copy)."""
+        from .gemm import fp4_linear
+
+        w1, s1, w2, s2, w3, s3 = self.fp4
+        gate = fp4_linear(x, w1, s1).float()
+        up = fp4_linear(x, w3, s3).float()
+        if self.swiglu_limit > 0:
+            up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
+            gate = torch.clamp(gate, max=self.swiglu_limit)
+        y = F.silu(gate) * up
+        if weights is not None:
+            y = weights * y
+        return fp4_linear(y.to(torch.bfloat16), w2, s2)
 
     def forward(self, x: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
         x = x.to(self.w1.dtype)
@@ -60,10 +76,13 @@ class Expert:
 
 
 class MoE:
-    def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, expert_store=None):
+    def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, expert_store=None,
+                 max_bf16_experts: int = 0):
         self.cfg = cfg
         self.layer_id = layer_id
         self._expert_store = expert_store  # optional tinyinfer.loading.ExpertStore
+        # 0 = never keep bf16 copies (production/GPU path); N>0 = bounded reference cache
+        self._max_bf16 = int(max_bf16_experts)
         self.gate = Gate(store, layer_id, cfg)
         p = f"layers.{layer_id}.ffn."
         self.shared = Expert(
@@ -94,12 +113,17 @@ class MoE:
                     dequant_fp4_block(self._store.get(p + "w3.weight"), self._store.get(p + "w3.scale")),
                     self.swiglu_limit,
                 )
+            # match the device Block.to() moved the shared expert / gate to
+            target = self.shared.w1.device
+            e.w1 = e.w1.to(target)
+            e.w2 = e.w2.to(target)
+            e.w3 = e.w3.to(target)
             self._expert_cache[i] = e
         return e
 
     def forward(self, x: torch.Tensor, image_mask: torch.Tensor | None = None) -> torch.Tensor:
         shape = x.shape
-        xf = x.view(-1, self.cfg.dim)
+        xf = x.view(-1, self.cfg.dim).to(self.shared.w1.dtype if self.shared.w1 is not None else x.dtype)
         weights, indices = self.gate.forward(xf, None if image_mask is None else image_mask.flatten())
         y = torch.zeros_like(xf, dtype=torch.float32)
         n_experts = self.cfg.n_routed_experts
@@ -108,6 +132,43 @@ class MoE:
             if counts[i].item() == 0:
                 continue
             idx, top = torch.where(indices == i)
-            y[idx] += self._expert(i).forward(xf[idx].float(), weights[idx, top, None])
+            if self._expert_store is not None:
+                if self._max_bf16 > 0:
+                    cached = self._expert_cache.get(i)
+                    if cached is not None:
+                        y[idx] += cached.forward(xf[idx].float(), weights[idx, top, None])
+                        continue
+                # production path: fetch fp4, dequant in place, drop the bf16 copy right away
+                with self._expert_store.experts(self.layer_id, [i]) as recs:
+                    rec = recs[0]
+                    target = self.shared.w1.device
+                    # fp4 kernels only pay off for larger M (official measurements: M=64+);
+                    # decode-sized groups use GPU dequant into bf16 instead
+                    use_fp4_kernel = target.type == "cuda" and xf.shape[0] >= 32
+                    if use_fp4_kernel:
+                        w1 = rec.tensor("w1.weight").to(target)
+                        s1 = rec.tensor("w1.scale").to(target)
+                        w2 = rec.tensor("w2.weight").to(target)
+                        s2 = rec.tensor("w2.scale").to(target)
+                        w3 = rec.tensor("w3.weight").to(target)
+                        s3 = rec.tensor("w3.scale").to(target)
+                        e = Expert(None, None, None, self.swiglu_limit)
+                        e.fp4 = (w1, s1, w2, s2, w3, s3)
+                    else:
+                        def _dq(name):
+                            w = rec.tensor(name + ".weight")
+                            s = rec.tensor(name + ".scale")
+                            return dequant_fp4_block(w, s)
+                        e = Expert(_dq("w1"), _dq("w2"), _dq("w3"), self.swiglu_limit)
+                    if use_fp4_kernel:
+                        y[idx] += e.forward_fp4(xf[idx], weights[idx, top, None]).float()
+                    else:
+                        y[idx] += e.forward(xf[idx].float(), weights[idx, top, None])
+                if self._max_bf16 > 0:
+                    if len(self._expert_cache) >= self._max_bf16:
+                        self._expert_cache.pop(next(iter(self._expert_cache)))
+                    self._expert_cache[i] = e
+            else:
+                y[idx] += self._expert(i).forward(xf[idx].float(), weights[idx, top, None])
         y += self.shared.forward(xf.float())
         return y.to(x.dtype).view(shape)
