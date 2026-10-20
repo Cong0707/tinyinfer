@@ -12,7 +12,7 @@ BASE = f"https://hf-mirror.com/{REPO}/resolve/main/"
 API = f"https://hf-mirror.com/api/models/{REPO}?blobs=true"
 DEST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cache", "weights")
 LOG = os.path.join(DEST, "download_repo.log")
-WORKERS = 6
+WORKERS = 10
 SMALL = 20 * 1024 * 1024
 
 def log(msg):
