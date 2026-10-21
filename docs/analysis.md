@@ -383,3 +383,22 @@ token-by-token reference exactly, rel 0.000000) stays the default; `chunk=4` is 
 for callers who want the 1.58x and accept that difference. This is the honest state of
 the 8x prefill goal: the wall is semantics, not speed.
 
+
+### Important distinction: the default path already chunks
+
+`generate()` prefills with `prefill_chunk` (8 from the planner), i.e. a short prompt goes
+through one s<=8 block, and it produces the correct answer (Paris, measured repeatedly).
+The 0.5% relative logit difference a chunk introduces therefore usually does not change the
+top-1 token: it only shows up as an argmax flip when the top-2 are within ~1 logit of each
+other (the 4-token probe prompt is such a case, top-2 0.75 apart).
+
+So the accurate statement is:
+
+- chunk=1 is the *exactly reference-matching* path (rel 0.000000 vs token-by-token),
+- the default chunked path is ~0.5%/layer off that reference but keeps the answer,
+- `TI_PREFILL_CHUNK=1` forces the exact path when a caller needs it.
+
+That means prefill is already 1.6x faster than the exact path in the default configuration,
+and closing the remaining 0.5% (deterministic s>1 reductions + compressor block alignment)
+is what would make it both fast and exact.
+
