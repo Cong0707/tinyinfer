@@ -111,3 +111,8 @@ after hours of repeated sweeps, so late measurements are disk-bound, not code-bo
   so the remaining suspect is state shared across rows inside the batch (slot/record
   reuse), not arithmetic.
 
+
+- OpenAI-compatible `/v1/completions` and `/v1/chat/completions` verified end to end
+  (server up, request, well-formed `choices`/`usage` response). One request at a time,
+  since the engine keeps a single KV session.
+

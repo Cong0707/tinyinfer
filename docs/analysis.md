@@ -75,3 +75,15 @@ attention/expert/gate/hc, 0.87% on compressed layers) confirm it does. So the
 off-topic-ish output is the checkpoint's behaviour, not an engine defect; a chat
 alignment (or the chat variant of the weights) is what would change it.
 
+
+## 6. Multi-row expert batches (open)
+
+With eight identical rows a batched MoE call matches eight single-row calls exactly; with
+distinct rows it does not (layer 0, up to ~70% of the output range). Each component was
+then checked in isolation on real weights: layer-0 attention 0.000000, gate weights and
+indices identical, activation quantisation bit-identical, `gemv_fp4_m8` vs `gemv_fp4_pq`
+0.000000 on expert 34's real w1/w2/w3. The difference therefore lives in how rows share
+state inside the batch (slot/record reuse in the serve loop), not in arithmetic. The
+single-row path is what decode uses, which is why answers are unaffected, and it is the
+default; the batch kernel is opt-in (`TI_MULTIROW_GEMV=1`).
+
