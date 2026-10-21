@@ -19,6 +19,8 @@
 | GLOSSARY.md | the project's terms (slab, ring, slot, record, tier, ...) |
 | PHILOSOPHY.md | why the project is shaped the way it is |
 | PERFORMANCE.md | one-page performance summary |
+| OPERATIONS.md | runbook: start, monitor, failure modes, resource budget |
+| EXTENDING.md | adding models, operators, endpoints; changing the planner |
 
 ## Reading order
 
