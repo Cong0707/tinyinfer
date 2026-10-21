@@ -62,10 +62,8 @@ def main() -> None:
     print(f"engram: {'on' if eng.hashes is not None else 'off'} layers={eng.cfg.engram_layer_ids}", flush=True)
 
     ids = tok.encode("Hello") if tok is not None else [1, 2, 3]
-    t0 = time.time()
-    eng.forward(torch.tensor([ids], device="cuda"), 0)
-    torch.cuda.synchronize()
-    print(f"prefill {len(ids)} tok: {time.time()-t0:.2f}s", flush=True)
+    # generate() runs its own prefill; a separate forward() here would replay the
+    # prefill on top of existing KV (shared compressed state resets mid-sequence).
     t0 = time.time()
     out = eng.generate(ids, max_new_tokens=n_tokens, temperature=0.0)
     torch.cuda.synchronize()
