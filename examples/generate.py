@@ -13,7 +13,8 @@ from tinyinfer.engine import Engine
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
-    ap.add_argument("--prompt", default="The capital of France is")
+    # question-shaped: the base model answers these sensibly (docs/faq.md)
+    ap.add_argument("--prompt", default="Question: What is the capital of France?\nAnswer:")
     ap.add_argument("--new-tokens", type=int, default=16)
     args = ap.parse_args()
 
