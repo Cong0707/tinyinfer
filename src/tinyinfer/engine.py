@@ -104,6 +104,10 @@ class Engine:
             self.gpu_layers = hw.gpu_layers
             self.head_gpu = not hw.head_on_cpu
             self.prefill_chunk = hw.prefill_chunk
+            # placement: while most layers stream, small activations round-trip every
+            # op; keep HC-style tiny ops on the host (big-VRAM boxes stay all-GPU).
+            from .placement import small_op_on_cpu
+            self.small_ops_on_cpu = small_op_on_cpu(self.gpu_layers, self.max_layers)
         self._blocks: dict[int, Block] = {}
         self._last_routing: dict[int, list[int]] = {}
         self.enable_prefetch = True
@@ -179,6 +183,7 @@ class Engine:
             b = Block(self.store, layer_id, self.cfg, expert_store=self.expert_store,
                       quant=self.tier.keep_weights_quantized, hashes=self.hashes,
                       cache_wo_a=self.cache_wo_a, expert_topk=self.tier.expert_topk)
+            b.hc_post_on_cpu = getattr(self, "small_ops_on_cpu", False)
             if layer_id < self.gpu_layers and self.device != "cpu":
                 b.to(self.device)
             self._blocks[layer_id] = b
@@ -334,6 +339,7 @@ class Engine:
             blk = Block(self.store, layer_id, self.cfg, expert_store=self.expert_store,
                         quant=self.tier.keep_weights_quantized, hashes=None,
                         expert_topk=self.tier.expert_topk)
+            blk.hc_post_on_cpu = getattr(self, "small_ops_on_cpu", False)
             blk.to(self.device)
             pair.append(blk)
         return pair[layer_id % 2]
