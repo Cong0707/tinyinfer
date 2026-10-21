@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from tinyinfer.compressor import Compressor, Indexer, select_candidate_blocks, shared_attn
+from conftest import model_dir
 from tinyinfer.config import TinyConfig
 from tinyinfer.nn import precompute_freqs_cis
 
@@ -21,7 +22,7 @@ class FakeStore:
 
 
 def make_cfg():
-    return TinyConfig.from_hf(ROOT / "cache" / "weights")
+    return TinyConfig.from_hf(model_dir())
 
 
 def make_store(cfg, layer_id=2, seed=0):

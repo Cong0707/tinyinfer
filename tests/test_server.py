@@ -17,6 +17,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from conftest import model_dir
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
@@ -1066,7 +1068,7 @@ def test_tool_choice_none_disables_extraction():
 # Optional: real L0 weights end-to-end (set TINYINFER_L0=1 to enable)
 # ---------------------------------------------------------------------------
 
-L0_DIR = ROOT / "cache" / "weights"
+L0_DIR = model_dir()
 L0_READY = (
     (L0_DIR / "model-00003-of-00048.safetensors").is_file()
     and (L0_DIR / "model-00002-of-00048.safetensors").is_file()
