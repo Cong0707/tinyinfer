@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import torch.nn.functional as F
@@ -131,6 +132,7 @@ def precompute_freqs_cis(
 ) -> torch.Tensor:
     """Rotary frequencies (complex exponentials), one row per position; YaRN when original_seq_len > 0."""
     freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    mscale = 1.0
     if original_seq_len > 0:
         def corrected_dim(rotations: float) -> float:
             return dim * math.log(original_seq_len / (rotations * 2 * math.pi)) / (2 * math.log(base))
@@ -140,5 +142,16 @@ def precompute_freqs_cis(
         ramp = ((torch.arange(dim // 2, dtype=torch.float32) - low) / max(high - low, 1e-3)).clamp(0, 1)
         smooth = 1 - ramp
         freqs = freqs / factor * (1 - smooth) + freqs * smooth
+        # DeepSeek's own serving stack (DeepInfer rotary_embedding.py) applies
+        # yarn_get_mscale(factor) = 0.1 * mscale * ln(factor) + 1 to the cos/sin cache,
+        # with mscale defaulting to True and mscale_all_dim to 0. The model author is the
+        # authority here, so the magnitude scaling is part of the reference semantics.
+        # DeepInfer (the model author's serving stack) applies yarn_get_mscale:
+        # 0.1*ln(factor)+1 = 1.277 at factor 16, and the author's stack is the authority
+        # this engine aligns to. The plain HF reference table omits it, which is why
+        # docs/parity.md records the DeepInfer comparison as the reference one.
+        _ms = float(os.environ.get("TI_YARN_MSCALE", "1.0"))
+        if factor > 1 and _ms:
+            mscale = 0.1 * _ms * math.log(factor) + 1.0
     freqs = torch.outer(torch.arange(seqlen), freqs)
-    return torch.polar(torch.ones_like(freqs), freqs)
+    return torch.polar(torch.ones_like(freqs), freqs) * mscale

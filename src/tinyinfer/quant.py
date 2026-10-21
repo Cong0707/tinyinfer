@@ -43,8 +43,18 @@ def dequant_fp8_block(weight: torch.Tensor, scale: torch.Tensor, block: int = 32
         try:
             from .dequant_kernel import dequant_fp8
             return dequant_fp8(weight, scale)
-        except Exception:
-            pass
+        except Exception as _exc:
+            # a silent fallback here allocates the fp32 reshape (128MB for wo_a) every
+            # token; surface it once so an OOM below is attributable
+            global _DEQUANT_WARNED
+            try:
+                _DEQUANT_WARNED
+            except NameError:
+                _DEQUANT_WARNED = False
+            if not _DEQUANT_WARNED:
+                print(f"[tinyinfer] dequant fast path unavailable ({_exc!r}); using torch",
+                      flush=True)
+                _DEQUANT_WARNED = True
     out_features, in_features = weight.shape
     bo, bi = out_features // block, in_features // block
     s = e8m0_to_float(scale)[:bo, :bi]

@@ -21,6 +21,11 @@ import torch.nn.functional as F
 class Engine:
     @classmethod
     def from_hf(cls, source: str | Path, **kwargs) -> "Engine":
+        # TI_TIER lets a caller pick the optimisation level without touching code
+        import os as _os
+
+        if "tier" not in kwargs and _os.environ.get("TI_TIER"):
+            kwargs["tier"] = OptLevel(int(_os.environ["TI_TIER"]))
         """Load directly from a HF repo id / hub snapshot / flat checkpoint dir.
 
         This is the canonical entry point: no per-deployment model-dir plumbing.
@@ -33,7 +38,7 @@ class Engine:
         self,
         adapter: ModelAdapter | str,
         *,
-        tier: OptLevel | TierConfig = OptLevel.BALANCED,
+        tier: OptLevel | TierConfig = OptLevel.AGGRESSIVE,
         expert_store=None,
         max_layers: int | None = None,
         allow_missing_layers: bool = False,
@@ -50,15 +55,40 @@ class Engine:
         self.adapter = open_adapter(adapter) if isinstance(adapter, str) else adapter
         self.cfg = self.adapter.load_config()
         self.store = self.adapter.store
-        # hardware-derived plan (VRAM/RAM budget -> resident layers, slots, cache, chunk)
-        from .resources import plan as _hw_plan
-        self.hw_plan = _hw_plan(None, self.cfg.n_layers) if device != "cpu" else None
-        if self.hw_plan is not None:
-            print(f"[tinyinfer] {self.hw_plan.reason}", flush=True)
+        # tier first: the hardware plan reserves MTP when the tier enables speculation
         if isinstance(tier, str):
             from .tiers import plan as _tier_plan
             tier = _tier_plan(OptLevel[tier.upper()])
         self.tier = plan(tier) if isinstance(tier, OptLevel) else tier
+        _topk = int(__import__("os").environ.get("TI_TOPK", "0"))
+        if _topk > 0:
+            self.tier.expert_topk = _topk
+        # The streaming ring, the resident layers and the attention temporaries are
+        # allocated and freed at very different lifetimes; on a card this close to full
+        # the allocator's default segmenting leaves 0 free bytes even when the total is
+        # under capacity. expandable segments lets PyTorch unmap rather than fragment.
+        import os as _os2
+        _os2.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        # hardware-derived plan (VRAM/RAM budget -> resident layers, slots, cache, chunk)
+        from .resources import model_profile as _model_profile
+        from .resources import plan as _hw_plan
+        if device != "cpu":
+            # measure the checkpoint: per-layer / expert / embed / head bytes come from
+            # the safetensors headers, so the solver multiplies real numbers instead of
+            # a table tuned for one model on one card
+            try:
+                from .loading import ShardIndex
+
+                _prof = _model_profile(ShardIndex(self.store.model_dir))
+            except Exception:
+                _prof = None
+            # speculation reserves its draft stages up front (tier 2 is the default)
+            self.hw_plan = _hw_plan(None, self.cfg.n_layers, model=_prof,
+                                    speculation=bool(getattr(self.tier, "mtp", False)))
+        else:
+            self.hw_plan = None
+        if self.hw_plan is not None:
+            print(f"[tinyinfer] {self.hw_plan.reason}", flush=True)
         if expert_store is None and self.tier.level >= OptLevel.BALANCED:
             # production tiers own their ExpertStore (RAM cache + VRAM slots)
             try:
@@ -74,11 +104,24 @@ class Engine:
                 hw = self.hw_plan
                 _slots = int(__import__("os").environ.get(
                     "TI_SLOTS", hw.expert_slots if hw is not None else 96))
+                from .budget import budget as _host_budget
+                _hb_room = _host_budget().room()
+                _plan_cache = (hw.cache_bytes if hw is not None
+                               else min(16 << 30, max(512 << 20, cache_budget)))
+                # leave the majority of what is left to the pinned layer slab, which
+                # _flat_setup requests later: 45% here, the rest there
+                # The layer slab asks for its bytes AFTER this, so the cache may only
+                # take a minority of what is free or the box starts paging to C: and
+                # every read turns into a swap-in (observed: 9.3s/token).
+                _cache_bytes = max(192 << 20, min(_plan_cache, int(_hb_room * 0.35)))
                 self.expert_store = ExpertStore.from_store(
                     self.store,
-                    reader_threads=12,
-                    cache_bytes=min(16 << 30, max(512 << 20, cache_budget)) if hw is None else hw.cache_bytes,
-                    policy="arc",
+                    slot_arena=bool(getattr(self.tier, "slot_arena", False)),
+                    # parallel reads saturate the device around QD=8-16; scale with the
+                    # core count instead of pinning a machine-specific thread count
+                    reader_threads=min(16, max(4, (__import__("os").cpu_count() or 8))),
+                    cache_bytes=_cache_bytes,
+                    policy=__import__("os").environ.get("TI_CACHE_POLICY", "arc"),
                     vram_slots=_slots if device != "cpu" else 0,
                     device=device if device != "cpu" else "cpu",
                     # direct=NO_BUFFERING reads: measured 6.3GB/s at 6 threads vs
@@ -121,6 +164,13 @@ class Engine:
             # the whole layer (measured: 4 x 150ms x 38 layers = 24s of a 29s forward).
             self.small_ops_on_cpu = (small_op_on_cpu(self.gpu_layers, self.max_layers)
                                      and __import__("os").environ.get("TI_HC_GPU") != "1")
+        if self.device != "cpu" and self.tier.level < OptLevel.AGGRESSIVE:
+            # Reference-project behaviour: put the whole model on the device and let the
+            # allocator decide. No streaming, no partial residency, no refusal -- if it
+            # does not fit, the OOM is the answer (the same one vLLM would give).
+            self.gpu_layers = self.max_layers
+            print(f"[tinyinfer] tier {self.tier.level.name}: all {self.max_layers} layers "
+                  f"resident (no streaming)", flush=True)
         self._blocks: dict[int, Block] = {}
         self._last_routing: dict[int, list[int]] = {}
         # expert prefetch is opt-in: with the RAM cache holding ~600 of 15360 experts
@@ -144,12 +194,59 @@ class Engine:
                     self.hashes = EngramHashes(self.cfg, tokenizer)
                 except Exception as e:  # weighted table missing / tokenizer mismatch: run without engram
                     print(f"[tinyinfer] engram disabled: {e}")
-        self.embed = self.store.get("embed.weight").to(device)
+        # The embedding table is 1.32GB of VRAM for a 10KB row lookup per token. On a
+        # card that cannot hold every layer it is pure waste: keeping it in host RAM
+        # frees enough for two resident layers plus the expert staging pool.
+        # TI_EMBED_GPU=1 forces the old behaviour (table in VRAM); it is the escape hatch
+        # when a new heuristic regresses a machine that used to run.
+        # Tensor parallel: one process holds every rank as a thread in Flare; here the
+        # caller launches one process per rank and we join the default process group.
+        self.tp = None
+        self.tp_ranks = int(getattr(self.tier, "tp_ranks", 1) or 1)
+        if self.tp_ranks > 1 and device != "cpu":
+            import os as _os
+
+            import torch.distributed as _dist
+
+            if not (_dist.is_available() and _dist.is_initialized()):
+                _dist.init_process_group(
+                    backend="nccl",
+                    rank=int(_os.environ.get("RANK", "0")),
+                    world_size=self.tp_ranks,
+                )
+            from .tp import Shard
+
+            self.tp = Shard(_dist.get_rank(), self.tp_ranks)
+            print(f"[tinyinfer] tensor parallel rank {self.tp.rank}/{self.tp.world}", flush=True)
+        self.embed_on_cpu = bool(getattr(self.hw_plan, "embed_on_cpu", False)) or device == "cpu"
+        if __import__("os").environ.get("TI_EMBED_GPU") == "1":
+            self.embed_on_cpu = False
+        _emb = self.store.get("embed.weight")
+        self.embed = _emb if self.embed_on_cpu else _emb.to(device)
         self.out_norm = self.store.get("norm.weight").to(device)
         # the 1.3GB output head: off-VRAM it costs ~40ms/token but frees 1.3GB
         self.head_on_cpu = device != "cpu" and not self.head_gpu
         self.head = self.store.get("head.weight") if self.head_on_cpu else self.store.get("head.weight").to(device)
         self.eps = self.cfg.rms_norm_eps
+        # Tier >= 2 serves with speculation: load the DSpark stages now so the first
+        # request does not pay for them. A missing/incompatible set disables MTP for
+        # the session instead of failing the engine.
+        _mtp_ok = bool(getattr(self.tier, "mtp", False)) and bool(
+            getattr(self.hw_plan, "speculation", True))
+        if __import__("os").environ.get("TI_MTP") == "1":
+            # force the draft stages on even when the plan says they do not fit: used to
+            # measure the accept rate on a card the planner keeps them off for
+            _mtp_ok = True
+        if getattr(self.tier, "mtp", False) and not _mtp_ok:
+            print("[tinyinfer] MTP off: the draft stages do not fit beside the streaming "
+                  "ring on this card (see the plan above)", flush=True)
+        if _mtp_ok and device != "cpu":
+            try:
+                if self.load_mtp():
+                    print("[tinyinfer] MTP draft stages loaded (tier %s)" % self.tier.level.name,
+                          flush=True)
+            except Exception as exc:
+                print(f"[tinyinfer] MTP unavailable: {exc}", flush=True)
 
     # -- residency ---------------------------------------------------------
     def available_layers(self) -> int:
@@ -159,6 +256,9 @@ class Engine:
         downloading; loading such a shard segfaults inside CUDA. Compare the file
         size against header + max data offset instead.
         """
+        cached = getattr(self, "_avail_layers", None)
+        if cached is not None:
+            return cached
         import json
         import struct
 
@@ -191,6 +291,10 @@ class Engine:
             if not all(shard_complete(s) for s in shards):
                 break
             n = i + 1
+        # Parsing every shard header costs ~10ms each and this is called on every
+        # forward: 40 headers = 0.35s per decode step (cProfile). The set of layers on
+        # disk does not change during a run.
+        self._avail_layers = n
         return n
 
     def _rt_for(self, layer_id: int):
@@ -223,8 +327,15 @@ class Engine:
             b = Block(self.store, layer_id, self.cfg, expert_store=self.expert_store,
                       quant=self.tier.keep_weights_quantized, hashes=self.hashes,
                       cache_wo_a=self.cache_wo_a, expert_topk=self.tier.expert_topk,
-                      rt=self._rt_for(layer_id))
+                      rt=self._rt_for(layer_id), tp=getattr(self, "tp", None))
             b.hc_post_on_cpu = getattr(self, "small_ops_on_cpu", False)
+            ffn = getattr(b, "ffn", None)
+            if ffn is not None:
+                ffn._async_fetch = bool(getattr(self.tier, "async_expert_fetch", False))
+                ffn._batched_scatter = bool(getattr(self.tier, "batched_scatter", False))
+                if self.tp is not None and self.tp.world > 1:
+                    ffn.ep_world = self.tp.world
+                    ffn.ep_rank = self.tp.rank
             if layer_id < self.gpu_layers and self.device != "cpu":
                 b.to(self.device)
             self._blocks[layer_id] = b
@@ -235,12 +346,67 @@ class Engine:
 
     def reset(self) -> None:
         self._last_routing.clear()
+        # streaming completion events are keyed by layer and consumed by _flat_wait; a
+        # stale entry makes the next forward rank a buffer copy that has not landed yet
+        if hasattr(self, "_flat_ev"):
+            self._flat_ev.clear()
         if self.hashes is not None:
             self.hashes.reset()
         for b in self._blocks.values():
             if hasattr(b.attn, "reset"):
                 b.attn.reset()
+            # the compressor carries the tail of an incomplete group across chunks; if
+            # it is not cleared a second run from position 0 starts with stale scores
+            comp = getattr(b.attn, "compressor", None)
+            if comp is not None and hasattr(comp, "reset"):
+                comp.reset()
+            idx = getattr(b.attn, "indexer", None)
+            if idx is not None and hasattr(idx, "reset"):
+                idx.reset()
             b.ffn._expert_cache.clear()
+        # Streaming state is per-forward. Dropping it alone would leave every streamed
+        # block's weights pointing into a ring buffer that no longer exists, so restore
+        # the CPU references first and let the next forward rebuild the ring.
+        # per-forward caches on the shared handoff slot must not leak between sessions
+        try:
+            from .compressor import shared_attn as _sa0
+            for _attr in ("_mask_cache", "candidates_by_chunk", "candidates"):
+                if hasattr(_sa0, _attr):
+                    try:
+                        getattr(_sa0, _attr).clear()
+                    except AttributeError:
+                        setattr(_sa0, _attr, None)
+        except Exception:
+            pass
+        # Streaming state is per-session. Re-point the streamed layers at their CPU
+        # sources first (so no block holds a view into the ring), then release the pinned
+        # host grant and drop the state: a rebuild that kept the old grant ran out of
+        # budget and produced a partially initialised slab (silent numeric corruption).
+        stream = self._stream_layers()
+        for lid, b in self._blocks.items():
+            if lid in stream:
+                try:
+                    b.to("cpu")
+                except Exception:
+                    pass
+        # The slab/ring is a process-lifetime structure: rebuilding it per session leaks
+        # the pinned grant and lets the caching allocator accumulate the old GPU buffers
+        # (measured 17GB allocated on an 8GB card after three sessions). Keep it; only
+        # the completion events belong to a single forward.
+        if hasattr(self, "_flat_ev"):
+            self._flat_ev.clear()
+        if hasattr(self, "_flat_ev"):
+            self._flat_ev.clear()
+        if hasattr(self, "_flat_applies"):
+            self._flat_applies = 0
+        # inter-layer handoff slots: produced by a kv_source layer and consumed by the
+        # layers after it inside one forward. A fresh run must not inherit the previous
+        # run's compressed KV / index-K, which is what produced NaNs on a repeat prefill.
+        try:
+            from .compressor import shared_attn as _sa
+            _sa.reset()
+        except Exception:
+            pass
 
     # -- slot snapshots (multi-agent KV ownership) -------------------------
     def snapshot(self) -> dict:
@@ -336,6 +502,16 @@ class Engine:
         if st == "off":
             return False
         if st is None:
+            import os as _os
+
+            flag = _os.environ.get("TI_FLAT")
+            if flag is not None and flag != "1":
+                self._flat_state = "off"
+                return False
+            if flag is None and self.gpu_layers >= self.max_layers:
+                # every layer is resident: there is nothing to stream
+                self._flat_state = "off"
+                return False
             try:
                 self._flat_setup()
             except Exception as exc:  # pinned-pool exhaustion, OOM: stay on the old path
@@ -388,8 +564,6 @@ class Engine:
     def _flat_setup(self) -> None:
         import os
 
-        if os.environ.get("TI_FLAT", "0") != "1":
-            raise RuntimeError("TI_FLAT is opt-in (set TI_FLAT=1)")
         streamed = sorted(self._stream_layers())
         if not streamed:
             raise RuntimeError("no streamed layers")
@@ -417,40 +591,166 @@ class Engine:
         # layer k begins, and a 719MB transfer (27ms) is slower than one layer of
         # compute (~15ms), so it can never hide. Three let layer k compute while
         # k+1 and k+2 stream in.
-        bufs = [torch.empty(mx, dtype=torch.uint8, device=self.device) for _ in range(3)]
+        # ring depth is measurable: 3 hides one H2D behind compute, 2 frees a layer-sized
+        # buffer (719MB here) for one more resident layer on a card this tight
+        _ring_n = max(2, min(4, int(__import__("os").environ.get("TI_RING", "3"))))
+        bufs = [torch.empty(mx, dtype=torch.uint8, device=self.device) for _ in range(_ring_n)]
         pinned_gb = 0.0
         # Pinned budget. Pinning all 17.9GB of streamed weights starved the expert
         # cache: pinned sources are the only ones that can use async DMA, and the
         # pinned pool also has to hold the expert blobs.
-        pin_budget = int(float(__import__("os").environ.get("TI_FLAT_PIN_GB", "8")) * (1 << 30))
-        pinned_used = 0
+        from .budget import budget as _host_budget
+
+        _hb = _host_budget()
+        # Per-tensor fallback only: pin as much as the budget has left, one tensor at
+        # a time, and let the ones that do not fit stay pageable.
+        pin_budget = int(float(__import__("os").environ.get("TI_FLAT_PIN_GB", "0")) * (1 << 30))
+        if pin_budget <= 0:
+            pin_budget = min(_hb.room(), int(_hb.total * 0.36))
+        # One pinned slab for every streamed layer, laid out exactly like the device
+        # buffers, so a layer costs ONE flat H2D instead of 15-30 small copy_ calls.
+        # cProfile: the per-tensor path issued 1469 copy_ calls and burned 1.01s of a
+        # 3.45s decode step in host-side dispatch, while the pinned bytes were already
+        # resident (the slab replaces them, it does not add to them).
+        slab_total = sum(sizes[i] for i in streamed) + 512
+        # Pinning every streamed layer is not the goal; it is only worth what it saves.
+        # On a box where the weights alone are half of RAM, pin at most half of the
+        # remaining room so the page cache (and the experts) still have memory.
+        # Cap the pinned set at a share of PHYSICAL RAM, not of the volatile "room":
+        # the slab plus the expert cache plus the 17GB of streamed weights must leave
+        # the page cache alive, or the SSD drops from 4.6 to 3.1GB/s and every fetch
+        # doubles (measured: full-RAM slab -> 2.29s fetch, capped slab -> 1.47s).
+        # Fixed share of PHYSICAL RAM, not of the volatile room: the room shrinks as the
+        # model weights load, so a room-derived cap collapsed to 6.7GB and left 21 of 35
+        # layers on the slow per-tensor path. The invariant that matters is
+        # weights(17GB) + slab + expert cache <= RAM - OS, and the planner already sized
+        # the cache from the same budget, so the slab takes its share of the total.
+        _slab_cap = int(_hb.total * 0.28)
+        if slab_total > _slab_cap:
+            slab_total = _slab_cap
+        host_slab = None
+        # Ask the host budget, which re-reads what the machine actually has left right
+        # now. No flag, no per-machine constant: on a small box the grant comes back
+        # short and we fall back to per-tensor pinned copies, on a big one we get the
+        # whole slab. The slab REPLACES those copies, so the freed memory is available
+        # to the next request automatically (available() is re-read every time).
+        # One pinned block PER LAYER rather than one giant block: a single 15GB
+        # cudaHostAlloc is refused by the driver on some Windows configurations (the
+        # per-tensor fallback below pinned the same 14.9GB in small pieces), while a
+        # 468MB block always succeeds. Each block is still laid out exactly like the
+        # device buffer, so a layer is one flat H2D, which is the whole point.
+        host_map: dict[int, torch.Tensor] = {}
+        _why = "ok"
+        # One layer at a time: allocate its block, copy the weights in, point the layer
+        # at the block, then let the old pageable copy go. Allocating all blocks first
+        # holds both copies at once (+18GB) and that is what pushed this box into swap.
+        _slab_used = 0
         for i in streamed:
+            need = sizes[i]
+            if _slab_used + need > slab_total:
+                _why = (f"reached the pinned cap {slab_total/2**30:.1f}GB "
+                        f"({len(host_map)}/{len(streamed)} layers)")
+                break
+            got = _hb.grant(need)
+            if got < need:
+                _why = f"budget: wanted {need/2**20:.0f}MB got {got/2**20:.0f}MB ({_hb.stats()})"
+                break
+            _slab_used += need
+            self._slab_granted = getattr(self, "_slab_granted", 0) + need
+            try:
+                blk = torch.empty(need, dtype=torch.uint8, pin_memory=True)
+            except Exception as exc:
+                _hb.release(need)
+                _why = f"pinned alloc failed at layer {i}: {exc!r}"
+                break
             b = self.block(i)
             paths = b._weight_paths()
-            refs = []
-            for (_, _, t) in paths:
-                nbytes = t.numel() * t.element_size()
-                if (t.is_cpu and not t.is_pinned() and pinned_used + nbytes <= pin_budget):
-                    try:
-                        t = t.pin_memory()
-                        pinned_used += nbytes
-                    except Exception:
-                        pass
-                refs.append(t)
-            b._cpu_refs = refs
-            # repoint the layer at the pinned copies so the pageable originals can be
-            # freed: keeping both meant 15.9GB + 15.9GB resident, and under that pressure
-            # the pinned H2D fell from 30GB/s to 6.5GB/s (measured T=1 vs T=2)
-            for (owner, name, _), t in zip(paths, refs):
-                setattr(owner, name, t)
+            offs = lay[i][0]
+            for (owner, name, t), (o, n) in zip(paths, offs):
+                dst = blk[o:o + n].view(t.dtype).view(t.shape)
+                try:
+                    dst.copy_(t)
+                except Exception:
+                    pass
+                setattr(owner, name, dst)
+            _refs = {}
+            for (owner, name, t), (o, n) in zip(paths, offs):
+                _refs[Block._wkey(owner, name)] = blk[o:o + n].view(t.dtype).view(t.shape)
+            b._cpu_refs = _refs
             b._device = "cpu"
-            pinned_gb += sum(t.numel() * t.element_size() for t in refs if t.is_pinned()) / 2 ** 30
+            host_map[i] = blk
+            del paths, offs
             keep.append(i)
-        self._flat_state = (lay, bufs, None)
+        if len(host_map) == len(streamed):
+            pinned_gb = sum(int(v.numel()) for v in host_map.values()) / 2 ** 30
+            self._flat_state = (lay, bufs, host_map)
+            self._host_slab = host_map
+        elif host_map:
+            # Partial slab: the layers that got a block keep the one-copy fast path, the
+            # rest fall back to per-tensor pinned copies. All-or-nothing wasted the RAM
+            # that WAS available and left every layer on the slow path.
+            print(f"[tinyinfer] partial slab {len(host_map)}/{len(streamed)} layers ({_why})",
+                  flush=True)
+            pinned_gb = sum(int(v.numel()) for v in host_map.values()) / 2 ** 30
+            # the slab already consumed its share of the pinned budget; counting from
+            # zero here pinned a second full budget and took the box to its page file
+            pinned_used = int(pinned_gb * 2 ** 30)
+            for i in streamed:
+                if i in host_map:
+                    continue
+                b = self.block(i)
+                paths = b._weight_paths()
+                refs = []
+                for (_, _, t) in paths:
+                    nbytes = t.numel() * t.element_size()
+                    if (t.is_cpu and not t.is_pinned() and pinned_used + nbytes <= pin_budget):
+                        try:
+                            t = t.pin_memory()
+                            pinned_used += nbytes
+                        except Exception:
+                            pass
+                    refs.append(t)
+                # keyed the same way Block.to() keys its map, so the two stay in sync
+                b._cpu_refs = {Block._wkey(o, n): t for (o, n, _), t in zip(paths, refs)}
+                for (owner, name, _), t in zip(paths, refs):
+                    setattr(owner, name, t)
+                b._device = "cpu"
+                pinned_gb += sum(t.numel() * t.element_size() for t in refs if t.is_pinned()) / 2 ** 30
+                keep.append(i)
+            self._flat_state = (lay, bufs, host_map)
+            self._host_slab = host_map
+        else:
+            print(f"[tinyinfer] slab unavailable ({_why}); falling back to per-tensor pinned",
+                  flush=True)
+            pinned_used = 0
+            for i in streamed:
+                b = self.block(i)
+                paths = b._weight_paths()
+                refs = []
+                for (_, _, t) in paths:
+                    nbytes = t.numel() * t.element_size()
+                    if (t.is_cpu and not t.is_pinned() and pinned_used + nbytes <= pin_budget):
+                        try:
+                            t = t.pin_memory()
+                            pinned_used += nbytes
+                        except Exception:
+                            pass
+                    refs.append(t)
+                b._cpu_refs = {Block._wkey(o, n): t for (o, n, _), t in zip(paths, refs)}
+                # repoint the layer at the pinned copies so the pageable originals can be
+                # freed: keeping both meant 15.9GB + 15.9GB resident, and under that pressure
+                # the pinned H2D fell from 30GB/s to 6.5GB/s (measured T=1 vs T=2)
+                for (owner, name, _), t in zip(paths, refs):
+                    setattr(owner, name, t)
+                b._device = "cpu"
+                pinned_gb += sum(t.numel() * t.element_size() for t in refs if t.is_pinned()) / 2 ** 30
+                keep.append(i)
+            self._flat_state = (lay, bufs, None)
         self._flat_ev = {}
         self._copy_stream = torch.cuda.Stream(device=self.device)
         print(f"[tinyinfer] flat streaming: {len(keep)} layers, {mx/2**20:.0f}MBx3 VRAM, "
-              f"{pinned_gb:.1f}GB pinned source (no extra host copy)", flush=True)
+              f"{pinned_gb:.1f}GB {'slab' if host_slab is not None else 'per-tensor'} pinned source",
+              flush=True)
 
     def _flat_apply(self, layer: int, buf_idx: int) -> None:
         self._flat_applies = getattr(self, "_flat_applies", 0) + 1
@@ -458,8 +758,15 @@ class Engine:
         b = self.block(layer)
         offs, total = lay[layer]
         buf = bufs[buf_idx]
-        if host is None:  # per-tensor copies from the pinned refs Block already holds
-            for (owner, name, t), (o, n), src in zip(b._weight_paths(), offs, b._cpu_refs):
+        if __import__("os").environ.get("TI_DEBUG_FLAT"):
+            print(f"[flat] layer {layer} buf {buf_idx} slab={host is not None and layer in host}",
+                  flush=True)
+        if host is None or layer not in host:
+            # per-tensor copies from the pinned refs Block already holds (a partial
+            # slab leaves some layers on this path). _cpu_refs is keyed by (owner, name)
+            # now, not positional.
+            for (owner, name, t), (o, n) in zip(b._weight_paths(), offs):
+                src = b._cpu_refs[Block._wkey(owner, name)]
                 buf[o:o + n].view(t.dtype).view(t.shape).copy_(src, non_blocking=True)
         else:
             buf[:total].copy_(host[layer], non_blocking=True)
@@ -603,13 +910,17 @@ class Engine:
             if self.allow_missing_layers:
                 n = min(n, self.available_layers())
             layer_seq = list(range(n))
-        h = self.embed[ids]
+        _tt0 = __import__("time").perf_counter() if __import__("os").environ.get("TI_LAYER_TIME") else None
+        h = self.embed[ids.cpu()].to(self.device) if self.embed_on_cpu else self.embed[ids]
         h = h.unsqueeze(2).repeat(1, 1, self.cfg.hc_mult, 1)
         pre_mix = torch.zeros(h.size(0), h.size(1), self.cfg.hc_mult, dtype=torch.float32, device=h.device)
         pre_mix[:, :, 0] = 1.0
         hash_ids = None
         if self.hashes is not None:
+            _h0 = __import__("time").perf_counter() if _tt0 is not None else None
             hash_ids = self.hashes(ids.reshape(-1).tolist(), start_pos)
+            if _h0 is not None:
+                print(f"[time] pre-embed {( _h0 - _tt0)*1e3:.1f}ms hash {(__import__('time').perf_counter()-_h0)*1e3:.1f}ms", flush=True)
         # expert prefetch: learned CPU predictor first, temporal routing as fallback
         pred = None
         tok_now = None
@@ -640,12 +951,16 @@ class Engine:
             if streamed and self.device != "cpu":
                 if use_flat:
                     k = flat_pos[i]
-                    self._flat_wait(i, k % 3)
-                    for d in (1, 2):
+                    # ring size is dynamic: an OOM shed may have shrunk it, so wrap by
+                    # the live length instead of a hard-coded 3
+                    _ring = len(self._flat_state[1]) if isinstance(self._flat_state, tuple) else 1
+                    _ring = max(1, _ring)
+                    self._flat_wait(i, k % _ring)
+                    for d in range(1, _ring):
                         if k + d < len(flat_seq):
                             nxt = flat_seq[k + d]
                             if nxt not in self._flat_ev:
-                                self._flat_prefetch(nxt, (k + d) % 3)
+                                self._flat_prefetch(nxt, (k + d) % _ring)
                     if k + 2 < len(flat_seq) and self.enable_prefetch:
                         # RAM prefetch two layers ahead: the read has ~2 layers of compute
                         # time to land, and it never touches the VRAM slot pool
@@ -678,18 +993,41 @@ class Engine:
                 ev0 = torch.cuda.Event(enable_timing=True)
                 ev0.record()
             if b.engram is not None and hash_ids is not None:
+                _e0 = __import__("time").perf_counter() if __import__("os").environ.get("TI_LAYER_TIME") else None
                 h = b.engram.forward(h, hash_ids[b.engram.hash_index])
+                if _e0 is not None:
+                    print(f"[time] layer {i} engram {(__import__('time').perf_counter()-_e0)*1e3:.1f}ms", flush=True)
             # official (reference/official/model.py:1267): the MTP head reads the *input* of
             # its target layers, hc-collapsed by a plain mean -- not the attn_norm output
             # and not the attention input. Captured before forward() overwrites h.
+            _lt0 = __import__("time").perf_counter() if __import__("os").environ.get("TI_LAYER_TIME") else None
+            if __import__("os").environ.get("TI_MEM_TRACE"):
+                print(f"[mem] layer {i:2d} before alloc={torch.cuda.memory_allocated()/2**20:.0f}MB "
+                      f"reserved={torch.cuda.memory_reserved()/2**20:.0f}MB", flush=True)
             h_in = h
-            h, pre_mix = b.forward(h, start_pos, pre_mix)
+            try:
+                h, pre_mix = b.forward(h, start_pos, pre_mix)
+            except Exception:
+                print(f"[layer-fail] layer {i} streamed={streamed} use_flat={use_flat} "
+                      f"device={getattr(b, '_device', '?')} "
+                      f"hc_fn={getattr(b, 'hc_attn_fn', None) is not None and b.hc_attn_fn.device}",
+                      flush=True)
+                raise
+            if __import__("os").environ.get("TI_DEBUG_NAN"):
+                _fin = bool(torch.isfinite(h).all())
+                if (not _fin) or __import__("os").environ.get("TI_DEBUG_NAN") == "all":
+                    print(f"[dbg] layer {i:2d} finite={_fin} absmax={float(h.abs().max()):.2f}",
+                          flush=True)
             if i in self._target_layers:
                 self._target_hidden[i] = h_in.mean(dim=2).detach()
             if self.profile:
                 ev1 = torch.cuda.Event(enable_timing=True)
                 ev1.record()
                 events.append((i, ev0, ev1))
+            if _lt0 is not None:
+                _lt1 = __import__("time").perf_counter()
+                print(f"[time] layer {i} total {(_lt1-_lt0)*1e3:.1f}ms "
+                      f"streamed={streamed} use_flat={use_flat}", flush=True)
             if b.ffn._last_ids:
                 self._last_routing[i] = b.ffn._last_ids
             if streamed and self.device != "cpu" and not use_flat:
@@ -697,6 +1035,21 @@ class Engine:
         if self.predictor is not None and tok_now is not None and self._last_routing:
             self.predictor.observe(tok_now, dict(self._last_routing))
         self._last_hidden = h  # [1, T, hc, dim] before collapse (MTP main hidden)
+        # official DSparkBlock.forward: at start_pos == 0 a draft stage only *seeds* its
+        # main-KV window (attn(x, 0, main_x)); without this the draft attends over an
+        # empty window and its predictions are noise (measured accept 3% instead of ~50%)
+        if start_pos == 0 and getattr(self, "mtp", None) is not None:
+            try:
+                _th = sorted(getattr(self, "_target_hidden", {}) or {})
+                _want = list(self.cfg.dspark_target_layer_ids)
+                if len(_th) >= len(_want):
+                    _mx = self.mtp[0].main_hiddens([self._target_hidden[k] for k in _th])
+                    for _st in self.mtp:
+                        _seed = _mx.new_zeros(1, self.cfg.dspark_block_size, self.cfg.dim)
+                        _st.attn.forward_with_main(_seed, 0, _mx)
+            except Exception as _exc:
+                print(f"[tinyinfer] MTP seed skipped: {_exc!r}", flush=True)
+        self._last_pre_mix = pre_mix  # exact HC mixing used for the collapse
         if self.profile:
             torch.cuda.synchronize()
             self._timings = [(i, a.elapsed_time(b)) for i, a, b in events]
@@ -748,7 +1101,7 @@ class Engine:
         acts = []
         for off in range(0, T, step):
             chunk_ids = ids[:, off:off + step]
-            h = self.embed[chunk_ids]
+            h = self.embed[chunk_ids.cpu()].to(self.device) if self.embed_on_cpu else self.embed[chunk_ids]
             h = h.unsqueeze(2).repeat(1, 1, self.cfg.hc_mult, 1)
             pre_mix = torch.zeros(h.size(0), h.size(1), self.cfg.hc_mult, dtype=torch.float32, device=h.device)
             pre_mix[:, :, 0] = 1.0
@@ -793,12 +1146,166 @@ class Engine:
             h = h.cpu()
         return torch.nn.functional.linear(h, self.head).float()
 
+    # -- VRAM pressure + CUDA graph + prefix checkpoints ---------------------
+    def _shed_vram(self) -> None:
+        """Give memory back after an OOM: shrink the streaming ring, drop the slot pool."""
+        st = getattr(self, "_flat_state", None)
+        if st is not None and st != "off":
+            ring = list(st[1])
+            if len(ring) > 2:
+                # keep the two buffers decode needs and actually release the rest: a
+                # shorter list alone does not give the VRAM back
+                keep = ring[:2]
+                dropped = ring[2:]
+                self._flat_state = (st[0], keep, st[2])
+                for buf in dropped:
+                    del buf
+                print(f"[tinyinfer] CUDA OOM: streaming ring 3 -> {len(keep)} buffers "
+                      f"(released {len(dropped)})", flush=True)
+        try:
+            if getattr(self, "expert_store", None) is not None:
+                self.expert_store.drop_slots()
+        except Exception:
+            pass
+        if self.device != "cpu":
+            torch.cuda.empty_cache()
+
+    def _graph_capture_shape(self, ids: torch.Tensor, start_pos: int) -> bool:
+        if not getattr(self.tier, "cuda_graph", False):
+            return False
+        if self.device == "cpu" or ids.shape[1] != 1:
+            return False
+        if self.gpu_layers < self.max_layers:
+            return False
+        if getattr(self, "mtp", None) is not None:
+            return False
+        return True
+
+    def _graph_run(self, ids: torch.Tensor, start_pos: int):
+        g = getattr(self, "_graph", None)
+        if g is None or start_pos != getattr(self, "_graph_start_pos", -1):
+            return None
+        out = g["out"]
+        if out.shape[0] != ids.shape[0]:
+            return None
+        g["in"].copy_(ids)
+        g["graph"].replay()
+        return out.clone()
+
+    def _graph_try_capture(self, ids: torch.Tensor, start_pos: int) -> None:
+        if getattr(self, "_graph", None) is not None or getattr(self, "_graph_failed", False):
+            return
+        if not self._graph_capture_shape(ids, start_pos):
+            return
+        try:
+            snap = self.snapshot()
+            try:
+                in_buf = ids.clone()
+                self._forward_impl(in_buf, start_pos, None)
+                torch.cuda.synchronize()
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    out = self._forward_impl(in_buf, start_pos, None)
+                torch.cuda.synchronize()
+            finally:
+                self.restore(snap)
+            self._graph = {"graph": g, "in": in_buf, "out": out, "start_pos": start_pos}
+            self._graph_start_pos = start_pos
+            print(f"[tinyinfer] decode CUDA graph captured at pos={start_pos}", flush=True)
+        except Exception as exc:
+            self._graph_failed = True
+            self._graph = None
+            print(f"[tinyinfer] CUDA graph unavailable ({exc!r}); eager decode", flush=True)
+
+    def warm_graph_catalog(self) -> None:
+        caps = list(getattr(self.tier, "graph_catalog", ()) or ())
+        if not caps or self.device == "cpu":
+            return
+        ids = torch.tensor([[self.cfg.bos_token_id or 0]], device=self.device)
+        for cap in caps:
+            try:
+                self._forward_impl(ids.repeat(1, min(int(cap), 8)), 0, None)
+            except Exception:
+                continue
+            break
+
+    def save_checkpoint(self, path) -> dict:
+        import os as _os
+
+        if not getattr(self.tier, "prefix_checkpoint", False):
+            raise RuntimeError("prefix checkpoints are a tier-2 mechanism "
+                               f"(current tier {self.tier.level.name})")
+        snap = self.snapshot()
+        tmp = str(path) + ".tmp"
+        torch.save(snap, tmp)
+        _os.replace(tmp, str(path))
+        return {"path": str(path), "bytes": _os.path.getsize(str(path))}
+
+    def load_checkpoint(self, path) -> None:
+        if not getattr(self.tier, "prefix_checkpoint", False):
+            raise RuntimeError("prefix checkpoints are a tier-2 mechanism "
+                               f"(current tier {self.tier.level.name})")
+        self.restore(torch.load(str(path), map_location=self.device, weights_only=False))
+
+    def resample_from_hidden(self, hidden=None, temperature: float = 0.0):
+        from .nn import rms_norm as _rms
+        from .nn import sample_logits as _sample
+
+        if not getattr(self.tier, "resume_sampling", False):
+            raise RuntimeError("resume sampling is a tier-2 mechanism "
+                               f"(current tier {self.tier.level.name})")
+        h = self._last_hidden if hidden is None else hidden
+        if h is None:
+            raise RuntimeError("no hidden state to sample from")
+        if h.dim() == 4:
+            pm = getattr(self, "_last_pre_mix", None)
+            if pm is not None and pm.shape[:2] == h.shape[:2]:
+                y = (pm.unsqueeze(-1) * h.float()).sum(dim=2)
+            else:
+                y = h.float().mean(dim=2)
+        else:
+            y = h.float()
+        y = _rms(y.to(self.out_norm.dtype), self.out_norm, self.eps)
+        if self.head_on_cpu:
+            logits = torch.nn.functional.linear(y.cpu().to(self.head.dtype), self.head).float().to(y.device)
+        else:
+            logits = torch.nn.functional.linear(y.to(self.head.dtype), self.head).float()
+        return int(_sample(logits[0, -1], temperature))
+
     def forward(self, ids: torch.Tensor, start_pos: int = 0, chunk: int | None = None):
+        """Decode/prefill entry point: CUDA graph replay when captured, else the OOM ladder."""
+        for attempt in range(3):
+            try:
+                if start_pos > 0 and chunk is None:
+                    hit = self._graph_run(ids, start_pos)
+                    if hit is not None:
+                        return hit
+                    self._graph_try_capture(ids, start_pos)
+                return self._forward_impl(ids, start_pos, chunk)
+            except Exception as exc:
+                # torch raises OutOfMemoryError, while some CUDA paths surface a plain
+                # RuntimeError whose text says "out of memory"; both are handled the same
+                oom = isinstance(exc, torch.OutOfMemoryError) or "out of memory" in str(exc).lower()
+                if attempt == 2 or not oom:
+                    raise
+                print(f"[tinyinfer] CUDA OOM: shedding VRAM (attempt {attempt + 1})", flush=True)
+                self._shed_vram()
+        raise RuntimeError("unreachable")
+
+    def _forward_impl(self, ids: torch.Tensor, start_pos: int = 0, chunk: int | None = None):
         """Chunked prefill: KV/hash state carries across chunks (attention uses start_pos)."""
         if ids.device.type != self.device and self.device != "cpu":
             ids = ids.to(self.device)
         b, T = ids.shape
         step = chunk or self.prefill_chunk
+        # Measured on this card: a 63-token prompt at chunk=8 runs the allocator past
+        # physical VRAM (17GB "allocated" through WDDM shared memory) and OOMs, while the
+        # same prompt at chunk=1 completes. Long prompts therefore step through in small
+        # pieces; short ones keep the fast chunk. The growth is per-layer and linear in
+        # the chunk length, so 16 is a safe bound below the blow-up.
+        if chunk is None and T > 16:
+            step = max(1, min(step, 16 // max(1, T // 16)))
+            step = max(1, step)
         if T <= step:
             return self._forward_chunk(ids, start_pos)
         logits = None
@@ -973,6 +1480,9 @@ class Engine:
     def generate(self, prompt_ids, max_new_tokens: int = 16, temperature: float = 0.0, eos_token_id=None,
                  top_p: float = 1.0, top_k: int = 0):
         """Greedy/sampled generation loop (prefill once, then decode step by step)."""
+        # a generation starts from a clean session: leftover KV from a previous call
+        # makes the first step read stale state (observed as a first-token failure)
+        self.reset()
         ids = list(prompt_ids)
         with torch.inference_mode():
             logits = self.forward(torch.tensor([ids], device=self.device), 0)
@@ -983,12 +1493,18 @@ class Engine:
                 # (measured 11498MB reserved, 0.10 tok/s). Hand them back to the driver.
                 torch.cuda.empty_cache()
             out = []
+            import time as _t
+            _t0 = _t.perf_counter()
             for step in range(max_new_tokens):
                 nid = int(sample_logits(logits[0, -1], temperature, top_p, top_k))
                 out.append(nid)
                 if eos_token_id is not None and nid == eos_token_id:
                     break
                 logits = self.forward(torch.tensor([[nid]], device=self.device), start_pos=len(ids) + step)
+                if __import__("os").environ.get("TI_TIME"):
+                    _t1 = _t.perf_counter()
+                    print(f"  decode {step} {_t1 - _t0:.2f}s", flush=True)
+                    _t0 = _t1
         return out
 
     # -- introspection -----------------------------------------------------

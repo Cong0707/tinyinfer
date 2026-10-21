@@ -35,12 +35,60 @@ _DTYPES = {
 class ShardStore:
     """Lazy, per-tensor access to a HF checkpoint directory (pread based)."""
 
-    def __init__(self, model_dir: str | Path, *, max_cached_headers: int = 64):
-        self.model_dir = Path(model_dir)
-        index_path = self.model_dir / INDEX_FILE
-        self.weight_map: dict[str, str] = json.loads(index_path.read_text(encoding="utf-8"))["weight_map"]
+    def __init__(self, model_dir, *, max_cached_headers: int = 64):
+        """One checkpoint, possibly split over several directories/disks.
+
+        Same contract as loading.ShardIndex: the sources must describe the same model
+        (identical weight_map where an index is present, identical shard sizes where a
+        shard appears twice) or this raises. A directory that contributes no shard is
+        rejected as a typo instead of being silently ignored.
+        """
+        raw = ([model_dir] if isinstance(model_dir, (str, Path))
+               else [p for chunk in model_dir for p in str(chunk).split(";")])
+        dirs: list[Path] = []
+        for entry in raw:
+            for part in str(entry).split(","):
+                part = part.strip().strip('"')
+                if part and Path(part).exists() and Path(part) not in dirs:
+                    dirs.append(Path(part))
+        if not dirs:
+            raise FileNotFoundError(f"no model directory exists among {raw!r}")
+        self.model_dirs = dirs
+        self.model_dir = dirs[0]
+        maps: list[tuple[Path, dict[str, str]]] = []
+        for d in dirs:
+            p = d / INDEX_FILE
+            if p.is_file():
+                maps.append((d, json.loads(p.read_text(encoding="utf-8"))["weight_map"]))
+        if not maps:
+            raise FileNotFoundError(f"{INDEX_FILE} not found under any of {[str(d) for d in dirs]}")
+        base_dir, base_map = maps[0]
+        for d, m in maps[1:]:
+            if m != base_map:
+                diff = sorted(k for k in set(base_map) | set(m) if base_map.get(k) != m.get(k))
+                sample = diff[0] if diff else "?"
+                raise ValueError("model sources are not the same checkpoint: "
+                                 f"{len(diff)} tensors differ, e.g. {sample} -> "
+                                 f"{base_map.get(sample)} vs {m.get(sample)}")
+        self.weight_map: dict[str, str] = base_map
+        self._shard_dir: dict[str, Path] = {}
+        for shard in sorted(set(base_map.values())):
+            found = [(d, (d / shard).stat().st_size) for d in dirs if (d / shard).is_file()]
+            if not found:
+                raise FileNotFoundError(f"shard {shard} missing from every source")
+            if len({sz for _d, sz in found}) > 1:
+                raise ValueError(f"shard {shard} differs between sources: refusing to mix checkpoints")
+            self._shard_dir[shard] = found[0][0]
+        idle = [d for d in dirs if d not in set(self._shard_dir.values())]
+        if idle and len(dirs) > 1:
+            raise ValueError("these model directories supplied no shards: "
+                             + ", ".join(str(d) for d in idle))
         self._headers: dict[str, tuple[dict, int]] = {}
         self._max_headers = max_cached_headers
+
+    def shard_path(self, shard: str) -> Path:
+        d = self._shard_dir.get(shard)
+        return (d / shard) if d is not None else (self.model_dir / shard)
 
     # -- discovery ---------------------------------------------------------
     def shard_of(self, name: str) -> str:
@@ -60,7 +108,7 @@ class ShardStore:
         cached = self._headers.get(shard)
         if cached is not None:
             return cached
-        path = self.model_dir / shard
+        path = self.shard_path(shard)
         if not path.exists():
             raise FileNotFoundError(f"shard missing (download incomplete): {shard}")
         with path.open("rb") as f:

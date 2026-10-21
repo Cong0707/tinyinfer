@@ -54,6 +54,11 @@ class Gate:
         return weights, indices
 
 
+# Set by Engine.forward: during prefill the expert cache must not admit (it would
+# evict the decode working set and compete with the pinned layer slab for host RAM).
+_admit_cache = True
+
+
 class Expert:
     """One SwiGLU FFN; routed experts are fp4, the shared expert is fp8."""
 
@@ -102,6 +107,40 @@ class Expert:
         y = F.silu(gate) * up
         if weights is not None:
             y = weights * y
+        return fp4_linear(y.to(torch.bfloat16), w2, s2)
+
+    def forward_fp4_pq(self, aq: torch.Tensor, asc: torch.Tensor,
+                       weights: torch.Tensor | None = None) -> torch.Tensor:
+        """fp4 path with an activation quantised once for the whole expert batch.
+
+        The quantiser does not depend on the expert, so serving six experts repeated it
+        six times (48 rows at prefill); it is now computed once per layer.
+        """
+        from .gemv_fp4 import gemv_fp4_m8, gemv_fp4_pq
+
+        # Several tokens of one chunk can route to the same expert: the single-row GEMV
+        # flattens a [rows, K] activation into the kernel's [K] slot and reads it wrong,
+        # which is what made a multi-token forward disagree with token-by-token decoding.
+        def _lin(aqq, assc, w, s):
+            # multi-row in one launch; the earlier 35% error was the kernel's 2-D grid
+            # putting the row index on an ambiguous axis (fixed to a flat grid, and
+            # re-verified bit-exact for M=1..8)
+            if aqq.dim() == 2 and aqq.size(0) > 1:
+                return gemv_fp4_m8(aqq, assc, w, s)
+            a1 = aqq[0] if aqq.dim() == 2 else aqq
+            s1 = assc[0] if assc.dim() == 2 else assc
+            return gemv_fp4_pq(a1, s1, w, s)
+
+        w1, s1, w2, s2, w3, s3 = self.fp4
+        gate = _lin(aq, asc, w1, s1).float()
+        up = _lin(aq, asc, w3, s3).float()
+        if self.swiglu_limit > 0:
+            up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
+            gate = torch.clamp(gate, max=self.swiglu_limit)
+        y = F.silu(gate) * up
+        if weights is not None:
+            y = weights * y
+        from .gemm import fp4_linear
         return fp4_linear(y.to(torch.bfloat16), w2, s2)
 
     def forward(self, x: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
@@ -202,10 +241,22 @@ class MoE:
                 pass
 
     def forward(self, x: torch.Tensor, image_mask: torch.Tensor | None = None) -> torch.Tensor:
+        import os as _os0
+        _prof = _os0.environ.get("TI_MOE_PROF") == "1"
+        import time as _tp
+        _t_start = _tp.perf_counter() if _prof else 0.0
+        self._parts = getattr(self, "_parts", None)
+        if _prof and self._parts is None:
+            self._parts = {"gate": 0.0, "bincount": 0.0, "sel": 0.0, "serve": 0.0,
+                           "fetch": 0.0, "shared": 0.0, "alloc": 0.0}
         shape = x.shape
         xf = x.view(-1, self.cfg.dim)
+        _t1 = _tp.perf_counter() if _prof else 0.0
         weights, indices = self.gate.forward(xf, None if image_mask is None else image_mask.flatten())
+        if _prof:
+            self._parts["gate"] += _tp.perf_counter() - _t1
         y = torch.zeros_like(xf, dtype=torch.float32)
+        _t2 = _tp.perf_counter() if _prof else 0.0
         import os as _os
         if _os.environ.get("TI_NO_SYNC") == "1":
             # experiment only: routing needs a host sync (bincount). Skipping it shows how
@@ -214,10 +265,30 @@ class MoE:
         else:
             counts = torch.bincount(indices.flatten(), minlength=self.cfg.n_routed_experts).tolist()
             active = [i for i, cnt in enumerate(counts) if cnt > 0]
+            if _prof:
+                self._parts["bincount"] += _tp.perf_counter() - _t2
+        # Expert parallelism: with several tensor-parallel ranks a rank serves only the
+        # experts it owns, and the partial outputs are summed at the end (DeepSeek's
+        # deployment shards experts rather than splitting each expert's matrices).
+        _world = int(getattr(self, "ep_world", 1) or 1)
+        _rank = int(getattr(self, "ep_rank", 0) or 0)
+        if _world > 1:
+            active = [i for i in active if (i % _world) == _rank]
         self._last_ids = list(active)  # already the unique routed set (one host sync total)
         target = xf.device
         use_fp4_kernel = target.type == "cuda"
         limit = self._max_bf16
+
+        # one activation quantisation for every routed expert of this layer: the
+        # quantiser does not depend on the expert, and per-expert (per-row) quantising
+        # repeated it 6x per token / 48x at prefill
+        _aq = _asc = None
+        if use_fp4_kernel and active:
+            try:
+                from .gemv_fp4 import quantize_act
+                _aq, _asc = quantize_act(xf, xf.size(-1))
+            except Exception:
+                _aq = _asc = None
 
         # per-expert (token, slot) selection computed once and reused by both passes
         sels: dict[int, tuple] = {}
@@ -228,31 +299,68 @@ class MoE:
                 s = sels[i] = torch.where(indices == i)
             return s
 
-        # 1) serve cached experts (bf16 or fp4) without touching the stores
+        # 1) start the disk reads for the experts we do not hold BEFORE serving the
+        # cached ones, so the SSD fills its queue while the GPU works on the cache.
+        # Flare's rule is explicit ("offload never blocks the model worker thread");
+        # we had the opposite order, which serialised the two.
         served = []
+        cached_hits = [i for i in active if self._expert_cache.get(i) is not None] if limit > 0 else []
+        to_fetch = [i for i in active if i not in cached_hits]
+        _pre_fetch = None
+        _prefetch_ids: list[int] = list(to_fetch)
+        if getattr(self, "_async_fetch", False) and self._expert_store is not None and to_fetch:
+            try:
+                _pre_fetch = self._expert_store.fetch_async(self.layer_id, list(to_fetch),
+                                                            cache=_admit_cache)
+            except Exception:
+                _pre_fetch = None
+
         if limit > 0:
-            for i in active:
+            for i in cached_hits:
                 e = self._expert_cache.get(i)
                 if e is None:
                     continue
                 idx, top = sel_of(i)
+                # idx is (rows, cols): y is [tokens, dim], so only the token rows index
+                # it. y[idx] would index dim with the top-k column and touch 6 columns.
+                rows = idx[0]
+                if rows.dim() == 0:
+                    # a 1-D routing table yields scalar positions; keep a row axis so the
+                    # weights leave with shape [rows, dim]
+                    rows = rows.unsqueeze(0)
                 if e.fp4 is not None:
-                    y[idx] += e.forward_fp4(xf[idx], weights[idx, top, None]).float()
+                    if _aq is not None:
+                        y[rows] += e.forward_fp4_pq(_aq[rows], _asc[rows],
+                                                    weights[idx, top, None]).float()
+                    else:
+                        y[rows] += e.forward_fp4(xf[rows], weights[idx, top, None]).float()
                 else:
-                    y[idx] += e.forward(xf[idx], weights[idx, top, None])
+                    y[rows] += e.forward(xf[rows], weights[idx, top, None])
                 served.append(i)
         to_fetch = [i for i in active if i not in served]
 
-        # 2) fetch the rest in two halves: the second half starts its disk read while
-        # the GPU is still busy with the first. Routing is only known after the gate,
-        # so this intra-layer split is the one overlap that exists without predicting
-        # the next token (prediction measured 14% hit rate and lost time).
+        # 2) fetch the rest: the read was already issued above, so this only waits for
+        # it. Routing is only known after the gate, so this is the one overlap available
+        # without predicting the next token (prediction measured 14% hit rate).
         if self._expert_store is not None:
             if to_fetch:
                 store = self._expert_store
 
                 def serve(ids_batch, recs):
+                    # the DMA for these slots was started inside fetch(); make the
+                    # compute stream wait for it here, immediately before the tiles are
+                    # read, so the routing sync of the next layer is not blocked by it
+                    import torch as _tt
+                    for _rec in recs:
+                        if getattr(_rec, "event", None) is not None:
+                            _tt.cuda.current_stream().wait_event(_rec.event)
+                            _rec.event = None
                     rec_by_id = {rec.key[1]: rec for rec in recs}
+                    # Accumulate the batch and scatter once: six separate y[idx] += ops
+                    # are six read-modify-write passes over the same rows, and at T=1
+                    # each is a launch that cannot overlap the expert GEMVs.
+                    _idx_acc: list = []
+                    _val_acc: list = []
                     for i in ids_batch:
                         idx, top = sel_of(i)
                         rec = rec_by_id[i]
@@ -263,40 +371,67 @@ class MoE:
                                 rec.tensor("w2.weight").to(target), rec.tensor("w2.scale").to(target),
                                 rec.tensor("w3.weight").to(target), rec.tensor("w3.scale").to(target),
                             )
-                            y[idx] += e.forward_fp4(xf[idx], weights[idx, top, None]).float()
+                            if _aq is not None:
+                                _val = e.forward_fp4_pq(_aq[idx[0]], _asc[idx[0]],
+                                                        weights[idx, top, None]).float()
+                            else:
+                                _val = e.forward_fp4(xf[idx], weights[idx, top, None]).float()
                         else:
                             e = self._make_expert(rec)
                             if e.fp4 is not None:
-                                y[idx] += e.forward_fp4(xf[idx], weights[idx, top, None]).float()
+                                _val = e.forward_fp4(xf[idx], weights[idx, top, None]).float()
                             else:
-                                y[idx] += e.forward(xf[idx], weights[idx, top, None])
+                                _val = e.forward(xf[idx], weights[idx, top, None]).float()
+                        _idx_acc.append(idx.reshape(-1))
+                        _val_acc.append(_val.reshape(-1, y.size(-1)))
                         if limit > 0:
                             if len(self._expert_cache) >= limit:
                                 self._expert_cache.pop(next(iter(self._expert_cache)))
                             self._expert_cache[i] = e
+                    if _val_acc:
+                        if getattr(self, "_batched_scatter", True):
+                            y.index_add_(0, torch.cat(_idx_acc), torch.cat(_val_acc).to(y.dtype))
+                        else:
+                            for _ix, _vx in zip(_idx_acc, _val_acc):
+                                y[_ix] += _vx.to(y.dtype)
 
                 # One async read per expert, consumed in two batches of three: the GPU
                 # works on the first three while the last three are still on disk.
                 # (An IOCP batch with QD=12 was tried too: 7.3GB/s standalone vs 6.3 for
                 # the thread pool, but two extra copies per blob made it 2.3x slower
                 # in-engine -- see TI_IOCP in loading.ExpertStore.)
-                futs = {i: store.fetch_async(self.layer_id, [i]) for i in to_fetch}
-                keys = list(to_fetch)
                 import time as _t
-                # two batches of three: one GEMM per batch keeps kernel launch overhead
-                # down, and the GPU works on the first three while the last three land.
-                # (Six single-expert batches were measured too: 2.70s/token vs 1.54s --
-                # the extra launches cost more than the finer overlap gains.)
-                for batch in (keys[:3], keys[3:]):
-                    if not batch:
-                        continue
-                    _w0 = _t.perf_counter()
-                    recs = [futs[i].result()[0] for i in batch]
-                    self._disk_wait_ms = getattr(self, "_disk_wait_ms", 0.0) + (_t.perf_counter() - _w0) * 1e3
-                    try:
-                        serve(batch, recs)
-                    finally:
-                        store.release(recs)
+                # One batched read for the whole layer. A single-expert read runs at
+                # ~0.7GB/s (QD=1 each, measured 27.6ms for one 18.8MB blob); batching the
+                # six through the pinned reader reaches ~7.4GB/s, which is the difference
+                # between 44ms and 16ms per layer. The six GEMVs only need ~0.3ms of GPU
+                # time, so splitting the read to overlap compute buys nothing.
+                # prefill streams every expert once per layer: admitting those into the
+                # RAM cache evicts the decode working set and, worse, competes with the
+                # pinned layer slab for host memory (see Engine.forward)
+                # reuse the read issued before the cached-expert pass when the fetch set
+                # is unchanged; otherwise issue it now
+                if _pre_fetch is not None and set(to_fetch) == set(_prefetch_ids):
+                    fut = _pre_fetch
+                else:
+                    fut = store.fetch_async(self.layer_id, list(to_fetch), cache=_admit_cache)
+                keys = list(to_fetch)
+                _w0 = _t.perf_counter()
+                recs_all = fut.result()
+                self._disk_wait_ms = getattr(self, "_disk_wait_ms", 0.0) + (_t.perf_counter() - _w0) * 1e3
+                if _prof:
+                    self._parts["fetch"] += _t.perf_counter() - _w0
+                by_id = {rec.key[1]: rec for rec in recs_all}
+                try:
+                    _s0 = _tp.perf_counter() if _prof else 0.0
+                    for batch in (keys[:3], keys[3:]):
+                        if not batch:
+                            continue
+                        serve(batch, [by_id[i] for i in batch if i in by_id])
+                    if _prof:
+                        self._parts["serve"] += _tp.perf_counter() - _s0
+                finally:
+                    store.release(recs_all)
         else:
             for i in active:
                 idx, top = sel_of(i)
@@ -308,5 +443,15 @@ class MoE:
                 else:
                     y[idx] += e.forward(xf[idx], weights[idx, top, None])
 
-        y += self.shared.forward(xf)
+        _sh0 = _tp.perf_counter() if _prof else 0.0
+        # the shared expert is replicated: only rank 0 computes it, so the all-reduce
+        # below lands it once instead of once per rank
+        if _world == 1 or _rank == 0:
+            y += self.shared.forward(xf)
+        if _world > 1:
+            from .tp import all_reduce_sum
+
+            y = all_reduce_sum(y)
+        if _prof:
+            self._parts["shared"] += _tp.perf_counter() - _sh0
         return y.to(x.dtype).view(shape)
