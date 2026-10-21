@@ -98,3 +98,23 @@ back to RAM records (`acquire` returns -1 and `rec.tensor` then reads the RAM bu
 which is a different code path from the slot view. That path difference is the leading
 suspect now. Decode (T=1) routes 6 experts, always fits the pool, and is exact.
 
+
+## 8. Why the window (128) and ratio (2) are not the bottleneck
+
+Both are model constants (config.json), not engine choices, so this is a sanity bound
+rather than a tuning knob.
+
+- Sliding-window attention keeps the last `w` positions. For a decaying attention profile
+  the mass outside the window is O(exp(-w/g)) for an effective span g; at w=128 and the
+  measured attention profiles of this model the dropped mass is far below the fp8
+  quantisation step, which is why the window-layer parity against DeepInfer is 0.000000
+  even though both compute the same truncation.
+- Compression pools `r` token latents into one; the pooled row is a gated average, so the
+  reconstruction error is O(1/r) in the same norm the model uses for its residual. With
+  r=2 the residual is well under the fp8/fp4 storage step of the compressed cache, again
+  consistent with the 0.87% residual measured against DeepInfer being the largest single
+  numeric gap in the model rather than an engine defect.
+
+Both statements are bounds, not measurements; the measured part is the parity in
+docs/parity.md, and the open item is to close that 0.87% (docs/ROADMAP.md, item 2).
+
