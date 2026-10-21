@@ -184,3 +184,22 @@ it is the compressed-attention semantics at s>1 (docs/ROADMAP.md item 4).
   match chunk-major (rel 1.17), so it stays off. The padding itself is a strict
   improvement: the sparse kernel now always sees one width.
 
+
+### Layer-by-layer: the 42% is accumulated, not a single bug
+
+Comparing the chunked forward against token-by-token with per-layer activation dumps:
+
+- layer 0's block on its own differs by **0.6%** (per-position 0.0-0.06),
+- the difference grows monotonically with depth (layer 29: 33%, layer 39: 53%),
+- so 40 layers of ~0.6% compound into the 42% seen in the logits.
+
+The single-layer 0.6% comes from the MoE batch path (the same `moe.forward` that differs
+by up to 26% on an artificial 8-row batch; on real activations far fewer experts are
+shared so the per-layer error is small). Every MoE *component* verifies 0 against the
+reference -- gate, activation quantisation, single-row GEMV, multi-row GEMV, shared
+expert -- so the residual is in how the per-expert values are combined for several rows
+at once, which is also where the batch-size sensitivity pointed.
+
+Consequence: chunk=1 stays the correct prefill path. A chunked prefill needs that 0.6%
+to be 0 first, because the error compounds with depth.
+
