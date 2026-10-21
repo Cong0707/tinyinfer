@@ -13,6 +13,9 @@ for those imports (only comments mention them).
 | block-scaled GEMV (16 features/CTA) | NVIDIA b12x algorithm, **re-implemented in TileLang** | used only above 4096 output features where it wins |
 | compress_pool | **DeepSeek** DeepInfer `tilelang_ops/cuda/compress.py` (TileLang) | ported in `deepseek_kernels.py`, replaces the torch pooling |
 | engine GEMV / MoE / attention plumbing | our own TileLang | |
+| rope + block-fp8 quant (fused KV) | **DeepInfer** `fused_transform.py` semantics, written here | `rope_quant_tl`; bit-exact vs rotate-then-act_quant (verified), opt-in `TI_FUSED_KV=1` |
+| multi-row fp4 GEMV (`gemv_fp4_m8`) | our own TileLang | flat grid; exact on synthetic weights, 42% off on some real ones -> opt-in only |
+| grouped 6-expert fp4 GEMV (`gemv_fp4_grouped`) | our own TileLang | exact, but gathering the planes costs more than the saved launches (measured 0.76x incl. stack) |
 
 ## Why DeepInfer over NVIDIA
 
@@ -32,7 +35,10 @@ See `parity.md` for the numerical comparison against that authority.
 ## Still to port from DeepInfer (TileLang, highest value first)
 
 - `fused_transform.py` -- norm + RoPE + Hadamard + fp8/fp4 cast + KV-cache store in
-  one kernel (currently 4 separate ops per layer per token).
+  one kernel. The RoPE + fp8 leg is done (`rope_quant_tl`, exact); the norm leg is
+  not, because the TileLang reduction order differs from torch by ~4e-3 and levels
+  0-2 must stay bit-comparable.
 - `norm.py` -- fused RMSNorm path.
-- `index_attn.py` / `get_kv_index.py` -- the indexer's own projections and top-k.
+- `index_attn.py` / `get_kv_index.py` -- the indexer's own projections and top-k
+  (the mask cache is in place; the projections are still torch).
 - `fused_sample.py` / `sampler.py` -- sampling without a host round trip.
