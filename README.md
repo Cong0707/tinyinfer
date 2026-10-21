@@ -65,3 +65,9 @@ picks resident layers, ring size, cache size and chunking itself.
 - docs/kernels_provenance.md - every kernel: official port / re-implementation
 - docs/level2_mechanisms.md  - the level 1/2 mechanisms and where they come from
 - docs/flare_analysis.md - NVIDIA Flare (b12x) mechanisms, ported and rejected ones
+- docs/benchmarks.md   - benchmark history (the disk rate is part of every row)
+- docs/analysis.md     - routing predictability, speculative ceiling, batch-vs-row probe
+- docs/architecture.md - module map, streaming model, expert path, sessions
+- docs/ENV.md          - every environment switch
+- docs/ROADMAP.md      - next steps ordered by measured value, with measured non-goals
+- docs/faq.md          - the questions this design invites
