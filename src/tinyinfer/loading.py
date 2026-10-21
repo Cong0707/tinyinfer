@@ -1624,16 +1624,20 @@ class VramSlotCache:
         use_b = threading.current_thread().name.startswith("vram-prefetch")
         lock = self._staging_lock_b if use_b else self._staging_lock
         staging = self._staging_b if use_b and self._staging_b is not None else self._staging
-        with lock:
-            if staging is not None and self._copy_stream is not None:
-                ev = event if event is not None else torch.cuda.Event()
-                staging.copy_(cpu)
-                with torch.cuda.stream(self._copy_stream):
-                    buf.copy_(staging, non_blocking=True)
-                    ev.record(self._copy_stream)
-                return ev
-            buf.copy_(cpu, non_blocking=True)
+        # A shared staging buffer serialises every concurrent fetch through one 18.8MB
+        # host memcpy (measured 18ms/layer for six experts). Pageable sources go
+        # straight to the device instead: six copies then run in parallel (~3ms).
+        # The staging path stays for pinned sources, where it buys async DMA.
+        if staging is None or self._copy_stream is None or not cpu.is_pinned():
+            buf.copy_(cpu, non_blocking=False)
             return None
+        with lock:
+            ev = event if event is not None else torch.cuda.Event()
+            staging.copy_(cpu)
+            with torch.cuda.stream(self._copy_stream):
+                buf.copy_(staging, non_blocking=True)
+                ev.record(self._copy_stream)
+            return ev
 
     def _find_victim_locked(self) -> int | None:
         for idx in range(self.slots):
@@ -1975,6 +1979,15 @@ class ExpertStore:
         return out
 
     def fetch(self, layer: int, experts: Iterable[int], *, cache: bool = True) -> list[ExpertRecord]:
+        import time as _t
+        _t0 = _t.perf_counter()
+        try:
+            return self._fetch_inner(layer, experts, cache=cache)
+        finally:
+            self._fetch_ms = getattr(self, "_fetch_ms", 0.0) + (_t.perf_counter() - _t0) * 1e3
+            self._fetch_calls = getattr(self, "_fetch_calls", 0) + 1
+
+    def _fetch_inner(self, layer: int, experts: Iterable[int], *, cache: bool = True) -> list[ExpertRecord]:
         experts = [int(e) for e in experts]
         # batch the disk misses through read_many (parallel pread, lock-free), then
         # materialise sequentially so the slot state machine stays single-threaded
@@ -2001,7 +2014,9 @@ class ExpertStore:
                 try:
                     # pinned reads: 7.4GB/s vs 3.2 pageable, and the bytes stay pinned
                     # for the H2D-to-slot copy (13.3GB/s vs 8.3)
+                    _d0 = __import__("time").perf_counter()
                     datas = self._reader.read_many_pinned(blobs) if blobs else []
+                    self._disk_ms = getattr(self, "_disk_ms", 0.0) + (__import__("time").perf_counter() - _d0) * 1e3
                     for b, d in zip(blobs, datas):
                         # Admit a PAGEABLE copy. Keeping the pinned block alive in the
                         # cache meant ~600 live cudaHostAlloc blocks (11GB), so every

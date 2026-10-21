@@ -190,6 +190,11 @@ class Block(HCBlockMixin):
         return self
 
     def forward(self, x: torch.Tensor, start_pos: int, pre_mix: torch.Tensor):
+        import os as _os
+        _wt = _os.environ.get("TI_WALL_PROF") == "1"
+        if _wt:
+            import time as _t
+            _w = [_t.perf_counter()]
         if self.profile:
             ev = [torch.cuda.Event(enable_timing=True) for _ in range(6)]
             ev[0].record()
@@ -197,26 +202,47 @@ class Block(HCBlockMixin):
         attn_pre, attn_post, attn_comb = self.hc_mixes(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         h = self.hc_pre(x, pre_mix)
         h = rms_norm(h, self.attn_norm, self.cfg.rms_norm_eps)
-        # official DFlash dflash_input: the target layer's attn_norm output (attention
+        # official DFlash dflash_input: the target layer attn_norm output (attention
         # input, collapsed to [T, dim]); captured here for MTP stage-0 projection.
         self._last_attn_norm = h
+        if _wt:
+            _w.append(_t.perf_counter())
         if self.profile:
             ev[1].record()
         h = self.attn.forward(h, start_pos)
+        if _wt:
+            _w.append(_t.perf_counter())
         if self.profile:
             ev[2].record()
         x = self.hc_post(h, residual, attn_post, attn_comb)
+        if _wt:
+            _w.append(_t.perf_counter())
 
         residual = x
         ffn_pre, ffn_post, ffn_comb = self.hc_mixes(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
         h = self.hc_pre(x, attn_pre)
         h = rms_norm(h, self.ffn_norm, self.cfg.rms_norm_eps)
+        if _wt:
+            _w.append(_t.perf_counter())
         if self.profile:
             ev[3].record()
         h = self.ffn.forward(h)
+        if _wt:
+            _w.append(_t.perf_counter())
         if self.profile:
             ev[4].record()
+        if _wt and not getattr(self, "_dev_dbg", False):
+            self._dev_dbg = True
+            print(f"[block {self.layer_id}] x={x.device} h={h.device} post={ffn_post.device} "
+                  f"h_dtype={h.dtype} h_shape={tuple(h.shape)}", flush=True)
         x = self.hc_post(h, residual, ffn_post, ffn_comb)
+        if _wt:
+            _w.append(_t.perf_counter())
+            keys = ("pre", "attn", "hc_mid", "ffn", "hc_post")
+            parts = getattr(self, "_wall_parts", {k: 0.0 for k in keys})
+            for i, k in enumerate(keys):
+                parts[k] += (_w[i + 1] - _w[i]) * 1e3
+            self._wall_parts = parts
         if self.profile:
             ev[5].record()
             torch.cuda.synchronize()
