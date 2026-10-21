@@ -138,3 +138,16 @@ docs/parity.md, and the open item is to close that 0.87% (docs/ROADMAP.md, item 
   explain, so some rows are accumulated with a wrong value rather than in a different
   order. Next: log the (row, expert) pairs fed to index_add per batch.
 
+
+### Chinese prompts
+
+Question-shaped Chinese prompts land in the model's *exercise-with-answer-key* distribution
+rather than answering:
+
+    问题：法国的首都是哪里？\n答案： -> 'A\n\n解析：解析：A项，由“甲'
+    问题：1+1等于几？\n答案：     -> ' 1\nD B C A 4 3'
+
+English question prompts work ('Paris', '3.14'), so this is the base model's Chinese
+training distribution, not an engine difference. Inference is correct either way; only the
+continuation style differs.
+
