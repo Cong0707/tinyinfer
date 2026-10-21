@@ -321,3 +321,13 @@ deterministic" (or bit-match the reference): a fixed reduction tree in the kerne
 reference path for prefill. That is the next concrete task; it is what stands between
 chunk=1 and an 8x faster prefill.
 
+
+- Control experiment: forcing the kernel's tile loop to `T.serial` (fixed order, no
+  pipelining) did **not** remove the drift (16.9 vs 18.6) and cost speed, so it was
+  reverted. The s>1 gap versus the reference is the online-softmax formulation itself
+  (0.33%), not scheduling: two identical prefills differ because that formulation's
+  float32 accumulation depends on the hardware's reduction tree. Making it bit-identical
+  to the reference means running the reference softmax in prefill (much slower per layer,
+  but prefill is IO-bound anyway) -- that is the concrete next step, and it is what
+  chunked prefill needs before it can be enabled.
+
