@@ -7,6 +7,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from conftest import model_dir
 from tinyinfer.config import TinyConfig
 from tinyinfer.model import TinyModel
 
@@ -79,7 +80,7 @@ def build_fake_store(cfg, layers, seed=0):
 
 
 def test_two_layer_forward_and_decode():
-    cfg = TinyConfig.from_hf(ROOT / "cache" / "weights")
+    cfg = TinyConfig.from_hf(model_dir())
     store = build_fake_store(cfg, [0, 2], seed=7)
     model = TinyModel(store, cfg, layers=[0, 2])
     model.reset()
