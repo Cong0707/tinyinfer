@@ -54,7 +54,7 @@ mtp.2.confidence_head.proj.weight [1, dim+256]       （官方 confidence_head.p
 4. 主模型 verify（一次并行 forward），贪心匹配接受前缀；不匹配则回滚 KV（snapshot/restore）。
 5. 接受率与加速比记录到 benchmarks。
 
-## 实测状态（2026-10-22 13:50，cache/weights 40 层）
+## 实测状态（2026-10-22 10:20，cache/weights 40 层）
 
 - **全链可跑**：prefill→target hidden→main_x→draft embeds→3 stage→forward_head（logits+confidence）无崩溃。
 - **投机解码（speculative_generate, draft_len=2, 4 token）**：0.056 tok/s，accept_rate=0%。
