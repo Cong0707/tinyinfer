@@ -10,11 +10,11 @@ second machine can be checked before it is bought or borrowed, and verified afte
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | RTX 5060 8GB / 47GB (this box) | 4 | 36 | 12 | 8 | 13.5GB | 1.28s | 0.8 tok/s |
 | RTX 3060 12GB / 32GB | 15 | 25 | 15 | 8 | 7.9GB | 1.18s | 0.8 tok/s |
-| RTX 4090 24GB / 64GB | 40 | 0 | 298 | 64 | 34.7GB | 0.01s | 83 tok/s |
-| RTX 5090 32GB / 128GB | 40 | 0 | 502 | 64 | 88GB | 0.01s | 83 tok/s |
-| A100 80GB / 256GB | 40 | 0 | 2332 | 64 | 128GB | 0.01s | 83 tok/s |
-| 2x RTX 4090 48GB / 128GB | 40 | 0 | 1055 | 64 | 88GB | 0.01s | 83 tok/s |
-| M3 Max 48GB unified | 40 | 0 | 563 | 64 | 2.5GB | 0.01s | 83 tok/s |
+| RTX 4090 24GB / 64GB | 40 | 0 | 298 | 64 | 34.7GB | 0.06s | ~18 tok/s |
+| RTX 5090 32GB / 128GB | 40 | 0 | 502 | 64 | 88GB | 0.06s | ~18 tok/s |
+| A100 80GB / 256GB | 40 | 0 | 2332 | 64 | 128GB | 0.06s | ~18 tok/s |
+| 2x RTX 4090 48GB / 128GB | 40 | 0 | 1055 | 64 | 88GB | 0.06s | ~18 tok/s (per GPU, no TP) |
+| M3 Max 48GB unified | 40 | 0 | 563 | 64 | 2.5GB | 0.06s | ~18 tok/s |
 | GTX 1650 4GB / 16GB | - | - | - | - | - | - | refused (needs ~2.9GB of skeleton) |
 | CPU only | 0 | 40 | 0 | 8 | 28.6GB | - | runs, very slowly |
 
@@ -32,7 +32,9 @@ Two terms dominate a token:
    room (a 10KB row lookup per token costs ~1ms, the slots save ~1s).
 
 At 24GB the pool reaches 298 slots, every expert the token can ask for is already in
-VRAM, and the decode floor collapses to compute (~12ms/token for 40 layers at M=1).
+VRAM, and the decode floor collapses to compute: 40 layers x (18 expert GEMVs at
+M=1 plus the dense GEMMs) is estimated at ~56ms/token, i.e. ~18 tok/s. That compute
+figure is an estimate from the 8GB measurements, not a big-card run.
 
 ## What each class of machine is bound by
 

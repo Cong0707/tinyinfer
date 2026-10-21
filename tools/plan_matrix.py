@@ -26,7 +26,9 @@ MODEL = {
     "topk": 6,
 }
 H2D = 26.5e9       # pinned host->device, measured
-COMPUTE_S = 0.012  # 40 layers x ~0.3ms, one token, fully resident
+# 40 layers x (18 expert GEMVs x ~0.05ms + ~0.5ms of dense GEMM/attention) is the
+# estimate for a modern card; it is a floor, not a measurement (no big card here).
+COMPUTE_S = 0.056
 DISK = 4.5e9       # checkpoint volume at its best, measured
 TOP6 = 6
 MACHINES = [
