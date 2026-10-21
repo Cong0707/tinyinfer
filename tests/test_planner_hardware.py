@@ -20,6 +20,7 @@ MODEL = {
     "head_bytes": 1.32 * GB,
     "expert_bytes": 18.8 * 2**20,
     "n_layers": 40,
+    "topk": 6,
 }
 N = 40
 
@@ -99,3 +100,15 @@ def test_residency_grows_with_vram():
     levels = [_plan([gb], 64.0, 56.0).gpu_layers for gb in (6.0, 8.0, 12.0, 16.0, 24.0)]
     assert levels == sorted(levels), levels
     assert levels[0] >= 1 and levels[-1] == N
+
+
+def test_big_card_covers_all_routable_experts():
+    """A 24GB card can hold every expert a token might route to (topk*n_layers=240).
+
+    That is the difference between 5 and 80 tok/s: the expert IO term vanishes. The
+    planner is expected to trade the 1.32GB embedding table for the last 43 slots.
+    """
+    p = _plan([24.0], 64.0, 56.0)
+    assert p.fits
+    assert p.expert_slots >= 240, p.expert_slots
+    assert p.embed_on_cpu, "the table must move to the host to make room for the slots"
