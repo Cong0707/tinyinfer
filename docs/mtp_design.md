@@ -57,11 +57,12 @@ mtp.2.confidence_head.proj.weight [1, dim+256]       （官方 confidence_head.p
 ## 实测状态（2026-10-22 10:20，cache/weights 40 层）
 
 - **全链可跑**：prefill→target hidden→main_x→draft embeds→3 stage→forward_head（logits+confidence）无崩溃。
-- **投机解码（speculative_generate, draft_len=2, 4 token）**：0.056 tok/s，accept_rate=0%。
-  - 结论：MTP 输出分布与主模型不一致，**draft 无效**——投机当前是**负收益**（比常规 decode 0.2 tok/s 慢）。
-  - markov 已按官方改为逐 step（每步用上一步采样的 draft token 作为 markov_w1 输入），accept 仍为 0 —— 根因不在 markov。
-  - dflash_input 已改为官方语义（Block.forward 捕获 attn_norm 输出），accept 仍 0% —— 根因不在 dflash_input。
-  - 剩余怀疑：forward_head 的 collapse（官方用 HCHead 模块而不是 hc_pre(x, pre_mix)）、main KV 窗口累积（官方 paged swa cache + slot mapping，位置逐 token 精确）、draft 位置的 RoPE/索引。
+- **投机解码（draft_len=2, 4 token）**：
+  - **短上下文（"Hello"，prefill 1 token）**：accept_rate=0%——**MTP 无足够上下文**（draft 输出高频先验词），不是 bug。
+  - **长上下文（"The quick brown fox jumps over the lazy dog"）**：**accept_rate=50%**，生成本身合理（". The quick brown"）。
+  - **仍慢**（0.031 tok/s）：长 prefill 16s + 投机开销 + **VRAM 10687MB（3.6GB 用于 3 stage 的 128 专家 ×3 权重常驻 GPU）**——8GB 卡必须把 MTP 专家放到专家槽/按需加载。
+  - markov 已按官方改为逐 step；dflash_input 已改为 target 层 attn_norm 输出（官方语义）。这两处都对 accept 无负面影响。
+  - 生产化待办：MTP 专家走 ExpertStore（或 CPU），投机路径单独预算 VRAM；长上下文下 >50% 的 accept 需要 main-KV 窗口/位置的进一步逐 token 对齐。
   - 其余待查：draft attention 的 main KV 窗口累积语义（官方 paged swa cache + slot mapping）、draft position 语义。
 - **当前投机关闭**；MTP 权重加载 + 前向链保留为已验证能力。
 - **VRAM**：投机时 3 stage 权重上卡 → 峰值 10.7GB > 8GB（WDDM 分页）。投机路径需 stage 权重换出（CPU）或按需加载。
