@@ -137,7 +137,9 @@ class MLAWindowAttention:
             self._kv_buf = buf
         n_old = old.size(1)
         if n_old > 0:
-            buf[:, :n_old].copy_(old)  # explicit copy (old may view the same buffer)
+            # old may alias this very buffer (chunked prefill beyond the window): clone
+            # the source before writing so the copy does not read its own destination.
+            buf[:, :n_old].copy_(old.clone())
         buf[:, n_old:n_old + s].copy_(kv)
         kv_att = buf[:, : n_old + s]
         full = s == 1 and n_old == self.window
