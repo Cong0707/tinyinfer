@@ -141,6 +141,16 @@ class Engine:
                 self.expert_store = expert_store
         else:
             self.expert_store = expert_store
+        # The VRAM slot pool is faster but not bit-reproducible yet (a slot can be
+        # re-targeted while the GEMV that reads it is still queued; docs/analysis.md
+        # section 10). TI_NO_SLOTS=1 trades about 40% of decode for deterministic logits.
+        if __import__("os").environ.get("TI_NO_SLOTS") == "1":
+            for _st in (getattr(self, "expert_store", None),):
+                try:
+                    if _st is not None:
+                        _st.slots = None
+                except Exception:
+                    pass
         self.max_layers = self.cfg.n_layers if max_layers is None else min(max_layers, self.cfg.n_layers)
         self.allow_missing_layers = allow_missing_layers
         self.prefill_chunk = 2048  # overridden by the hardware plan on cuda

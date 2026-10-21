@@ -85,3 +85,17 @@ capability note above.
   produced a sentence about Japan's monarchy, 'who wrote Romeo and Juliet' fell into the
   multiple-choice template. Same base-model capability, same conclusion.
 
+
+## Is the output reproducible?
+
+Not bit-for-bit by default: the VRAM expert-slot pool has a race (a slot can be
+re-targeted while the GEMV reading it is still queued), so two identical calls differ in
+the logits. Decode text stays coherent because the top-1 token is stable. For
+reproducible logits set
+
+    TI_NO_SLOTS=1
+
+which disables the slot pool: identical runs then agree exactly, at about 40% slower
+decode (0.29 vs 0.49 tok/s here). The batched/chunked comparisons in docs/analysis.md
+were measured with the pool on and are therefore noise; see section 10 there.
+
