@@ -180,15 +180,6 @@ class Engine:
     def block(self, layer_id: int) -> Block:
         b = self._blocks.get(layer_id)
         if b is None:
-            # warm the OS cache with a parallel read of this layer's tensors; the Block
-            # constructor then hits page cache instead of doing ~100 serial preads.
-            prefix = f"layers.{layer_id}."
-            names = [n for n in self.store.weight_map if n.startswith(prefix)]
-            if names:
-                try:
-                    self.store.read_many(names)
-                except Exception:
-                    pass
             b = Block(self.store, layer_id, self.cfg, expert_store=self.expert_store,
                       quant=self.tier.keep_weights_quantized, hashes=self.hashes,
                       cache_wo_a=self.cache_wo_a, expert_topk=self.tier.expert_topk)
