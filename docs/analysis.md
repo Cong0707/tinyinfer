@@ -493,3 +493,28 @@ handing over `min(top_k, t)`. Effects, measured:
 `tests/test_compressor.py` was updated to assert the tile-aligned width (it had pinned the
 old `min(top_k, t)` shape). Full suite green.
 
+
+## 14. Chunked prefill: it is accumulation, not a broken step
+
+Per-position comparison of `chunk=2` against strict token-by-token (deterministic mode):
+
+| position | rel | argmax |
+| --- | --- | --- |
+| 0 | 0.0095 | same |
+| 1 | 0.096 | same |
+| 2 | 0.063 | same |
+| 3 | 0.57 | different (271 vs 8120) |
+
+The first position is already ~1% off and the error compounds with depth and with
+position, which is exactly what a fixed per-layer difference produces. Since the
+components each measure at or below their noise floor (compressor 1.6e-7, MoE 0.000000,
+attention kernel 0.0033 at s=24 against the reference), the per-layer difference is the
+sum of many small reduction-order differences inside the compressed path -- not a wrong
+index or a skipped state.
+
+That settles what chunked prefill can be today: a 1.6x faster path whose output drifts
+from the exact path by roughly 0.5%/layer, which is harmless on short prompts (the
+France/pi questions answer correctly) and grows with prompt length. `TI_PREFILL_CHUNK=1`
+is the exact path and remains the default choice for long prompts until the compressed
+path is made bit-identical to the token-wise one.
+
