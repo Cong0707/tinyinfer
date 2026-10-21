@@ -7,6 +7,7 @@ as a second adapter later.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Protocol
 
@@ -49,9 +50,40 @@ class HFDeepSeekV41Adapter:
         return Block(self.store, layer_id, cfg or self.cfg)
 
 
+def resolve_hf_snapshot(source: str | Path) -> Path:
+    """Resolve a HF repo id / hub cache dir to a usable snapshot directory.
+
+    Accepts (a) a flat downloaded checkpoint dir, (b) a HF hub snapshot dir, or
+    (c) a repo id such as "deepseek-ai/DeepSeek-V4.1-Flash-1017" -- for (c) the
+    already-downloaded snapshot is located with huggingface_hub (local only, no
+    network access unless the caller asks for it).
+    """
+    p = Path(source)
+    if (p / "model.safetensors.index.json").exists():
+        return p
+    if not p.exists():
+        from huggingface_hub import snapshot_download
+        try:
+            snap = snapshot_download(str(source), local_files_only=True)
+            return Path(snap)
+        except Exception as exc:
+            # hub cache may be present without the refs bookkeeping that
+            # snapshot_download insists on; fall back to the raw snapshots dir.
+            hub = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
+            repo_dir = hub / f"models--{str(source).replace('/', '--')}"
+            snaps = sorted((repo_dir / "snapshots").glob("*")) if (repo_dir / "snapshots").exists() else []
+            for cand in snaps:
+                if (cand / "model.safetensors.index.json").exists():
+                    return cand
+            raise FileNotFoundError(
+                f"could not resolve HF repo {source!r}: not found in local cache (HF_HOME={hub})"
+            ) from exc
+    raise FileNotFoundError(f"unrecognized checkpoint layout under {p}")
+
+
 def open_adapter(model_dir: str | Path) -> ModelAdapter:
     """Detect the checkpoint layout and return a matching adapter."""
-    p = Path(model_dir)
+    p = resolve_hf_snapshot(model_dir)
     if (p / "model.safetensors.index.json").exists():
         cfg = TinyConfig.from_hf(p)
         # deepseek_v41 is the only architecture wired today; other HF MoE layouts will

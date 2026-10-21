@@ -5,6 +5,8 @@ The fetch/dequant/eviction policy lives in loading.py; this is the orchestration
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from .adapters import ModelAdapter, open_adapter
 from .config import TinyConfig
 from .hc import hc_split_sinkhorn  # noqa: F401  (re-export for callers)
@@ -17,6 +19,16 @@ import torch.nn.functional as F
 
 
 class Engine:
+    @classmethod
+    def from_hf(cls, source: str | Path, **kwargs) -> "Engine":
+        """Load directly from a HF repo id / hub snapshot / flat checkpoint dir.
+
+        This is the canonical entry point: no per-deployment model-dir plumbing.
+        Local-only by default; pass local_files_only=False to plan.resolve_hf_snapshot
+        (via open_adapter) once network downloads are acceptable.
+        """
+        return cls(open_adapter(source), **kwargs)
+
     def __init__(
         self,
         adapter: ModelAdapter | str,
