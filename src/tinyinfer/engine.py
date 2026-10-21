@@ -672,12 +672,13 @@ class Engine:
                 ev0.record()
             if b.engram is not None and hash_ids is not None:
                 h = b.engram.forward(h, hash_ids[b.engram.hash_index])
+            # official (reference/official/model.py:1267): the MTP head reads the *input* of
+            # its target layers, hc-collapsed by a plain mean -- not the attn_norm output
+            # and not the attention input. Captured before forward() overwrites h.
+            h_in = h
             h, pre_mix = b.forward(h, start_pos, pre_mix)
             if i in self._target_layers:
-                # MTP stage-0 main_proj expects the concat of the dspark target layers'
-                # attn_norm outputs (official dflash_input), [1, T, 3*dim].
-                cap = getattr(b, "_last_attn_norm", None)
-                self._target_hidden[i] = (cap if cap is not None else b.hc_pre(h, pre_mix)).detach()
+                self._target_hidden[i] = h_in.mean(dim=2).detach()
             if self.profile:
                 ev1 = torch.cuda.Event(enable_timing=True)
                 ev1.record()

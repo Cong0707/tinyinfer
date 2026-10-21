@@ -124,7 +124,13 @@ class MTPAttention(MLAWindowAttention):
 
         kv_att = torch.cat([hist, kv], dim=1)
         n_hist = hist.size(1)
-        idxs = window_idxs_general(start_pos, s, n_hist, win, x.device).unsqueeze(0).expand(b, -1, -1)
+        # official get_dspark_topk_idxs: every draft query attends to ALL window slots
+        # plus ALL draft slots -- the block is non-causal (its positions are noise-filled),
+        # unlike the causal window_idxs_general used for real decode steps.
+        idxs = torch.cat([
+            torch.arange(n_hist, device=x.device),
+            n_hist + torch.arange(s, device=x.device),
+        ]).view(1, 1, -1).expand(b, s, -1).contiguous()
         from .kernels import sparse_attn_dispatch
         o = sparse_attn_dispatch(q, kv_att, self.sink, idxs, self.scale)
         apply_rope(o[..., -rd:], freqs, inverse=True)

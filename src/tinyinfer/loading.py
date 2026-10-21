@@ -1624,11 +1624,14 @@ class VramSlotCache:
         use_b = threading.current_thread().name.startswith("vram-prefetch")
         lock = self._staging_lock_b if use_b else self._staging_lock
         staging = self._staging_b if use_b and self._staging_b is not None else self._staging
-        # A shared staging buffer serialises every concurrent fetch through one 18.8MB
-        # host memcpy (measured 18ms/layer for six experts). Pageable sources go
-        # straight to the device instead: six copies then run in parallel (~3ms).
-        # The staging path stays for pinned sources, where it buys async DMA.
-        if staging is None or self._copy_stream is None or not cpu.is_pinned():
+        # Pinned sources go straight to the device as an async DMA (26GB/s, six in
+        # parallel). Routing them through the single shared staging buffer serialised
+        # them through one 18.8MB host memcpy (measured 18ms/layer). Pageable sources
+        # cannot be async, so they copy synchronously.
+        if cpu.is_pinned():
+            buf.copy_(cpu, non_blocking=True)
+            return None
+        if staging is None or self._copy_stream is None:
             buf.copy_(cpu, non_blocking=False)
             return None
         with lock:
@@ -1928,7 +1931,7 @@ class ExpertStore:
             data = self.ram.get(layer, expert, admit=False)
             with self._lock:
                 self._stream_reads += 1
-                self._stream_bytes += len(data)
+                self._stream_bytes += int(getattr(data, "nbytes", len(data)))
         if self.slots is None or self.slots.slots == 0:
             return ExpertRecord((layer, expert), data, blob.tensors, "cpu")
         if slot is None:
@@ -2018,11 +2021,14 @@ class ExpertStore:
                     datas = self._reader.read_many_pinned(blobs) if blobs else []
                     self._disk_ms = getattr(self, "_disk_ms", 0.0) + (__import__("time").perf_counter() - _d0) * 1e3
                     for b, d in zip(blobs, datas):
-                        # Admit a PAGEABLE copy. Keeping the pinned block alive in the
-                        # cache meant ~600 live cudaHostAlloc blocks (11GB), so every
-                        # fetch had to allocate fresh pinned memory for each 18.8MB
-                        # blob -- that allocation, not the device, was what capped
-                        # reads at 1.2GB/s on an 11GB/s SSD.
+                        # Admit the pinned buffer directly (zero copy) while the pinned
+                        # budget lasts; past it fall back to a pageable copy so the
+                        # cudaHostAlloc pool is never exhausted.
+                        self._pinned_cache_bytes = getattr(self, "_pinned_cache_bytes", 0)
+                        # Pageable copy. Keeping the pinned tensor measured 57ms/fetch
+                        # vs 22ms for the pageable copy: the pinned pool is already
+                        # holding 17.9GB of layer weights and the extra registrations
+                        # cost more than the async DMA buys back.
                         arr = d.numpy().copy()
                         self.ram.admit(layer, b.key[1], arr)
                 except Exception:
