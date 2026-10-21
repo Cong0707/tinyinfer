@@ -22,7 +22,8 @@ GB = 1 << 30
 MB = 1 << 20
 
 # calibrated model-side constants (fp8 non-expert weights, bf16 embed/head)
-LAYER_GB = 0.44           # resident per-layer VRAM incl. allocator/state
+LAYER_GB = 0.55           # resident per-layer VRAM incl. allocator/state (recalibrated:
+                          # 11 layers + embed + slots measured 8671MB, i.e. 0.55GB/layer)
 LAYER_HOST_GB = 0.19      # per-layer host RAM for a streamed layer
 EMBED_GB = 1.32
 HEAD_GB = 1.32
