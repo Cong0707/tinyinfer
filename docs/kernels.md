@@ -676,6 +676,23 @@ V4.1 的 non-expert 权重只有 17.7 GB（fp8 + e8m0 scale），expert 296 GB�
 
 **不要照抄的点**：llama.cpp 的 MoE 专家是**全驻留**模型（无 NVMe 流式），O7 的专家流式仍应参考 ds4/flash-moe 与 Strata；llama.cpp 的 CUDA 侧没有多项式 fast-math（这印证了第 2.9 节的负结果）。
 
+## 8.3 tilelang 预编译（冷启动的关键路径）
+
+tilelang 按 (kernel, shape, M) 组合独立编译，**未缓存的组合首次调用约 5s**；40 层的
+shape 各不相同，所以冷启动的 20-30s 几乎全是编译。编译产物缓存在
+`~/.tilelang/cache/0.1.15/cuda-binaries/<hash>/kernel.cubin`，之后启动只做加载
+（~22ms/个）。
+
+| 脚本 | 覆盖 | 实测（一次性） |
+|---|---|---|
+| `scripts/warm_prefill.py` | decode M=1 + prefill M=8/16/32/64/128 | M=8 467s、M=16 122s、M=32 195s、M=64 278s |
+| `scripts/precompile.py` | prefill M=8..64 + decode + MTP stage 链 | 874s |
+| `scripts/precompile_long.py` | Engine.prefill_chunk=2048 的长上下文 chunk | 后台编译，供几百 K 上下文 |
+
+**部署**：把编译好的 `.tilelang` 缓存随镜像发布（或 bootstrap 跑一次），生产冷启动从
+分钟级降到秒级。**长上下文**首次 prefill 前必须先跑 `precompile_long.py`，否则第一个长
+prompt 会卡在编译（实测 M=32 未预编译时 prefill 228s）。
+
 ---
 
 ## 9. MTP / DSpark（参考映射与状态）
