@@ -389,6 +389,7 @@ class MoE:
                                 _val = e.forward(xf[idx], weights[idx, top, None]).float()
                         _idx_acc.append(idx.reshape(-1))
                         _val_acc.append(_val.reshape(-1, y.size(-1)))
+
                         if limit > 0:
                             if len(self._expert_cache) >= limit:
                                 self._expert_cache.pop(next(iter(self._expert_cache)))
