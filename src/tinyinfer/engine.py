@@ -279,6 +279,8 @@ class Engine:
         for (owner, name, t), (_, _, _, off, _) in zip(paths, layout):
             buf[off:off + t.numel() * t.element_size()].view(t.dtype).view(t.shape).copy_(t)
             setattr(owner, name, buf[off:off + t.numel() * t.element_size()].view(t.dtype).view(t.shape))
+        if getattr(b, "engram", None) is not None:
+            b.engram.to(self.device)
         b._device = self.device
 
     def _stream_layers(self):
@@ -314,6 +316,8 @@ class Engine:
             ev.record(stream)
         for (owner, name, t), (_, _, _, off, n) in zip(paths, layout):
             setattr(owner, name, buf[off:off + n].view(t.dtype).view(t.shape))
+        if getattr(b, "engram", None) is not None:
+            b.engram.to(self.device)
         return ev
 
     # -- streaming slots ---------------------------------------------------
@@ -373,7 +377,7 @@ class Engine:
         if not hasattr(self, "_v5_enabled"):
             # 8GB card: even two signature groups of flat buffers push VRAM past the
             # physical limit (measured 9330MB peak -> WDDM paging), so keep it off.
-            self._v5_enabled = False
+            self._v5_enabled = bool(int(__import__("os").environ.get("TI_V5", "0")))
             self._v5_stream = None
             self._v5_pending: dict[int, object] = {}
         if self.layer_ids is not None:
@@ -434,7 +438,7 @@ class Engine:
                                 if (nxt % 2) != (i % 2) and nxt not in self._v5_pending:
                                     self._v5_pending[nxt] = self._stream_prefetch(nxt, self._v5_stream)
                     except Exception:
-                        self._v5_enabled = False
+                        self._v5_enabled = bool(int(__import__("os").environ.get("TI_V5", "0")))
                         b.to(self.device)
                 else:
                     b.to(self.device)
