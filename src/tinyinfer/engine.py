@@ -1025,6 +1025,11 @@ class Engine:
                 if (not _fin) or __import__("os").environ.get("TI_DEBUG_NAN") == "all":
                     print(f"[dbg] layer {i:2d} finite={_fin} absmax={float(h.abs().max()):.2f}",
                           flush=True)
+            if getattr(self, "_layer_dump", None) is not None:
+                # diagnostics: per-position activation magnitude after each layer, so a
+                # chunked forward and the same tokens one at a time can be diffed layer
+                # by layer (probe_layer_dump.py)
+                self._layer_dump.append((i, h.float().amax(dim=(0, 2, 3)).tolist()))
             if i in self._target_layers:
                 self._target_hidden[i] = h_in.mean(dim=2).detach()
             if self.profile:
