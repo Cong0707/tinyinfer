@@ -122,3 +122,8 @@ docs/parity.md, and the open item is to close that 0.87% (docs/ROADMAP.md, item 
 - Ruled out: the VRAM-slot path vs the RAM-record path are identical (rel 0.000000 with
   `store.slots = None`), so the batch difference is not slot pressure.
 
+
+- Row-uniformity was confirmed again (rows with no shared expert differ by 1.6 as well),
+  so the batch error is not a multi-row-expert artefact. The VRAM-slot vs RAM-record path
+  was ruled out (0.000000 with `store.slots = None`).
+
