@@ -33,5 +33,5 @@ Yes: `python -m tinyinfer.serve` exposes `/v1/completions` and `/v1/chat/complet
 
 ## What is not perfect yet?
 
-docs/STATUS.md lists the open items: session logit drift, the batch-vs-row MoE
+difference (does not affect decode), MTP verify, and the compressed-layer 0.87% residual.
 difference (does not affect decode), MTP verify, and the compressed-layer 0.87% residual.
