@@ -164,3 +164,17 @@ continuation style differs.
   difference (22.9% on that synthetic batch) therefore does not come from the GEMV
   kernels, and the default stays row-at-a-time until the actual source is found.
 
+
+## 9. Where the chunk-vs-token difference actually lives
+
+`_forward_impl` with chunk=8 vs eight single-token calls on the same prompt differs by
+rel 0.42 (per position 1.3 -> 11.2). The expert FFN is not the source: with the row-index
+fix (`_aq[idx]` instead of `_aq[idx[0]]`, which fed only the first routed row through the
+kernel) the expert module is exact for multi-row input, and the MoE batch difference that
+remains is the compressed-layer path: `compress_len = end_pos // ratio` is computed once
+per chunk, so position 0 of a chunk can see compressed groups that belong to later
+positions, and the indexer's visibility mask is built for the chunk's end position.
+
+That is why chunked prefill is still restricted to chunk=1: it is not a kernel problem,
+it is the compressed-attention semantics at s>1 (docs/ROADMAP.md item 4).
+
