@@ -303,4 +303,16 @@ class Indexer:
         topk = min(self.index_topk, t)
         idxs = score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
         valid = idxs < compress_lens.reshape(-1, 1).unsqueeze(0)
-        return torch.where(valid, idxs + offset, -1).int()
+        out = torch.where(valid, idxs + offset, -1).int()
+        # Give the sparse kernel a width aligned to its 32-wide tile. min(top_k, t) is
+        # narrow early in a sequence and a chunked pass hands it a wider list; since the
+        # kernel walks the list in 32-token tiles, the two paths disagreed by ~0.5%/layer.
+        # Rounding *up* to the tile keeps the tile count (and every par- tial sum) exactly
+        # as it was, while making the width path-independent. -1 is the empty-slot marker.
+        _tile = 32
+        _want = -(-out.size(-1) // _tile) * _tile
+        if out.size(-1) < _want:
+            pad = torch.full((*out.shape[:-1], _want - out.size(-1)), -1,
+                             dtype=out.dtype, device=out.device)
+            out = torch.cat([out, pad], dim=-1)
+        return out

@@ -478,3 +478,18 @@ list). Closing this needs the *index list itself* to be chunk-invariant (e.g. al
 top_k wide with -1 padding on both paths, which is what the compressed padding commit
 started), not a different attention formulation.
 
+
+### Tile-aligned index width (kept, chunk=1 stays exact)
+
+The indexer now rounds its gather list up to the sparse kernel's 32-wide tile instead of
+handing over `min(top_k, t)`. Effects, measured:
+
+- chunk=1 still matches the token-by-token reference exactly (`rel 0.000000`),
+- the list width no longer depends on how many positions a pass happens to process,
+- a chunked pass still differs (rel 0.80 on the 4-token probe), so this was a correctness
+  / behaviour-isolation fix, not the cure: the remaining difference is inside the compressed
+  layer's use of the freshly published groups, not the width of the list.
+
+`tests/test_compressor.py` was updated to assert the tile-aligned width (it had pinned the
+old `min(top_k, t)` shape). Full suite green.
+

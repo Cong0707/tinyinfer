@@ -97,7 +97,11 @@ def test_indexer_prefill():
     qr = torch.randn(1, 8, cfg.q_lora_rank, dtype=torch.bfloat16)
     latent = torch.randn(1, 4, cfg.head_dim, dtype=torch.bfloat16)
     out = idx.forward(x, qr, latent, 0, offset=128)
-    assert out.shape == (1, 8, min(cfg.index_topk, 4)), out.shape
+    # the list width is tile-aligned (32) so a chunked and a token-wise pass hand the
+    # sparse kernel the same shape; only the -1-padded tail differs
+    _want = -(-min(cfg.index_topk, 4) // 32) * 32
+    assert out.shape == (1, 8, _want), out.shape
+    assert out.shape[-1] % 32 == 0
     assert out.dtype == torch.int32
     valid = out[out >= 0]
     assert valid.numel() > 0
