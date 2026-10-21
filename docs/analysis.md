@@ -210,3 +210,29 @@ to be 0 first, because the error compounds with depth.
   (`index_add` of several experts at once versus one at a time), which is far larger than
   fp32 association can explain; it stays the open lead for chunked prefill.
 
+
+## 10. CORRECTION: the engine is not bit-reproducible with VRAM slots on
+
+Running the exact same call sequence twice gives different logits:
+
+| configuration | two identical runs differ by |
+| --- | --- |
+| tier 2 (VRAM slot pool) | 0.63-0.78 relative |
+| slot pool disabled (`store.slots = None`) | **0.000000** |
+
+So the slot pool has a read/write race: a slot can be re-targeted at an expert while the
+GEMV that reads it is still queued on the compute stream. Four fixes were tried and all
+failed to remove it (device-wide sync before serve, recording a compute-stream event at
+release, keeping that event across eviction, blocking instead of async H2D copies); one
+of them (the sync) also cost 35% of decode, so all of them were reverted.
+
+**This invalidates the earlier "batch differs from token-by-token by 26-42%" measurements**
+in this file: those comparisons were run with the slot pool on and are dominated by this
+noise, not by a routing/matmul difference. The same applies to the layer-0 0.6% and the
+chunk 42% figures. With slots off, chunk=1 and token-by-token agree exactly, which is the
+honest current statement. Decode output quality is unaffected in practice (top-1 stays
+stable across runs), but the logits are not reproducible.
+
+Open item for the roadmap: find and fix the slot race, then re-run the batch/prefix
+comparisons (they may well be exact, which would unlock chunked prefill).
+
