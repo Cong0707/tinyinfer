@@ -261,18 +261,24 @@ class Engine:
         return self._stream_set
 
     def _stream_prefetch(self, layer_id: int, stream) -> None:
-        """Copy a streamed layer's weights into its rotating buffer (copy stream)."""
+        """Copy a streamed layer's weights into its rotating buffer (copy stream).
+
+        The layout (weight order/sizes) comes from the first layer of a kind; the
+        owners here are the CURRENT layer's objects, so every layer gets its own
+        attribute wiring onto the shared buffers.
+        """
         (layout, bufs) = self._ensure_stream_buffers(layer_id)
         b = self.block(layer_id)
+        paths = b._weight_paths()
         if b._cpu_refs is None:
             b._cpu_refs = [t.pin_memory() if t.is_cpu and t.device.type == "cpu" else t
-                           for (_, _, t) in b._weight_paths()]
+                           for (_, _, t) in paths]
         buf = bufs[layer_id % 2]
         with torch.cuda.stream(stream):
-            for (owner, name, dt, sh, off, n), cpu in zip(layout, b._cpu_refs):
-                buf[off:off + n].view(dt).view(sh).copy_(cpu)
-        for (owner, name, dt, sh, off, n) in layout:
-            setattr(owner, name, buf[off:off + n].view(dt).view(sh))
+            for (_, _, dt, sh, off, n), cpu in zip(layout, b._cpu_refs):
+                buf[off:off + n].view(cpu.dtype).view(cpu.shape).copy_(cpu)
+        for (_, _, dt, sh, off, n), (owner, name, t) in zip(layout, paths):
+            setattr(owner, name, buf[off:off + n].view(t.dtype).view(t.shape))
         b._device = self.device
 
     # -- streaming slots ---------------------------------------------------
@@ -309,6 +315,17 @@ class Engine:
         for (owner, name, t), cpu in zip(dst, block_i._cpu_refs):
             t.copy_(cpu, non_blocking=True)
 
+    def _prefetch_layer(self, layer_id: int, experts) -> None:
+        """Warm RAM and stage the experts in VRAM slots (DMA overlaps the current layer)."""
+        b = self.block(layer_id)
+        b.ffn.prefetch(experts)
+        store = getattr(b.ffn, "_expert_store", None)
+        if store is not None and getattr(store, "prefetch_to_vram", None) is not None:
+            try:
+                store.prefetch_to_vram(layer_id, experts)
+            except Exception:
+                pass
+
     # -- forward -----------------------------------------------------------
     def _forward_chunk(self, ids: torch.Tensor, start_pos: int):
         self._last_hidden = None  # filled after the final layer (MTP stage-0 input)
@@ -339,34 +356,18 @@ class Engine:
             if pred:
                 for layer_i, experts in pred.items():
                     if layer_i in layer_seq and experts:
-                        self.block(layer_i).ffn.prefetch(experts)
+                        self._prefetch_layer(layer_i, experts)
             elif self._last_routing:
                 for layer_i, ids_ in self._last_routing.items():
                     if layer_i in layer_seq:
-                        self.block(layer_i).ffn.prefetch(ids_)
+                        self._prefetch_layer(layer_i, ids_)
         self._timings = []
         events = []
-        if self.device != "cpu":
-            if getattr(self, "_copy_stream", None) is None:
-                self._copy_stream = torch.cuda.Stream()
-            stream_set = self._stream_layers()
-            first = next((j for j in layer_seq if j in stream_set), None)
-            if first is not None:
-                self._stream_prefetch(first, self._copy_stream)
-            nexts = [j for j in layer_seq if j in stream_set]
-            nstream = len(nexts)
-        for idx, i in enumerate(layer_seq):
+        for i in layer_seq:
             b = self.block(i)
             streamed = i in self._stream_layers()
             if streamed and self.device != "cpu":
-                torch.cuda.current_stream().wait_stream(self._copy_stream)
-                # submit the next streamed layer's copy on the copy stream (overlap)
-                try:
-                    pos = nexts.index(i)
-                    if pos + 1 < nstream:
-                        self._stream_prefetch(nexts[pos + 1], self._copy_stream)
-                except ValueError:
-                    pass
+                b.to(self.device)
             if self.profile:
                 ev0 = torch.cuda.Event(enable_timing=True)
                 ev0.record()
