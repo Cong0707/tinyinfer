@@ -13,6 +13,8 @@
 | 生成 | " Deep..  I am Deep." | 修复 L20 ratio=1 kv_source 的 src_ratio 后语义正常 |
 | 每层成本 | MoE 56ms/层（72%）、attn 3ms/层、HC 1.7ms/层 | 专家 IO + fp4 kernel |
 
+**流式双缓冲（2026-10-22）**：每个层类型（window / compressed-source / compressed-consumer）预分配 2 个固定 GPU flat buffer，流式层轮换 copy-in（pinned→buffer，copy stream），**层 i 计算时**层 i+1 的 H2D 已在后台进行——目标消除每层 26-60ms 的同步拷贝等待（33 个流式层合计 0.9-2s/token）。
+
 **IO 实测（2026-10-22）**：read_many 批量 pread（8 线程、direct IO）**4.95 GB/s**（24 专家 0.45GB/0.09s，致态 9100 Plus 理论 11.9GB/s——受 Windows direct-IO 与文件系统限制）；下载器本身受 ModelScope 网络限 10-13MB/s（磁盘写 ~0.1GB/s）。专家 fetch 已改批量读（read_many + admit），decode 每层 6 专家的读在 0.02s 量级。
 
 **优化状态（2026-10-22）**：MoE 融合 kernel（gate+up 单 kernel + silu，M>1 走 fused、M=1 走官方 fp4_gemm 保稳定）；专家 fetch 8 线程并行（锁外读盘）；RAM 缓存按可用内存弹性（psutil）；MTP 三 stage 加载成功（forward 链待全 40 层验证）；fp4 GEMV（M=1）已实现但集成路径异常慢，暂未启用。

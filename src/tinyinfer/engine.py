@@ -224,6 +224,57 @@ class Engine:
                 idx._k_cache = None if entry.get("ik") is None else entry["ik"].clone()
             b.ffn._expert_cache.clear()
 
+    # -- double-buffered streaming -----------------------------------------
+    def _ensure_stream_buffers(self, layer_id: int):
+        """Two flat device buffers per layer-kind, laid out from this layer's weights.
+
+        The first streamed layer of each kind defines the layout (same kind = same
+        weight names/shapes); later layers reuse the buffers via rotating copy-in.
+        """
+        b = self.block(layer_id)
+        kind = (self.cfg.compress_ratios[layer_id] > 0,
+                getattr(b.attn, "compressor", None) is not None,
+                getattr(b.attn, "indexer", None) is not None)
+        cache = getattr(self, "_stream_buffer_cache", None)
+        if cache is None:
+            self._stream_buffer_cache = cache = {}
+        ent = cache.get(kind)
+        if ent is None:
+            layout = []
+            off = 0
+            for owner, name, t in b._weight_paths():
+                n = t.numel() * t.element_size()
+                off = (off + 255) // 256 * 256
+                layout.append((owner, name, t.dtype, t.shape, off, n))
+                off += n
+            bufs = [torch.empty(off, dtype=torch.uint8, device=self.device) for _ in range(2)]
+            ent = cache[kind] = (layout, bufs)
+        return ent
+
+    def _stream_layers(self):
+        """Layers that are re-copied every token (the tail beyond the resident set)."""
+        if getattr(self, "_stream_set", None) is None:
+            if self.layer_ids is not None:
+                self._stream_set = set(self.layer_ids[self.gpu_layers:])
+            else:
+                self._stream_set = set(range(self.gpu_layers, self.max_layers))
+        return self._stream_set
+
+    def _stream_prefetch(self, layer_id: int, stream) -> None:
+        """Copy a streamed layer's weights into its rotating buffer (copy stream)."""
+        (layout, bufs) = self._ensure_stream_buffers(layer_id)
+        b = self.block(layer_id)
+        if b._cpu_refs is None:
+            b._cpu_refs = [t.pin_memory() if t.is_cpu and t.device.type == "cpu" else t
+                           for (_, _, t) in b._weight_paths()]
+        buf = bufs[layer_id % 2]
+        with torch.cuda.stream(stream):
+            for (owner, name, dt, sh, off, n), cpu in zip(layout, b._cpu_refs):
+                buf[off:off + n].view(dt).view(sh).copy_(cpu)
+        for (owner, name, dt, sh, off, n) in layout:
+            setattr(owner, name, buf[off:off + n].view(dt).view(sh))
+        b._device = self.device
+
     # -- streaming slots ---------------------------------------------------
     def _ensure_slots(self):
         if getattr(self, "_stream_slots", None) is None:
@@ -295,11 +346,27 @@ class Engine:
                         self.block(layer_i).ffn.prefetch(ids_)
         self._timings = []
         events = []
-        for i in layer_seq:
+        if self.device != "cpu":
+            if getattr(self, "_copy_stream", None) is None:
+                self._copy_stream = torch.cuda.Stream()
+            stream_set = self._stream_layers()
+            first = next((j for j in layer_seq if j in stream_set), None)
+            if first is not None:
+                self._stream_prefetch(first, self._copy_stream)
+            nexts = [j for j in layer_seq if j in stream_set]
+            nstream = len(nexts)
+        for idx, i in enumerate(layer_seq):
             b = self.block(i)
-            streamed = self._layer_device(b) != self.device
+            streamed = i in self._stream_layers()
             if streamed and self.device != "cpu":
-                b.to(self.device)
+                torch.cuda.current_stream().wait_stream(self._copy_stream)
+                # submit the next streamed layer's copy on the copy stream (overlap)
+                try:
+                    pos = nexts.index(i)
+                    if pos + 1 < nstream:
+                        self._stream_prefetch(nexts[pos + 1], self._copy_stream)
+                except ValueError:
+                    pass
             if self.profile:
                 ev0 = torch.cuda.Event(enable_timing=True)
                 ev0.record()
