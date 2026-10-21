@@ -402,3 +402,26 @@ That means prefill is already 1.6x faster than the exact path in the default con
 and closing the remaining 0.5% (deterministic s>1 reductions + compressor block alignment)
 is what would make it both fast and exact.
 
+
+### Where the chunk difference starts (final trace)
+
+With the slot pool off (reproducible) and one layer at a time:
+
+| layer | chunk=1 vs chunk=2 |
+| --- | --- |
+| 0 (window layer) | rel 1.3e-5 (float noise) |
+| 1-19 | identical to 1e-4 |
+| **20 (first kv_source, compress_ratio 1)** | **rel 0.005, the first real gap** |
+| 21-39 | propagates |
+
+Layer 20 is the first compressed layer. Its compressor is a ratio-1 source (no pooling:
+`rms_norm(wkv(x))` per token), so the group values themselves match; the gap appears in
+how the chunk presents them to attention (2 groups visible at once vs 1 at a time) and
+the surrounding fp32 arithmetic. It is a semantics/accumulation difference inside the
+compressed path, not the attention kernel (reference attention shows the same 0.5%) and
+not the MoE (exact at 0.000000).
+
+Practical consequence: `chunk=4` gives 1.58x prefill for a ~0.5%/layer difference that
+can flip an argmax when the top-2 are within ~1 logit. `TI_PREFILL_CHUNK=1` is the exact
+path; the planner value is the fast one.
+
