@@ -74,11 +74,15 @@ class Engine:
                 hw = self.hw_plan
                 self.expert_store = ExpertStore.from_store(
                     self.store,
+                    reader_threads=12,
                     cache_bytes=min(16 << 30, max(512 << 20, cache_budget)) if hw is None else hw.cache_bytes,
                     policy="arc",
                     vram_slots=(96 if device != "cpu" else 0) if hw is None else hw.expert_slots,
                     device=device if device != "cpu" else "cpu",
-                    direct=False,
+                    # direct=NO_BUFFERING reads: measured 6.3GB/s at 6 threads vs
+                    # 0.26GB/s through the Windows file cache (which serialises the
+                    # multi-threaded pread path on a big-blob stream)
+                    direct=True,
                 )
             except Exception as e:
                 print(f"[tinyinfer] ExpertStore disabled: {e}")
@@ -110,7 +114,10 @@ class Engine:
             self.small_ops_on_cpu = small_op_on_cpu(self.gpu_layers, self.max_layers)
         self._blocks: dict[int, Block] = {}
         self._last_routing: dict[int, list[int]] = {}
-        self.enable_prefetch = True
+        # expert prefetch is opt-in: with the RAM cache holding ~600 of 15360 experts
+        # the prediction misses often enough that the prefetch and the fetch read the
+        # same blob twice (measured 5.3GB/step against 3.5GB of unique data)
+        self.enable_prefetch = bool(int(__import__("os").environ.get("TI_PREFETCH", "0")))
         self.cache_wo_a = False
         self.profile = False
         # CPU-side learned expert prefetcher (context tables; ~95% hit rate measured)
@@ -308,6 +315,152 @@ class Engine:
             b.engram.to(self.device)
         b._device = self.device
 
+    # -- flat streaming (v6) -----------------------------------------------
+    # Every streamed layer reuses ONE pair of device buffers sized to the largest
+    # layer, and every layer's host weights are packed once into a pinned flat
+    # buffer. A decode step then issues one 442MB pinned H2D per layer (16ms at
+    # pinned bandwidth) instead of ~31 pageable per-tensor copies that each cost a
+    # host round-trip; the next layer is copied on a side stream while the current
+    # one computes, so the transfer hides behind the GPU.
+    def _flat_enabled(self) -> bool:
+        st = getattr(self, "_flat_state", None)
+        if st == "off":
+            return False
+        if st is None:
+            try:
+                self._flat_setup()
+            except Exception as exc:  # pinned-pool exhaustion, OOM: stay on the old path
+                print(f"[tinyinfer] flat streaming off: {exc!r}", flush=True)
+                self._flat_state = "off"
+                return False
+        return True
+
+    def _warm_weights(self, layers) -> None:
+        """Read every streamed layer's weights through an 8-way pool first.
+
+        ShardStore.get is one open+seek+read per tensor (31 per layer), which measured
+        ~1.2GB/s on this box; the same bytes through 8 threads saturate far better and
+        leave the block constructors reading from the OS cache.
+        """
+        import itertools
+        from concurrent.futures import ThreadPoolExecutor
+
+        names: list[str] = []
+        try:
+            wm = self.store.weight_map
+        except AttributeError:
+            return
+        for i in layers:
+            pre = f"layers.{i}."
+            exp = pre + "ffn.experts."
+            # non-expert weights only: the routed experts are 12.75GB/layer and are
+            # streamed per token, warming them here would just OOM the box
+            names.extend(n for n in wm if n.startswith(pre) and not n.startswith(exp))
+        if not names:
+            return
+        import time as _time
+        t0 = _time.time()
+        total = 0
+        pool = ThreadPoolExecutor(max_workers=8)
+        it = iter(names)
+        try:
+            while True:
+                batch = list(itertools.islice(it, 8))
+                if not batch:
+                    break
+                for t in pool.map(self.store.get, batch):
+                    total += t.numel() * t.element_size()
+        finally:
+            pool.shutdown(wait=True)
+        dt = _time.time() - t0
+        print(f"[tinyinfer] prewarm {total/1e9:.1f}GB of layer weights in {dt:.1f}s "
+              f"= {total/1e9/max(dt,1e-6):.1f}GB/s", flush=True)
+
+    def _flat_setup(self) -> None:
+        import os
+
+        if os.environ.get("TI_FLAT", "0") != "1":
+            raise RuntimeError("TI_FLAT is opt-in (set TI_FLAT=1)")
+        streamed = sorted(self._stream_layers())
+        if not streamed:
+            raise RuntimeError("no streamed layers")
+        lay: dict[int, tuple[list[tuple[int, int]], int]] = {}
+        sizes: dict[int, int] = {}
+        for i in streamed:
+            paths = self.block(i)._weight_paths()
+            offs: list[tuple[int, int]] = []
+            off = 0
+            for (_, _, t) in paths:
+                n = t.numel() * t.element_size()
+                off = (off + 255) // 256 * 256
+                offs.append((off, n))
+                off += n
+            lay[i] = (offs, off)
+            sizes[i] = off
+        # No second host copy: Block.to() already keeps a pinned ref for every weight
+        # (_cpu_refs, 15.5GB on this checkpoint). A packed flat copy on top of that is
+        # another 15.5GB, which pushed the box into paging (rss 21.6GB vs 14.6GB
+        # available). Instead the per-tensor pinned copies go straight into the shared
+        # pair: still async, still one H2D per layer, no extra host memory.
+        keep: list[int] = []
+        mx = max(sizes.values())
+        bufs = [torch.empty(mx, dtype=torch.uint8, device=self.device) for _ in range(2)]
+        pinned_gb = 0.0
+        for i in streamed:
+            b = self.block(i)
+            paths = b._weight_paths()
+            refs = []
+            for (_, _, t) in paths:
+                if t.is_cpu and not t.is_pinned():
+                    try:
+                        t = t.pin_memory()
+                    except Exception:
+                        pass
+                refs.append(t)
+            b._cpu_refs = refs
+            pinned_gb += sum(t.numel() * t.element_size() for t in refs if t.is_pinned()) / 2 ** 30
+            keep.append(i)
+        self._flat_state = (lay, bufs, None)
+        self._flat_ev = {}
+        self._copy_stream = torch.cuda.Stream(device=self.device)
+        print(f"[tinyinfer] flat streaming: {len(keep)} layers, {mx/2**20:.0f}MBx2 VRAM, "
+              f"{pinned_gb:.1f}GB pinned source (no extra host copy)", flush=True)
+
+    def _flat_apply(self, layer: int, buf_idx: int) -> None:
+        lay, bufs, host = self._flat_state
+        b = self.block(layer)
+        offs, total = lay[layer]
+        buf = bufs[buf_idx]
+        if host is None:  # per-tensor copies from the pinned refs Block already holds
+            for (owner, name, t), (o, n), src in zip(b._weight_paths(), offs, b._cpu_refs):
+                buf[o:o + n].view(t.dtype).view(t.shape).copy_(src, non_blocking=True)
+        else:
+            buf[:total].copy_(host[layer], non_blocking=True)
+        for (owner, name, t), (o, n) in zip(b._weight_paths(), offs):
+            setattr(owner, name, buf[o:o + n].view(t.dtype).view(t.shape))
+        if getattr(b, "engram", None) is not None:
+            b.engram.to(self.device)
+        b._device = self.device
+
+    def _flat_prefetch(self, layer: int, buf_idx: int) -> None:
+        if layer not in self._flat_state[0]:
+            return
+        ev = torch.cuda.Event()
+        with torch.cuda.stream(self._copy_stream):
+            self._flat_apply(layer, buf_idx)
+            ev.record(self._copy_stream)
+        self._flat_ev[layer] = ev
+
+    def _flat_wait(self, layer: int, buf_idx: int) -> None:
+        if layer not in self._flat_state[0]:
+            self.block(layer).to(self.device)
+            return
+        ev = self._flat_ev.pop(layer, None)
+        if ev is not None:
+            torch.cuda.current_stream().wait_event(ev)
+        else:
+            self._flat_apply(layer, buf_idx)
+
     def _stream_layers(self):
         """Layers that are re-copied every token (the tail beyond the resident set)."""
         if getattr(self, "_stream_set", None) is None:
@@ -382,15 +535,18 @@ class Engine:
             t.copy_(cpu, non_blocking=True)
 
     def _prefetch_layer(self, layer_id: int, experts) -> None:
-        """Warm RAM and stage the experts in VRAM slots (DMA overlaps the current layer)."""
+        """Stage the experts for a later layer: one disk read, straight into a VRAM slot.
+
+        The old version called both the RAM prefetch and the VRAM prefetch, so every
+        blob was read from disk twice and the slot pool (measured 0 hits) was refilled
+        with data that was never consumed.
+        """
         b = self.block(layer_id)
+        # RAM only. Staging into VRAM here filled the 24-slot pool with 186 predicted
+        # blobs per token and evicted the very ones the compute thread was about to
+        # use (measured: 2.4k loads, 1 hit). Slots are now H2D staging for the layer
+        # being executed, and this thread just warms the RAM cache ahead of it.
         b.ffn.prefetch(experts)
-        store = getattr(b.ffn, "_expert_store", None)
-        if store is not None and getattr(store, "prefetch_to_vram", None) is not None:
-            try:
-                store.prefetch_to_vram(layer_id, experts)
-            except Exception:
-                pass
 
     # -- forward -----------------------------------------------------------
     def _forward_chunk(self, ids: torch.Tensor, start_pos: int):
@@ -429,24 +585,42 @@ class Engine:
             if self.predictor is not None and ids.numel() == 1:
                 tok_now = int(ids.reshape(-1)[0].item())
                 pred = self.predictor.predict(tok_now)
-            if pred:
-                for layer_i, experts in pred.items():
-                    if layer_i in layer_seq and experts:
-                        self._prefetch_layer(layer_i, experts)
-            elif self._last_routing:
-                for layer_i, ids_ in self._last_routing.items():
-                    if layer_i in layer_seq:
-                        self._prefetch_layer(layer_i, ids_)
+            source = pred or self._last_routing
+            if source:
+                # only the first layers: the VRAM slot pool holds ~1-2 layers of top-6,
+                # so prefetching all 40 layers evicts every slot before it is consumed
+                # (measured: 0 slot hits, every read repeated on the compute thread).
+                # The rest is prefetched rolling inside the layer loop below.
+                for layer_i in layer_seq[:2]:
+                    if source.get(layer_i):
+                        self._prefetch_layer(layer_i, source[layer_i])
         self._timings = []
         events = []
         if self._v5_enabled and self._v5_stream is None:
             self._v5_stream = torch.cuda.Stream(device=self.device)
+        use_flat = self.device != "cpu" and not self._v5_enabled and self._flat_enabled()
         streamed_seq = [i for i in layer_seq if i in self._stream_layers()] if self._v5_enabled else []
+        flat_seq = [i for i in layer_seq if i in self._stream_layers()] if use_flat else []
+        flat_pos = {j: k for k, j in enumerate(flat_seq)}
         for pos_i, i in enumerate(layer_seq):
             b = self.block(i)
             streamed = i in self._stream_layers()
             if streamed and self.device != "cpu":
-                if self._v5_enabled and streamed_seq:
+                if use_flat:
+                    k = flat_pos[i]
+                    self._flat_wait(i, k % 2)
+                    if k + 1 < len(flat_seq):
+                        nxt = flat_seq[k + 1]
+                        if nxt not in self._flat_ev:
+                            self._flat_prefetch(nxt, (k + 1) % 2)
+                    if k + 2 < len(flat_seq) and self.enable_prefetch:
+                        # RAM prefetch two layers ahead: the read has ~2 layers of compute
+                        # time to land, and it never touches the VRAM slot pool
+                        ahead = flat_seq[k + 2]
+                        r = self._last_routing.get(ahead)
+                        if r:
+                            self._prefetch_layer(ahead, r)
+                elif self._v5_enabled and streamed_seq:
                     try:
                         ev = self._v5_pending.pop(i, None)
                         if ev is not None:
@@ -484,7 +658,7 @@ class Engine:
                 events.append((i, ev0, ev1))
             if b.ffn._last_ids:
                 self._last_routing[i] = b.ffn._last_ids
-            if streamed and self.device != "cpu":
+            if streamed and self.device != "cpu" and not use_flat:
                 b.to("cpu")  # free VRAM for the next streamed layer
         if self.predictor is not None and tok_now is not None and self._last_routing:
             self.predictor.observe(tok_now, dict(self._last_routing))
@@ -705,6 +879,12 @@ class Engine:
         ids = list(prompt_ids)
         with torch.inference_mode():
             logits = self.forward(torch.tensor([ids], device=self.device), 0)
+            if self.device != "cpu":
+                # the prefill kernels (tilelang workspace for the prompt-length shape)
+                # leave ~5GB of cached blocks behind; against an 8GB card that pushes
+                # reserved past physical memory and every decode step then pages
+                # (measured 11498MB reserved, 0.10 tok/s). Hand them back to the driver.
+                torch.cuda.empty_cache()
             out = []
             for step in range(max_new_tokens):
                 nid = int(sample_logits(logits[0, -1], temperature, top_p, top_k))
