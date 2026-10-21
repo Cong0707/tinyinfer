@@ -22,7 +22,7 @@
 2. **复用 DeepInfer**：以深寻官方推理框架为上游，复用其模型定义（MLA / YWCO / SWA / indexer / Engram / MoE / Hyper-Connections / DSpark / MTP）与引擎组件；只替换"装不下"的部分。
 3. **分层内存**：VRAM（8 GB）→ RAM（34 GB）→ NVMe（2.4 TB）三级。专家权重与 Engram 表按 token/行按需从 NVMe 拉取，参考 llama.cpp PR #25294（MoE 磁盘流式）与 flash-moe（"Trust the OS"）的经验。
 4. **消费级 kernel 适配**：把 DeepInfer 的 SM100 kernel 栈移植到 sm_120 —— 参考 vLLM PR #43477（SM120 DeepSeek V4）、DeepGEMM PR #324（SM120 MXFP4）、FlashMLA sm120 fork、FlashInfer sparse MLA PR #3395。
-5. **可验证**：每个阶段有明确验收，不追求速度，追求正确性与可运行；所有实验可复现（脚本 + 日志 + 记忆沉淀）。
+5. **可验证且已提速**：每个阶段有明确验收；速度已从 0.087 tok/s（早期 7 常驻）提升到 **0.34 tok/s**（9 常驻、物理显存内、engram 全开），并完成 H2D/GEMM/attention/HC 的逐项 A/B（见 `docs/optimization_plan.md`）；所有实验可复现（脚本 + 日志 + 记忆沉淀）。
 
 ## 架构
 
