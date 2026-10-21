@@ -58,7 +58,7 @@ class Engine:
                     self.store,
                     cache_bytes=min(16 << 30, max(512 << 20, cache_budget)),
                     policy="arc",
-                    vram_slots=48 if device != "cpu" else 0,
+                    vram_slots=96 if device != "cpu" else 0,  # 96*18.8MB=1.8GB, covers a token's experts
                     device=device if device != "cpu" else "cpu",
                     direct=False,
                 )
