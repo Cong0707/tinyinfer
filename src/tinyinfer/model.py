@@ -16,7 +16,7 @@ class Block(HCBlockMixin):
     """One decoder layer: Hyper-Connection collapse -> norm -> attention -> HC expand -> ... FFN."""
 
     def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, expert_store=None, quant: bool = False,
-                 hashes=None, cache_wo_a: bool = False):
+                 hashes=None, cache_wo_a: bool = False, expert_topk: int = 0):
         self.layer_id = layer_id
         self.cfg = cfg
         self._expert_store = expert_store
@@ -41,7 +41,7 @@ class Block(HCBlockMixin):
             self.attn = MLAWindowAttention(store, layer_id, cfg, quant=quant, cache_wo_a=cache_wo_a)
         else:
             self.attn = MLACompressedAttention(store, layer_id, cfg, quant=quant)
-        self.ffn = MoE(store, layer_id, cfg, expert_store=expert_store)
+        self.ffn = MoE(store, layer_id, cfg, expert_store=expert_store, topk=expert_topk)
         p = f"layers.{layer_id}."
         self.attn_norm = store.get(p + "attn_norm.weight")
         self.ffn_norm = store.get(p + "ffn_norm.weight")

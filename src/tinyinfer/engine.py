@@ -178,7 +178,7 @@ class Engine:
         if b is None:
             b = Block(self.store, layer_id, self.cfg, expert_store=self.expert_store,
                       quant=self.tier.keep_weights_quantized, hashes=self.hashes,
-                      cache_wo_a=self.cache_wo_a)
+                      cache_wo_a=self.cache_wo_a, expert_topk=self.tier.expert_topk)
             if layer_id < self.gpu_layers and self.device != "cpu":
                 b.to(self.device)
             self._blocks[layer_id] = b
@@ -332,7 +332,8 @@ class Engine:
             pair = slots[kind] = []
         while len(pair) < 2:
             blk = Block(self.store, layer_id, self.cfg, expert_store=self.expert_store,
-                        quant=self.tier.keep_weights_quantized, hashes=None)
+                        quant=self.tier.keep_weights_quantized, hashes=None,
+                        expert_topk=self.tier.expert_topk)
             blk.to(self.device)
             pair.append(blk)
         return pair[layer_id % 2]
