@@ -325,22 +325,22 @@ class MoE:
                 e = self._expert_cache.get(i)
                 if e is None:
                     continue
-                idx, top = sel_of(i)
-                # idx is (rows, cols): y is [tokens, dim], so only the token rows index
-                # it. y[idx] would index dim with the top-k column and touch 6 columns.
-                rows = idx[0]
+                # sel_of unpacks where() into (rows, cols): only the token rows index y
+                # (y[rows, cols] would touch six columns of the dim axis).
+                rows, cols = sel_of(i)
                 if rows.dim() == 0:
                     # a 1-D routing table yields scalar positions; keep a row axis so the
                     # weights leave with shape [rows, dim]
                     rows = rows.unsqueeze(0)
+                    cols = cols.unsqueeze(0)
                 if e.fp4 is not None:
                     if _aq is not None:
                         y[rows] += e.forward_fp4_pq(_aq[rows], _asc[rows],
-                                                    weights[idx, top, None]).float()
+                                                    weights[rows, cols, None]).float()
                     else:
-                        y[rows] += e.forward_fp4(xf[rows], weights[idx, top, None]).float()
+                        y[rows] += e.forward_fp4(xf[rows], weights[rows, cols, None]).float()
                 else:
-                    y[rows] += e.forward(xf[rows], weights[idx, top, None])
+                    y[rows] += e.forward(xf[rows], weights[rows, cols, None])
                 served.append(i)
         to_fetch = [i for i in active if i not in served]
 
@@ -377,7 +377,11 @@ class MoE:
                                 rec.tensor("w3.weight").to(target), rec.tensor("w3.scale").to(target),
                             )
                             if _aq is not None:
-                                _val = e.forward_fp4_pq(_aq[idx[0]], _asc[idx[0]],
+                                # idx holds *every* row routed to this expert. Taking
+                                # idx[0] (as this did) fed only the first row through the
+                                # kernel, which is why a batch and the same rows one at a
+                                # time disagreed while a single token was exact.
+                                _val = e.forward_fp4_pq(_aq[idx], _asc[idx],
                                                         weights[idx, top, None]).float()
                             else:
                                 _val = e.forward_fp4(xf[idx], weights[idx, top, None]).float()
