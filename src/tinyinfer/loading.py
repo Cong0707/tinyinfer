@@ -1681,6 +1681,37 @@ class VramSlotCache:
                 self._state[idx] = self.IN_USE
                 return idx, False
 
+    def acquire_many(self, layer: int, experts: list[int]) -> list[tuple[int, bool] | None]:
+        """Batch acquire: one lock for the whole expert list (decode fetches 6/ layer).
+
+        Returns per-expert (slot, ready) or None when the caller should fall back to
+        the single acquire() path (RESERVED slots that a prefetch is still filling).
+        """
+        self._ensure()
+        out: list[tuple[int, bool] | None] = []
+        with self._cond:
+            for expert in experts:
+                key = (layer, expert)
+                idx = self._by_key.get(key)
+                if idx is not None:
+                    st = self._state[idx]
+                    if st == self.RESERVED:
+                        out.append(None)  # prefetch in flight: let acquire() wait
+                        continue
+                    self._refs[idx] += 1
+                    self.hits += 1
+                    self._state[idx] = self.IN_USE
+                    out.append((idx, True))
+                    continue
+                idx = self._reserve_locked(key)
+                if idx is None:
+                    out.append((-1, False))
+                    continue
+                self._refs[idx] = 1
+                self._state[idx] = self.IN_USE
+                out.append((idx, False))
+        return out
+
     def copy_in(self, slot: int, data: Any):
         return self._copy_blocking(slot, data)
 
@@ -1830,7 +1861,8 @@ class ExpertStore:
             index.weight_map = weight_map
         return cls(model_dir, index=index, **kwargs)
 
-    def _materialize(self, layer: int, expert: int, *, cache: bool = True) -> ExpertRecord:
+    def _materialize(self, layer: int, expert: int, *, cache: bool = True,
+                     slot: int | None = None, ready: bool = False) -> ExpertRecord:
         blob = self.index.expert_blob(layer, expert)
         if cache:
             data = self.ram.get(layer, expert)
@@ -1843,7 +1875,8 @@ class ExpertStore:
                 self._stream_bytes += len(data)
         if self.slots is None or self.slots.slots == 0:
             return ExpertRecord((layer, expert), data, blob.tensors, "cpu")
-        slot, ready = self.slots.acquire(layer, expert)
+        if slot is None:
+            slot, ready = self.slots.acquire(layer, expert)
         if slot < 0:  # no VRAM slot available: serve straight from the RAM cache
             return ExpertRecord((layer, expert), data, blob.tensors, "cpu")
         if ready:
@@ -1867,9 +1900,17 @@ class ExpertStore:
                         self.ram.admit(layer, b.key[1], d)
                 except Exception:
                     pass  # fall back to per-expert reads inside _materialize
+        # batch the slot reservations under one lock (decode fetches 6 experts/layer)
+        acquired = None
+        if self.slots is not None and self.slots.slots > 0 and len(experts) > 1 and cache:
+            acquired = self.slots.acquire_many(layer, experts)
         records = []
-        for expert in experts:
-            records.append(self._materialize(layer, expert, cache=cache))
+        for i, expert in enumerate(experts):
+            if acquired is not None and acquired[i] is not None:
+                slot, ready = acquired[i]
+                records.append(self._materialize(layer, expert, cache=cache, slot=slot, ready=ready))
+            else:
+                records.append(self._materialize(layer, expert, cache=cache))
             with self._lock:
                 self._open[(layer, expert)] += 1
         return records
