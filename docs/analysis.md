@@ -118,3 +118,7 @@ rather than a tuning knob.
 Both statements are bounds, not measurements; the measured part is the parity in
 docs/parity.md, and the open item is to close that 0.87% (docs/ROADMAP.md, item 2).
 
+
+- Ruled out: the VRAM-slot path vs the RAM-record path are identical (rel 0.000000 with
+  `store.slots = None`), so the batch difference is not slot pressure.
+
