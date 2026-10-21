@@ -54,7 +54,9 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
     """
     if x.dtype != torch.bfloat16:
         x = x.to(torch.bfloat16)
-    # decode (M==1): single fused GEMV kernel instead of the block_M=32 GEMM
+    # decode (M==1): the fused GEMV kernel when it is available. NOTE: looping
+    # fused_fp8_gemv for M in 2..8 crashes (misaligned address inside
+    # gemv_bf16_kernel at N=1280/K=5120), so small-M fp8 stays on the GEMM for now.
     if x.dim() == 2 and x.size(0) == 1 and x.is_cuda:
         try:
             from .gemv_fp8 import gemv_fp8
@@ -68,6 +70,15 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
 
 def fp4_linear(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor, act_block: int = 32) -> torch.Tensor:
     """C = x @ w_fp4.T with fp8 activation quant, fp4 weight (official kernel path)."""
+    if x.dim() == 2 and 0 < x.size(0) <= 8 and x.is_cuda:
+        # same block_M=32 waste as fp8: at M=2 the GEMM took 334ms/layer, the GEMV loop
+        # takes ~2 x 6ms
+        try:
+            from .gemv_fp4 import gemv_fp4
+            rows = [gemv_fp4(x[i:i + 1], w_fp4, w_scale) for i in range(x.size(0))]
+            return rows[0] if len(rows) == 1 else torch.cat(rows, dim=0)
+        except Exception:
+            pass
     with _bf16_default():
         x_fp8, x_s = _k.act_quant(x, act_block, SCALE_FMT, SCALE_DTYPE)
         return _k.fp4_gemm(x_fp8, x_s, w_fp4, w_scale, SCALE_DTYPE, act_block_size=act_block)

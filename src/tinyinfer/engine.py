@@ -72,12 +72,14 @@ class Engine:
                 except Exception:
                     cache_budget = int(self.tier.expert_cache_gb * (1 << 30))
                 hw = self.hw_plan
+                _slots = int(__import__("os").environ.get(
+                    "TI_SLOTS", hw.expert_slots if hw is not None else 96))
                 self.expert_store = ExpertStore.from_store(
                     self.store,
                     reader_threads=12,
                     cache_bytes=min(16 << 30, max(512 << 20, cache_budget)) if hw is None else hw.cache_bytes,
                     policy="arc",
-                    vram_slots=(96 if device != "cpu" else 0) if hw is None else hw.expert_slots,
+                    vram_slots=_slots if device != "cpu" else 0,
                     device=device if device != "cpu" else "cpu",
                     # direct=NO_BUFFERING reads: measured 6.3GB/s at 6 threads vs
                     # 0.26GB/s through the Windows file cache (which serialises the
@@ -425,6 +427,12 @@ class Engine:
                         pass
                 refs.append(t)
             b._cpu_refs = refs
+            # repoint the layer at the pinned copies so the pageable originals can be
+            # freed: keeping both meant 15.9GB + 15.9GB resident, and under that pressure
+            # the pinned H2D fell from 30GB/s to 6.5GB/s (measured T=1 vs T=2)
+            for (owner, name, _), t in zip(paths, refs):
+                setattr(owner, name, t)
+            b._device = "cpu"
             pinned_gb += sum(t.numel() * t.element_size() for t in refs if t.is_pinned()) / 2 ** 30
             keep.append(i)
         self._flat_state = (lay, bufs, None)
@@ -434,6 +442,7 @@ class Engine:
               f"{pinned_gb:.1f}GB pinned source (no extra host copy)", flush=True)
 
     def _flat_apply(self, layer: int, buf_idx: int) -> None:
+        self._flat_applies = getattr(self, "_flat_applies", 0) + 1
         lay, bufs, host = self._flat_state
         b = self.block(layer)
         offs, total = lay[layer]
@@ -801,6 +810,60 @@ class Engine:
                 logits = self.forward(torch.tensor([[nid]], device=self.device), start_pos=len(ids) + step)
 
     # -- speculative decoding (MTP/DSpark) ---------------------------------
+    def _window_span(self) -> int:
+        """Tokens still replayable from the ring without cloning it."""
+        spans = [getattr(b.attn, "window", 0) or 0 for b in self._blocks.values()]
+        return min([s for s in spans if s] or [0]) or 0
+
+    def _kv_truncate(self, target: int) -> None:
+        """Roll every attention state back to `target` absolute tokens."""
+        for b in self._blocks.values():
+            a = b.attn
+            win = getattr(a, "window", None) or 0
+            keep = target if not win else min(target, win)
+            kv = getattr(a, "_kv_window", None)
+            if kv is not None and kv.shape[1] > keep:
+                a._kv_window = kv[:, :keep].contiguous()
+            if hasattr(a, "_decode_win_idxs"):
+                a._decode_win_idxs = None
+            comp = getattr(a, "compressor", None)
+            if comp is not None and comp.ratio > 1:
+                want = target % comp.ratio
+                for st in comp._states.values():
+                    pk = st.get("pkv")
+                    if pk is not None and pk.shape[1] > want:
+                        st["pkv"] = pk[:, :want].contiguous()
+                        sc = st.get("psc")
+                        if sc is not None:
+                            st["psc"] = sc[:, :want].contiguous()
+
+    def _draft(self, nid: int, pos: int, draft_len: int) -> list:
+        """One DSpark draft block: target hiddens -> seed -> stages -> head."""
+        stages = self.mtp
+        s0 = stages[0]
+        th = self._target_hidden
+        if not th:
+            return []
+        keys = sorted(th.keys())
+        if len(keys) < len(self.cfg.dspark_target_layer_ids):
+            return []
+        # a draft seeds its attention from the main KV of the current token; state from
+        # the previous draft must not leak in (measured: draft 2 vs draft 3 disagreed
+        # on the 4th token because the window kept the earlier block)
+        for st in stages:
+            st.attn.reset()
+        main_x = s0.main_hiddens([th[k] for k in keys])
+        tok = torch.tensor([[nid]], device=self.device)
+        x = s0.forward_embed(tok)
+        pre = torch.zeros(1, x.size(1), self.cfg.hc_mult, device=self.device)
+        pre[:, :, 0] = 1.0
+        for st in stages:
+            x, pre = st.forward(x, pos, pre, main_x)
+        dlogits, _conf = stages[-1].forward_head(x, pre, tok)
+        if dlogits is None:
+            return []
+        n = min(draft_len, dlogits.size(1))
+        return [int(dlogits[0, i].argmax()) for i in range(n)]
     def load_mtp(self) -> bool:
         """Load the three DSpark stages if their shards are on disk."""
         from .mtp import load_mtp
@@ -816,25 +879,30 @@ class Engine:
 
     def speculative_generate(self, prompt_ids, max_new_tokens: int = 32, draft_len: int | None = None,
                              temperature: float = 0.0, eos_token_id=None):
-        """MTP speculative decoding: draft with the DSpark stages, verify with one main forward.
+        """MTP speculative decoding: one main forward verifies a whole draft block.
 
-        Draft chain (official DFlash contract, see mtp.py):
-            target hiddens -> main_x -> draft attention seed
-            golden token   -> noise-filled draft block -> stage0..2 -> forward_head logits
-        Verification: the main model's argmax at each accepted position must equal the
-        draft token; the first mismatch truncates the run. KV is snapshotted/rolled back
-        so the main model state stays exact. Returns (tokens, accept_rate).
+        Draft (official DFlash contract, see mtp.py):
+            target hiddens of layers 37/38/39 -> main_proj/main_norm -> main_x
+            golden token -> noise-filled draft block -> stage 0..2 -> head logits
+        Verify:
+            one main forward over the drafts; preds[t] is the argmax at each position;
+            accept the longest matching prefix, then truncate the KV to pos+accepted so
+            the rejected positions never enter the cache. The logits of the last
+            accepted position become the next step's logits -- nothing is replayed.
         """
         from .nn import sample_logits
+
         if getattr(self, "mtp", None) is None and not self.load_mtp():
-            raise RuntimeError("MTP weights are not available (model-00044..46 not downloaded?)")
-        draft_len = draft_len or min(self.cfg.dspark_block_size, 4)
-        stages, s0 = self.mtp, self.mtp[0]
+            raise RuntimeError("MTP weights are not available (model-00044..46 missing?)")
+        draft_len = draft_len or self.cfg.dspark_block_size
         ids = list(prompt_ids)
         out: list[int] = []
-        accepted_total = drafted_total = 0
+        acc = drafted = 0
         with torch.inference_mode():
             logits = self.forward(torch.tensor([ids], device=self.device), 0)
+            if self.device != "cpu":
+                torch.cuda.empty_cache()
+            pos = len(ids)
             while len(out) < max_new_tokens:
                 nid = int(sample_logits(logits[0, -1], temperature))
                 out.append(nid)
@@ -842,49 +910,41 @@ class Engine:
                     break
                 if len(out) >= max_new_tokens:
                     break
-                # advance the main model with nid; captures dspark target hiddens
-                logits = self.forward(torch.tensor([[nid]], device=self.device), start_pos=len(ids))
-                ids.append(nid)
-                th = self._target_hidden
-                if not th:
-                    continue
-                main_x = s0.main_hiddens([th[i] for i in sorted(th.keys())])
-                pos = len(ids)  # draft positions start after the accepted token
-                x = s0.forward_embed(torch.tensor([[nid]], device=self.device))
-                pre = torch.zeros(1, x.size(1), self.cfg.hc_mult, device=self.device)
-                pre[:, :, 0] = 1.0
-                for st in stages:
-                    x, pre = st.forward(x, pos, pre, main_x)
-                dlogits, _conf = stages[-1].forward_head(x, pre, torch.tensor([[nid]], device=self.device))
-                if dlogits is None:
-                    continue
-                drafts = [int(dlogits[0, i].argmax()) for i in range(min(draft_len - 1, dlogits.size(1)))]
+                logits = self.forward(torch.tensor([[nid]], device=self.device), start_pos=pos)
+                pos += 1
+                drafts = self._draft(nid, pos, draft_len)
                 if not drafts:
                     continue
-                # verify: one main forward over the draft block, compare argmax position-wise
-                snap = self.snapshot()
+                span = self._window_span()
+                cheap = span == 0 or pos + len(drafts) <= span
+                snap = None if cheap else self.snapshot()
                 vlogits = self.forward(torch.tensor([drafts], device=self.device), start_pos=pos)
-                self.restore(snap)
                 preds = [logits[0, -1]] + [vlogits[0, t] for t in range(len(drafts) - 1)]
-                accepted = 0
+                j = 0
                 for t, cand in enumerate(drafts):
                     if int(preds[t].argmax()) == cand:
-                        accepted += 1
+                        j += 1
                     else:
                         break
-                drafted_total += len(drafts)
-                accepted_total += accepted
-                if accepted:
-                    out.extend(drafts[:accepted])
-                    ids.extend(drafts[:accepted])
-                    logits = self.forward(torch.tensor([drafts[:accepted]], device=self.device), start_pos=pos)
-                if len(out) >= max_new_tokens:
-                    break
-                if not accepted and len(drafts) and len(out) < max_new_tokens:
-                    # no progress from the draft block: fall back to a plain decode step
-                    pass
-        rate = accepted_total / drafted_total if drafted_total else 0.0
+                drafted += len(drafts)
+                acc += j
+                if j < len(drafts):
+                    if cheap:
+                        self._kv_truncate(pos + j)
+                    else:
+                        self.restore(snap)
+                        if j:
+                            vlogits = self.forward(
+                                torch.tensor([drafts[:j]], device=self.device), start_pos=pos)
+                if j:
+                    out.extend(drafts[:j])
+                    pos += j
+                    logits = vlogits[0, j - 1:j]
+                    if eos_token_id is not None and drafts[j - 1] == eos_token_id:
+                        break
+        rate = acc / drafted if drafted else 0.0
         return out[:max_new_tokens], rate
+
 
     def generate(self, prompt_ids, max_new_tokens: int = 16, temperature: float = 0.0, eos_token_id=None,
                  top_p: float = 1.0, top_k: int = 0):

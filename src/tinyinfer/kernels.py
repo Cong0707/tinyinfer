@@ -123,6 +123,12 @@ def sparse_attn_dispatch(q, kv, attn_sink, topk_idxs, scale: float, prefer_tilel
             out = sparse_attn_tl(q, kv, attn_sink, topk_idxs, scale)
             _TL_STATE = True
             return out
-        except Exception:
+        except Exception as _exc:
+            import os as _os
+            if _os.environ.get("TI_TL_DEBUG"):
+                import traceback
+                print(f"[sparse_attn] tilelang failed for shape q={tuple(q.shape)} "
+                      f"kv={tuple(kv.shape)} idx={tuple(topk_idxs.shape)}: {_exc!r}", flush=True)
+                traceback.print_exc()
             _TL_STATE = False
     return sparse_attn_ref(q, kv, attn_sink, topk_idxs, scale)

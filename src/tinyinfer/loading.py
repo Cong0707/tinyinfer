@@ -2064,7 +2064,9 @@ class ExpertStore:
         if getattr(self, "_fetch_pool", None) is None:
             import concurrent.futures
             self._fetch_pool = concurrent.futures.ThreadPoolExecutor(
-                max_workers=8, thread_name_prefix="expert-fetch")
+                # 12 concurrent blobs (M=2 verify) drove the SSD into a 0.4GB/s regime;
+                # four keeps the queue inside what this device likes
+                max_workers=4, thread_name_prefix="expert-fetch")
         ids = [int(e) for e in experts]
 
         def run():

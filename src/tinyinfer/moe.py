@@ -63,12 +63,16 @@ class Expert:
         self.fp4 = None  # optional (w1,s1,w2,s2,w3,s3) tuple: compute without bf16 dequant
 
     def to(self, device):
+        # torch.Tensor.to returns a NEW tensor; dropping the result left the weights on
+        # the CPU (crash: "mat2 is on cpu ... other tensors on cuda")
         for name in ("w1", "w2", "w3"):
             w = getattr(self, name)
-            if hasattr(w, "to"):
-                w.to(device)
-            else:
+            if w is None:
+                continue
+            if isinstance(w, torch.Tensor):
                 setattr(self, name, w.to(device))
+            elif hasattr(w, "to"):
+                w.to(device)  # QuantLinear.to is in-place
         if self.fp4 is not None:
             self.fp4 = tuple(t.to(device) for t in self.fp4)
         return self
@@ -78,7 +82,10 @@ class Expert:
         from .gemm import fp4_linear
 
         w1, s1, w2, s2, w3, s3 = self.fp4
-        if x.size(0) > 1 and x.is_cuda:
+        # the fused prefill kernel is built for chunk-sized M; at M=2..8 it measured
+        # 7.5x slower per layer than the GEMV path (667ms vs 89ms), so only real
+        # prefill shapes use it
+        if x.size(0) > 8 and x.is_cuda:
             # chunked prefill: one fused kernel does gate+up+silu, another does down+scale
             try:
                 from .moe_fused import fused_fp4_expert_ffn
@@ -139,29 +146,42 @@ class MoE:
         self._last_ids: list[int] | None = None
         self.swiglu_limit = cfg.swiglu_limit
 
+    def _expert_from(self, get) -> Expert:
+        """Build an Expert from a name->tensor accessor, packed fp4 when on CUDA."""
+        target = self.gate.weight.device
+        if target.type == "cuda":
+            e = Expert(None, None, None, self.swiglu_limit)
+            e.fp4 = (
+                get("w1.weight").to(target), get("w1.scale").to(target),
+                get("w2.weight").to(target), get("w2.scale").to(target),
+                get("w3.weight").to(target), get("w3.scale").to(target),
+            )
+            return e
+        return Expert(
+            dequant_fp4_block(get("w1.weight"), get("w1.scale")),
+            dequant_fp4_block(get("w2.weight"), get("w2.scale")),
+            dequant_fp4_block(get("w3.weight"), get("w3.scale")),
+            self.swiglu_limit,
+        )
+
+    def _make_expert(self, rec) -> Expert:
+        """Materialise one expert for the gate's device: fp4 stays packed on CUDA.
+
+        Dequantising on the host costs 74ms per expert (measured), which would dominate
+        any CPU-side path, so the packed fp4 tensors go to the device and the fp4 kernel
+        consumes them directly.
+        """
+        return self._expert_from(rec.tensor)
+
     def _expert(self, i: int) -> Expert:
         e = self._expert_cache.get(i)
         if e is None:
             if self._expert_store is not None:
-                # zero-copy views are only valid inside the context; dequant copies out
                 with self._expert_store.experts(self.layer_id, [i]) as recs:
-                    rec = recs[0]
-                    w = {n: dequant_fp4_block(rec.tensor(n + ".weight"), rec.tensor(n + ".scale"))
-                         for n in ("w1", "w2", "w3")}
-                e = Expert(w["w1"], w["w2"], w["w3"], self.swiglu_limit)
+                    e = self._make_expert(recs[0])
             else:
                 p = f"layers.{self.layer_id}.ffn.experts.{i}."
-                e = Expert(
-                    dequant_fp4_block(self._store.get(p + "w1.weight"), self._store.get(p + "w1.scale")),
-                    dequant_fp4_block(self._store.get(p + "w2.weight"), self._store.get(p + "w2.scale")),
-                    dequant_fp4_block(self._store.get(p + "w3.weight"), self._store.get(p + "w3.scale")),
-                    self.swiglu_limit,
-                )
-            # match the device Block.to() moved the gate to
-            target = self.gate.weight.device
-            e.w1 = e.w1.to(target)
-            e.w2 = e.w2.to(target)
-            e.w3 = e.w3.to(target)
+                e = self._expert_from(lambda n: self._store.get(p + n))
             self._expert_cache[i] = e
         return e
 
@@ -239,13 +259,11 @@ class MoE:
                             )
                             y[idx] += e.forward_fp4(xf[idx], weights[idx, top, None]).float()
                         else:
-                            e = Expert(
-                                dequant_fp4_block(rec.tensor("w1.weight"), rec.tensor("w1.scale")),
-                                dequant_fp4_block(rec.tensor("w2.weight"), rec.tensor("w2.scale")),
-                                dequant_fp4_block(rec.tensor("w3.weight"), rec.tensor("w3.scale")),
-                                self.swiglu_limit,
-                            )
-                            y[idx] += e.forward(xf[idx], weights[idx, top, None])
+                            e = self._make_expert(rec)
+                            if e.fp4 is not None:
+                                y[idx] += e.forward_fp4(xf[idx], weights[idx, top, None]).float()
+                            else:
+                                y[idx] += e.forward(xf[idx], weights[idx, top, None])
                         if limit > 0:
                             if len(self._expert_cache) >= limit:
                                 self._expert_cache.pop(next(iter(self._expert_cache)))
@@ -279,7 +297,10 @@ class MoE:
                 e = self._expert(i)
                 if limit > 0 and len(self._expert_cache) > limit:
                     self._expert_cache.pop(next(iter(self._expert_cache)))
-                y[idx] += e.forward(xf[idx], weights[idx, top, None])
+                if e.fp4 is not None:
+                    y[idx] += e.forward_fp4(xf[idx], weights[idx, top, None]).float()
+                else:
+                    y[idx] += e.forward(xf[idx], weights[idx, top, None])
 
         y += self.shared.forward(xf)
         return y.to(x.dtype).view(shape)
