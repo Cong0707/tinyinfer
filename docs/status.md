@@ -54,10 +54,11 @@ not code changes. The IO arithmetic in docs/lower_bounds.md is the invariant.
 
 ## What the output looks like
 
-A 20-token run of the question/answer prompt is coherent (' The answer is 3.14.\nThe
-question is "What is the value of pi?"'), i.e. the engine produces sensible text for
-this base model when the prompt is a question; the earlier '## 第2题' continuation came
-from the math-quiz framing of that run, which is the model's own distribution.
+A 20-token run of the question/answer prompt is coherent, and the France question
+now answers correctly: ' Paris\n- 1. The first thing that I did was to take the dog
+out of the'. Another run: ' The answer is 3.14.\nThe question is "What is the value
+of pi?"'. The engine produces sensible text for this base model when the prompt is a
+question; templated continuations come from the model's own distribution.
 
 The checkpoint is a **base (pre-SFT) model** with no chat template: its own top-1 for
 'The capital of France is' is '#' (13.25) over 'Paris' (12.5), so templated
