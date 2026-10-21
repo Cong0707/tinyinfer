@@ -43,6 +43,10 @@ degraded output.
     python -m tinyinfer.cli serve --backend tiny --model-dir E:\Models\DeepSeek-V4.1-Flash-1017 --port 8000
     curl -X POST http://127.0.0.1:8000/generate -d '{"prompt": "...", "max_new_tokens": 8}'
 
+    # the base model answers question-shaped prompts best (measured):
+    #   "Question: What is the capital of France?\nAnswer:" -> " France is a country in Europe..."
+    #   "Question: What is pi?\nAnswer:"                   -> " The answer is 3.14..."
+
     # or from Python
     from tinyinfer.engine import Engine
     eng = Engine.from_hf(model_dir, device="cuda", tokenizer=tok, allow_missing_layers=True)
