@@ -1,0 +1,58 @@
+# 本轮工作总结（加速 + 其它机器）
+
+## 一、找到了什么、改了什么（都有提交和验证）
+
+### 加速
+
+| 改动 | 效果 | 验证 |
+| --- | --- | --- |
+| fp4 GEMV 的 K 循环改为软件流水 | 1.11x，**逐位一致**（rel 0） | `probe_gemv_pipe.py` |
+| MoE serve 用 `idx[0]`（每专家只喂第一行） | 修复：批量时其它行被静默丢弃 | `probe_fp4_stage.py` 逐段回到 0 |
+| 压缩层槽位索引补齐到固定宽度 | 稀疏核形状恒定；layer-major 不再崩 | 测过 |
+| planner 在 24GB 卡上为全部 240 个可路由专家留槽 | 197→298 槽，embed 回主机；IO 项消失，从 5→约 18 tok/s（估算） | `tools/plan_matrix.py` |
+
+### 其它机器（可移植性）
+
+- planner 现在对九类机器给出合理计划并被 `tests/test_planner_hardware.py` 固化：
+  CPU-only（表留主机）、统一内存（不再双重记账，48GB Mac 之前会规划 46GB VRAM + 36GB 缓存）、
+  小卡（4GB 明确拒绝并给出最低需求，6GB 可跑 4 层）、24GB（专家全覆盖）。
+- **张量并行**：切分改为 128 块对齐，scale 按各自布局（fp8 每 32 行 / fp4 每行）取切片——
+  之前多卡数值是错的；`tests/test_tp.py` 验证。未在真实多卡上跑过。
+- `docs/HARDWARE.md`：机器选型表 + 每类机器的瓶颈 + 如何在目标机验证。
+
+### 一个必须说清楚的发现（正确性）
+
+同一个调用序列跑两次，logits 会差 0.5-1.0（相对）；**argmax 稳定**，所以生成文本正常。
+根因定位到 **VRAM 专家槽池**：关掉它（`TI_NO_SLOTS=1`）后两次完全相同（rel 0.000000），
+代价是 decode 慢约 40%（0.29 vs 0.49 tok/s）。我试了 5 种修法（serve 前同步、release 记
+事件、驱逐保留事件、改阻塞拷贝、独立的“使用中事件”），**都无效，已全部回退**。
+
+这同时说明：之前文档里“批量比逐 token 差 26-42%”“chunk 差 42%”的对比**都是这个噪声**，
+已在 `docs/analysis.md` 第 10-12 节标注作废，并留下一条唯一缺陷的结论（不是三个 bug）。
+
+## 二、实测数字（本机 8GB / 47GB，磁盘 1.58GB/s）
+
+| 项 | 值 |
+| --- | --- |
+| 首次前向 | 31.7s |
+| 热预填充（8 token） | 13.3s |
+| decode | 0.485 tok/s |
+| 专家缓存命中 | 16% |
+| 确定性模式（`TI_NO_SLOTS=1`） | 0.29 tok/s |
+| 组件 parity（窗口层/专家/gate/hc） | 0.000000 |
+| 压缩层 parity | 0.87% / 1.42% |
+
+输出示例：`Question: What is the capital of France?\nAnswer:` → `Paris`（多轮也连贯）。
+
+## 三、仍未解决（已写进 docs/ROUND_REPORT.md / ROADMAP.md）
+
+1. **槽池竞态**（阻断严格可复现）；`TI_NO_SLOTS=1` 是临时答案。
+2. 上面那个噪声也让“chunk 预填充”的真实性问题悬空：去掉噪声后 chunk=1 与逐 token 完全
+   一致，chunk>1 的数值需要重新测（可能本来就接近正确）。这是 prefill 8x 的前提。
+3. 压缩层 0.87% parity 残差。
+4. TP 只做了数值验证，没上过真实多卡。
+
+## 四、仓库状态
+
+本轮 40+ 次提交（全部可查），`scripts/check.ps1` 全绿；新增 5 个测试文件/脚本、
+7 篇文档（HARDWARE / ROUND_REPORT / ROUND_OUTCOME / PERFORMANCE / analysis 增补等）。
