@@ -29,6 +29,7 @@ them is required to run.
 | TI_BF16_CACHE | 1 keeps up to 8 bf16 expert copies per layer (VRAM cost, use on big cards) |
 | TI_NO_MASK_CACHE | 1 disables the indexer visibility-mask cache |
 | TI_MULTIROW_GEMV | 1 opts into the multi-row fp4 kernel (exact on synthetic weights, not on real ones) |
+| TI_NO_SLOTS | 1 disables the VRAM expert-slot pool: deterministic logits, ~40% slower decode (docs/analysis.md §10) |
 
 ## Measurement
 
