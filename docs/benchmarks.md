@@ -14,6 +14,7 @@ invariant to compare across runs is the ratio to the IO floor (docs/lower_bounds
 | end of round | 1.4GB/s | 2.5-3s | 0.40-0.46 | disk at its slowest; code unchanged from the 1.66s run |
 | later | 1.5GB/s | 2.5s | 0.41 | disk recovering; warm prefill 11.5s |
 | later | 1.5GB/s | 2.3-2.5s | 0.44 | warm prefill 12.1s, hit 16% |
+| later | 1.5GB/s | 3.2s | 0.31 | `TI_MULTIROW_GEMV=1`: serve 184ms vs 168ms, so the batch kernel buys nothing at decode (one row per expert) |
 
 ## Where the time goes (1.66s step, 4.5GB/s disk)
 
