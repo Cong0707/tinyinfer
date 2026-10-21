@@ -54,9 +54,10 @@ not code changes. The IO arithmetic in docs/lower_bounds.md is the invariant.
 
 ## What the output looks like
 
-A 20-token run of the question/answer prompt was coherent for the first sentences
-(' The answer is 2.5.') and then fell into the base model's templated continuation
-('## 第2题'), which is its training distribution, not a decode failure.
+A 20-token run of the question/answer prompt is coherent (' The answer is 3.14.\nThe
+question is "What is the value of pi?"'), i.e. the engine produces sensible text for
+this base model when the prompt is a question; the earlier '## 第2题' continuation came
+from the math-quiz framing of that run, which is the model's own distribution.
 
 The checkpoint is a **base (pre-SFT) model** with no chat template: its own top-1 for
 'The capital of France is' is '#' (13.25) over 'Paris' (12.5), so templated
