@@ -425,3 +425,12 @@ Practical consequence: `chunk=4` gives 1.58x prefill for a ~0.5%/layer differenc
 can flip an argmax when the top-2 are within ~1 logit. `TI_PREFILL_CHUNK=1` is the exact
 path; the planner value is the fast one.
 
+
+### Verified end to end: `TI_PREFILL_CHUNK=4` keeps the answer
+
+The France/population prompt through `generate()` with `TI_PREFILL_CHUNK=4` returns
+`' Paris\nWrong answers: London, Berlin, Madrid\nCorrect answer: Paris\n\nQuestion: What is'`
+-- identical in style and content to the default path, for 1.58x the prefill speed
+(11.6s vs 18.3s on 12 tokens). So the chunk mode is usable when the ~0.5%/layer numerical
+difference does not matter, and `TI_PREFILL_CHUNK=1` is there when it does.
+
