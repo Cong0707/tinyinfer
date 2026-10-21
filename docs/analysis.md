@@ -253,3 +253,11 @@ prompt differ on their own. With single-token forwards the engine is exactly rep
 (`rel 0.000000`), so the difference is specific to the multi-chunk path and is separate
 from the slot-pool race. It stays open, and the regression test keeps its xfail.
 
+
+- Follow-up: with per-layer dumps of both forwards, **layer 0 already differs (rel 0.19)**
+  on the 4 positions of the first chunk, while its input (the embedding) is identical,
+  and only one chunk's worth of layers is recorded (40 entries for a 24-token prompt that
+  should run three chunks). So the multi-chunk path has a state handoff problem of its
+  own, separate from the slot race, and it starts at the first layer rather than
+  accumulating with depth. Not fixed in this round; documented for the next one.
+
