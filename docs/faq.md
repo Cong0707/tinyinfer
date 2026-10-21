@@ -80,3 +80,8 @@ Creative prompts likewise follow a math-answer template ('Write a haiku about th
 -> ' The answer is 1, but the obvious proof is not much at'), consistent with the
 capability note above.
 
+
+- Factual questions are inconsistent rather than uniformly right: 'capital of Japan'
+  produced a sentence about Japan's monarchy, 'who wrote Romeo and Juliet' fell into the
+  multiple-choice template. Same base-model capability, same conclusion.
+
