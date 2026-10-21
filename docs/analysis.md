@@ -299,3 +299,25 @@ from the slot-pool race. It stays open, and the regression test keeps its xfail.
   independent of reset. A deterministic accumulation (sort by index, or accumulate into a
   per-expert buffer and reduce in fixed order) is the next thing to try.
 
+
+## 11. The multi-row difference is (mostly) reduction-order, not a logic bug
+
+`sparse_attn_dispatch` versus the numpy-style reference `sparse_attn_ref` on the same
+causal indices: **rel 0.000000 for s=1** (the parity in docs/parity.md is single-token)
+and **rel 0.0033 for s=24**. The kernel computes the softmax reduction with a tilelang
+`Pipelined`/`reduce_max`/`reduce_sum` over 32-wide blocks whose parallel accumulation
+order changes with the row length; at s=1 there is one row per block and the order is
+fixed, at s=24 the long rows expose it.
+
+That single fact explains the whole reproducibility picture:
+
+- single-token forwards are exactly reproducible (s=1 reductions),
+- a 24-token prefill differs between two identical runs by 18-20 logits, with or without
+  a reset, starting at layer 0 (the first softmax), growing with depth,
+- and `TI_NO_SLOTS=1` removes a *second*, unrelated source (the slot pool).
+
+So the fix for chunked prefill is not "find the state leak" but "make the s>1 reductions
+deterministic" (or bit-match the reference): a fixed reduction tree in the kernel, or the
+reference path for prefill. That is the next concrete task; it is what stands between
+chunk=1 and an 8x faster prefill.
+
