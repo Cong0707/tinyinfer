@@ -77,7 +77,12 @@ tinyinfer/
   - OpenAI API（多 slot/SSE/function calling 回显）端到端通过
 - [x] 测试 68 passed / 文档（benchmarks/kernels/loading/api/mtp_design/deepinfer_ref）/ bootstrap / git
 
-**进行中**：engram 表下载（72%，~3.5h）；MTP 投机验证（三 stage 加载成功）；流式层 H2D 与专家 IO 进一步重叠（显存预算约束）。
+- [x] P6 HF 仓库直载：`Engine.from_hf(repo_id | hub snapshot | 平铺目录)`——模型统一放 `E:\Models\<repo-name>`（HF 平铺布局），适配器自动解析；也接受 HF hub 缓存快照。
+- [x] P7 MTP：3 stage 权重加载 + 官方 DFlash 契约前向链（main_hiddens/forward_embed/滑窗 attention/MoE/HC/forward_head=主head+markov+confidence）全部跑通（`scripts/e2e_mtp.py`）。
+  - 投机解码实测负结果：accept_rate 0%、比常规 decode 慢（draft 分布待参考数值验证），已记录 docs/mtp_design.md，暂不启用。
+- [x] P8 回归：pytest **68 passed / 1 skipped**（含 attention/compressor/server/quant）。
+
+**进行中**：engram 表下载（00048 分片进行中，完成后 `E:\Models\DeepSeek-V4.1-Flash-1017` 全量终验）；流式层 H2D 与专家 IO 进一步重叠（显存预算约束）；MTP 投机的参考数值对齐。
 ## 优化分级（O1 → O4）
 
 像编译器的 -O 级别一样，tinyinfer 的加速按可验证的阶梯推进；每一级都保留上一级的正确性基准：
