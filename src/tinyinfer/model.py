@@ -156,14 +156,29 @@ class Block(HCBlockMixin):
 
             self._cpu_refs = [_pin(t) for (_, _, t) in paths]
         import os as _os
-        if _os.environ.get("TI_STAGING"):
-            from .cpu_kernels import stage_tensor_to_device
+        from .cpu_kernels import slab
 
-            for (owner, name, _), cpu in zip(paths, self._cpu_refs):
-                # pinned staging measured SLOWER here (0.142 vs 0.304 tok/s): each small
-                # tensor waits for a synchronous H2D, and the win of pinned bandwidth
-                # does not cover the serialization. Opt-in only.
-                setattr(owner, name, stage_tensor_to_device(cpu, device))
+        st = None if _os.environ.get("TI_SLAB") is None else slab()
+        if st is not None:
+            # one layer = one pinned memcpy + one pinned H2D. Pageable per-tensor copies
+            # were 763 transfers x 781us (8.3GB/s); a 190MB pinned H2D is ~7ms at 26GB/s.  # noqa: E501
+            nbytes = [t.numel() * t.element_size() for (_, _, t) in paths]
+            offsets = []
+            off = 0
+            for n in nbytes:
+                off = (off + 255) // 256 * 256  # 256B alignment: tilelang kernels require it
+                offsets.append(off)
+                off += n
+            total = (off + 255) // 256 * 256
+            if total <= st.numel():
+                for (owner, name, t), cpu, o, n in zip(paths, self._cpu_refs, offsets, nbytes):
+                    st[o:o + n].copy_(cpu.reshape(-1).view(torch.uint8), non_blocking=False)
+                gpu = st[:total].to(device, non_blocking=False)  # single pinned H2D
+                for (owner, name, t), o, n in zip(paths, offsets, nbytes):
+                    setattr(owner, name, gpu[o:o + n].view(t.dtype).view(t.shape))
+            else:
+                for (owner, name, _), cpu in zip(paths, self._cpu_refs):
+                    setattr(owner, name, cpu.to(device, non_blocking=True))
         else:
             for (owner, name, _), cpu in zip(paths, self._cpu_refs):
                 setattr(owner, name, cpu.to(device, non_blocking=True))
