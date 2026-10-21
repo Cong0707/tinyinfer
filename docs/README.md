@@ -16,6 +16,7 @@
 | ENV.md | every environment switch (measurement and A/B only) |
 | changelog.md | chronological notes of each round |
 | CONTRIBUTING.md | ground rules, workflow, how to add an optimisation |
+| GLOSSARY.md | the project's terms (slab, ring, slot, record, tier, ...) |
 
 ## Reading order
 
