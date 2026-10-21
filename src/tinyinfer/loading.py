@@ -1152,25 +1152,27 @@ class ARCPolicy(_Policy):
         self.t2.pop(key, None)
 
     def evict_one(self, is_pinned):
+        # linear scan for the first un-pinned key; no full-dict copies (O(n) lists)
+        # inside the cache lock -- misses hit this path on every insert
         if self.t1 and len(self.t1) > self.p:
-            for key in list(self.t1):
-                if not is_pinned(key):
-                    self.t1.pop(key)
-                    self.b1[key] = None
-                    self._trim_ghost()
-                    return key
-        for key in list(self.t2):
-            if not is_pinned(key):
-                self.t2.pop(key)
-                self.b2[key] = None
+            victim = next((k for k in self.t1 if not is_pinned(k)), None)
+            if victim is not None:
+                self.t1.pop(victim)
+                self.b1[victim] = None
                 self._trim_ghost()
-                return key
-        for key in list(self.t1):
-            if not is_pinned(key):
-                self.t1.pop(key)
-                self.b1[key] = None
-                self._trim_ghost()
-                return key
+                return victim
+        victim = next((k for k in self.t2 if not is_pinned(k)), None)
+        if victim is not None:
+            self.t2.pop(victim)
+            self.b2[victim] = None
+            self._trim_ghost()
+            return victim
+        victim = next((k for k in self.t1 if not is_pinned(k)), None)
+        if victim is not None:
+            self.t1.pop(victim)
+            self.b1[victim] = None
+            self._trim_ghost()
+            return victim
         return None
 
     def __len__(self):
