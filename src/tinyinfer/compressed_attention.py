@@ -158,7 +158,8 @@ class MLACompressedAttention:
 
         # ---- compressed KV ----
         end_pos = start_pos + s
-        compress_len = end_pos // self.ratio
+        ratio_now = self.ratio if self.is_kv_source else (shared_attn.src_ratio or self.ratio)
+        compress_len = end_pos // ratio_now
         latent = self.compressor.forward(x, start_pos) if self.compressor is not None else None
         if latent is not None:
             start_group = start_pos // self.ratio

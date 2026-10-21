@@ -49,6 +49,13 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
     """
     if x.dtype != torch.bfloat16:
         x = x.to(torch.bfloat16)
+    # decode (M==1): single fused GEMV kernel instead of the block_M=32 GEMM
+    if x.dim() == 2 and x.size(0) == 1 and x.is_cuda:
+        try:
+            from .gemv_fp8 import gemv_fp8
+            return gemv_fp8(x, w_fp8, w_scale)
+        except Exception:
+            pass
     with _bf16_default():
         x_fp8, x_s = _k.act_quant(x, block, SCALE_FMT, SCALE_DTYPE)
         return _k.fp8_gemm(x_fp8, x_s, w_fp8, w_scale, SCALE_DTYPE, block_size=block)

@@ -61,6 +61,8 @@ set "PATH=%CUDA_HOME%\bin;%PATH%"
 | `fused/bench_hc_fused.py` | 真实 L0 HC：torch vs fused，正确性/耗时/kernel 数 | ✅ |
 | `fused/gemv_fp8.py` | decode fp8 GEMV（bf16 入口 / 预量化 / pq4 / RoPE epilogue） | ✅ |
 | `fused/bench_gemv_fp8.py` | 真实 L0 四个 GEMM：official vs GEMV，带宽/正确性 | ✅ |
+| `fused/moe_fused.py` | fused_fp4_swiglu / down / expert_ffn（pq + bf16 变体） | ✅ |
+| `fused/bench_moe_fused.py` | 真实 L0 专家：官方 fp4 分步 vs fused，正确性/耗时/kernel 数 | ✅ |
 
 ## 2026-10-21 第二轮新增结论（详见 `docs/kernels.md` 2.9-2.11、第 8 节）
 
@@ -153,3 +155,21 @@ M=1 时官方 fp8_gemm 的 block_M=32 浪费 31/32 行。GEMV 改为每个线程
 - 四 GEMM ~597 → ~350 µs/层，40 层约省 10 ms/token。
 - 变体：wq_b pq4(32/64)=139.7 < pq8=170.6；wo_b bf16=147.1 < pq8=173.2 < pq4≈200+（K=8192 时 4-FMA/迭代不划算）。
 - 限制：32 B/warp/迭代的 sector 读，尚未做 16B 向量 load；下一步 16B/thread + 2 warps/行、或 wq_b 与 act_quant 单 kernel 融合。wo_a 是分组 8×(1024×4096)，本表未按单 GEMV 计。
+
+## 2026-10-21 第六轮：MoE 融合 kernel（moe_fused.py）
+
+每个专家：gate/up 两次 fp4 GEMM + clamp + silu 融成一个 kernel；down GEMM + 路由权重融成第二个。
+
+真实 L0 expert 0 权重、median of 3、含 act_quant：
+
+| M | 官方 fp4 分步 | fused（最佳配置） | 加速 | rel err |
+|---:|---:|---:|---:|---:|
+| 8 | 246.2 µs | 146.5 µs（bm=16,bn=64） | 1.68x | 1.97e-3 |
+| 64 | 387.0 µs | 273.9 µs（bm=64,bn=128） | 1.41x | 1.91e-3 |
+
+- 正确性 <1e-2；关键：epilogue 必须先把 gate/up round 到 bf16 再 clamp/silu（否则 h 差 0.2%，经 h act_quant 放大到 1.4e-2）。
+- 每专家 launch-ish op：官方 19 → fused 4（2 act_quant + 2 tilelang）；6 专家/层 114 → 24。
+- 每层省 ~0.6–0.7 ms；40 层约 24–27 ms/token。
+- bf16 内置量化变体（单 kernel）实测 1.7 ms/专家，不要用（每个 N block 重复量化 A）。
+- **~6 kernel/层目标未达**：需全专家 grouped kernel（堆叠 6 组权重或 pointer table + expert 维 grid）；单专家单 kernel 不可行（down 需要完整 h 行，跨 block 同步）。
+- 接入：moe.Expert.forward → fused_fp4_expert_ffn（专家权重保持 fp4 packed，路由权重传给 down）。

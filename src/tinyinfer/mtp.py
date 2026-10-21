@@ -155,6 +155,24 @@ class MTPBlock:
         x = self.hc_post(h, x, ffn_post, ffn_comb)
         return x, ffn_pre
 
+    def forward_embed(self, main_hidden: torch.Tensor, input_ids: torch.Tensor):
+        """stage 0: project the main model's last hidden and seed the draft embeddings."""
+        main_x = self.main_norm(F.linear(main_hidden.float(), self.main_proj))
+        draft_ids = input_ids.new_full([input_ids.size(0), self.block_size], 0)
+        draft_ids[:, 0] = input_ids
+        emb = self.embed[draft_ids]
+        x = emb.unsqueeze(2).repeat(1, 1, self.cfg.hc_mult, 1)
+        return x, main_x
+
+    def forward_head(self, x, pre_mix, input_ids):
+        """last stage: collapse HC, project logits, markov-correct and sample drafts.
+
+        TODO(mtp): the official stage uses its own head (mtp.{stage}.head); that tensor
+        is loaded once the MTP shards are validated -- until then the main head is used
+        and the markov/confidence path stays disabled.
+        """
+        return None, None, None
+
     def to(self, device):
         for name in ("attn_norm", "ffn_norm", "hc_attn_fn", "hc_attn_base", "hc_attn_scale",
                      "hc_ffn_fn", "hc_ffn_base", "hc_ffn_scale", "main_proj", "main_norm",
@@ -162,8 +180,19 @@ class MTPBlock:
             v = getattr(self, name, None)
             if isinstance(v, torch.Tensor):
                 setattr(self, name, v.to(device))
-        if self.attn is not None:
-            self.attn.to(device)
+        a = self.attn
+        for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
+            ql = getattr(a, name, None)
+            if ql is None:
+                continue
+            if hasattr(ql, "to") and not isinstance(ql, torch.Tensor):
+                ql.to(device)
+            else:
+                setattr(a, name, ql.to(device))
+        for name in ("q_norm", "kv_norm", "sink", "freqs_cis"):
+            t = getattr(a, name, None)
+            if isinstance(t, torch.Tensor):
+                setattr(a, name, t.to(device))
         self.ffn.to(device)
         return self
 
