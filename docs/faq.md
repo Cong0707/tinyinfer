@@ -53,3 +53,16 @@ distribution ('问题：...\n答案：' -> 'A\n\n解析：...', '请用一句话
 English question prompts answer correctly ('Paris', '3.14'). The engine reproduces the
 checkpoint; Chinese answers need a chat-aligned checkpoint.
 
+
+## Does a multi-turn chat work?
+
+The checkpoint has no chat template, but a flat transcript in the question/answer shape
+continues sensibly (measured):
+
+    Question: What is the capital of France?
+    Answer: Paris
+    Question: What is the population of that city?
+    Answer: -> ' 2,000,000'
+
+so multi-turn use works by appending turns to one transcript and calling `/v1/completions`.
+
