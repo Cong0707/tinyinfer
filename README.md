@@ -26,7 +26,7 @@ experts top-6, fp8 non-expert + fp4 experts) that runs **on an 8GB laptop GPU wi
 | theoretical floor | 1.23s/token = 0.81 tok/s (IO only) |
 | prefill, 8 tokens, warm | ~3s |
 | process start (pinned slab, 13GB) | ~13s, one-off |
-| output | base model: `Question: What is the capital of France?\nAnswer: -> " France is a country in Europe..."` (see docs/faq.md for prompt shapes) |
+| output | `Question: What is the capital of France?\nAnswer: -> Paris`, and `What is pi? -> 3.14` (see docs/faq.md for prompt shapes) |
 
 ## Hardware reality
 
