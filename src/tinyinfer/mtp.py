@@ -266,24 +266,33 @@ class MTPBlock:
         if self.head is not None:
             # main output head may live on CPU (8GB card); move just the activation
             logits = F.linear(h, self.head.to(h.device) if self.head.device != h.device else self.head)
-        markov_emb = None
-        if self.markov_embed is not None and self.markov_head is not None:
-            if draft_ids is None:
-                # first draft round: the block is the noise fill + the golden token
-                draft_ids = torch.full((x.size(0), self.block_size), self.cfg.dspark_noise_token_id,
-                                       dtype=torch.long, device=x.device)
-            if draft_ids.size(1) != self.block_size:
-                pad = torch.full((draft_ids.size(0), self.block_size - draft_ids.size(1)),
-                                 self.cfg.dspark_noise_token_id, dtype=torch.long, device=x.device)
-                draft_ids = torch.cat([draft_ids, pad], dim=1)
-            markov_emb = F.embedding(draft_ids, self.markov_embed)      # official markov_w1
-            logits = logits + F.linear(markov_emb, self.markov_head)    # official markov_w2
         confidence = None
-        if self.confidence_proj is not None:
-            feat = torch.cat([h, markov_emb], dim=-1) if markov_emb is not None else h
-            temperature = 1.0  # official envs.DEEPINFER_DFLASH_CONFIDENCE_HEAD_TEMPERATURE
+        if self.markov_embed is not None and self.markov_head is not None:
+            # official sample_drafts: markov correction is per step and feeds on the
+            # token sampled at the previous step (draft_token_ids evolves).
+            # draft_ids: the already-accepted token(s) for position 0; consumed greedily.
+            if draft_ids is None:
+                raise RuntimeError("forward_head requires the golden token ids for the markov head")
+            ids = draft_ids[:, :1]  # [1, 1] golden token
+            step_logits = []
+            markov_embs = []
+            for i in range(x.size(1)):
+                w1 = F.embedding(ids, self.markov_embed)              # official markov_w1
+                li = logits[:, i] + F.linear(w1.squeeze(1), self.markov_head)  # official markov_w2
+                step_logits.append(li)
+                markov_embs.append(w1.squeeze(1))
+                ids = li.argmax(dim=-1, keepdim=True)                  # next markov input
+            logits = torch.stack(step_logits, dim=1)
+            if self.confidence_proj is not None:
+                feat = torch.cat([h, torch.stack(markov_embs, dim=1)], dim=-1)
+                temperature = 1.0  # official envs.DEEPINFER_DFLASH_CONFIDENCE_HEAD_TEMPERATURE
+                confidence = torch.sigmoid(
+                    F.linear(feat.to(self.confidence_proj.dtype), self.confidence_proj) / temperature
+                ).squeeze(-1)
+        elif self.confidence_proj is not None:
+            temperature = 1.0
             confidence = torch.sigmoid(
-                F.linear(feat.to(self.confidence_proj.dtype), self.confidence_proj) / temperature
+                F.linear(h.to(self.confidence_proj.dtype), self.confidence_proj) / temperature
             ).squeeze(-1)
         return logits, confidence
 

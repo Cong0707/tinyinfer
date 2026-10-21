@@ -547,7 +547,7 @@ class Engine:
                 pre[:, :, 0] = 1.0
                 for st in stages:
                     x, pre = st.forward(x, pos, pre, main_x)
-                dlogits, _conf = stages[-1].forward_head(x, pre, None)
+                dlogits, _conf = stages[-1].forward_head(x, pre, torch.tensor([[nid]], device=self.device))
                 if dlogits is None:
                     continue
                 drafts = [int(dlogits[0, i].argmax()) for i in range(min(draft_len - 1, dlogits.size(1)))]
