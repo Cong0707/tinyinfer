@@ -91,3 +91,45 @@ These are hardware facts on this box (RTX 5060 laptop 8GB, 47GB RAM, NVMe rated
    ~42% of its sequential rating; the next step is IoRing/BypassIO, not more
    threads. The 8GB card is the binding constraint: every extra resident layer
    removes 442MB of H2D per token.
+
+## Pipeline round: what actually overlaps now (2026-10-21, second half)
+
+Instrumented the decode loop with two timers — time spent waiting for the layer H2D
+event (`Engine._h2d_wait_ms`) and time spent waiting for expert disk reads
+(`MoE._disk_wait_ms`) — and built a three-stage pipeline:
+
+1. **Triple-buffered layer streaming** (`TI_FLAT=1`): three rotating 719MB device
+   buffers; layer k computes while k+1 and k+2 copy in on a side stream. Two buffers
+   were not enough: a 719MB H2D takes 27ms and a layer only 15ms, so with two the
+   transfer can never hide.
+2. **Six-way expert fetch** (`MoE.forward`): one `fetch_async` per expert, consumed
+   in two batches of three. The GPU starts on the first three while the last three
+   are still on disk.
+3. **Zero-residency option** (`TI_GPU_LAYERS=0`): every layer streams through the
+   flat pair. Measured: reserved 4198MB (vs 10426MB with per-tensor layer copies),
+   no paging at all.
+
+Measured wait times at 1.54s/token (0.65 tok/s, best run):
+
+| stage | per step | note |
+|---|---|---|
+| layer H2D wait | **9-13ms** | 15GB/token is now hidden by the triple buffer |
+| expert disk wait | **1.0-1.5s** | the remaining bottleneck |
+| GPU compute | ~0.6s | |
+| total | 1.5-2.0s | varies with page-cache state |
+
+So the PCIe side is solved: 15GB of weights arrive without the compute thread ever
+blocking. Everything left is disk: 3.8GB of expert blobs per token at an effective
+~4.6GB/s, and the variance between 1.5s and 3.3s runs tracks the OS page cache.
+
+Next, in order of leverage:
+* **IoRing / deeper async queue** — one 18.8MB read measures 9.4GB/s alone, six
+  concurrent threads do not add up to that, and 8-12 threads already plateaued at
+  6.3GB/s. The gap is queue depth, not the device.
+* **Resident-layer budget** — VRAM sits at 7856/8151MB; every layer moved to
+  residency removes 442MB of H2D, but H2D is already free, so this only helps by
+  shrinking the *host* traffic, not the step.
+* **Gemv for fp8 at M=1** — 195ms of the 600ms GPU time is GEMM doing one row.
+* **MTP / speculative decode** — the only way to amortise the 3.8GB/token that
+  top-6 routing across 384 experts forces us to read.
+

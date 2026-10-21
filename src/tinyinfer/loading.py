@@ -1936,6 +1936,9 @@ class ExpertStore:
         else:
             ev = self.slots.copy_in(slot, data)
             self.slots.publish(slot, ev)
+            # copy_in is a non_blocking H2D on the copy stream; the compute stream must
+            # wait for it or the first expert tiles read garbage
+            self.slots.wait_event(slot)
         return ExpertRecord((layer, expert), self.slots.buffer(slot), blob.tensors, self.device)
 
     def fetch(self, layer: int, experts: Iterable[int], *, cache: bool = True) -> list[ExpertRecord]:
@@ -1943,6 +1946,8 @@ class ExpertStore:
         # batch the disk misses through read_many (parallel pread, lock-free), then
         # materialise sequentially so the slot state machine stays single-threaded
         if len(experts) > 1:
+            # single-expert fetches go to the bytearray reader; the pinned path costs
+            # an 18.8MB cudaHostAlloc per blob and measured 2x slower for that case
             misses = [e for e in experts if not self.ram.contains(layer, e)]
             if misses:
                 # a prefetch for this very expert may already be in flight: wait for it
@@ -2010,6 +2015,23 @@ class ExpertStore:
             fut = self._vram_executor.submit(one, expert)
             self._pending[(int(layer), int(expert))] = fut
         return 0
+
+    def fetch_async(self, layer: int, experts: Iterable[int], *, cache: bool = True) -> Future:
+        """Start a disk read on a private pool so the caller can compute meanwhile."""
+        if getattr(self, "_fetch_pool", None) is None:
+            import concurrent.futures
+            self._fetch_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=8, thread_name_prefix="expert-fetch")
+        ids = [int(e) for e in experts]
+
+        def run():
+            # inference_mode is thread-local: the slot buffers were allocated under it
+            # on the calling thread, so the copy must happen under it here too
+            import torch as _t
+            with _t.inference_mode():
+                return self.fetch(layer, ids, cache=cache)
+
+        return self._fetch_pool.submit(run)
 
     def release(self, records: Iterable[ExpertRecord]) -> None:
         for rec in records:

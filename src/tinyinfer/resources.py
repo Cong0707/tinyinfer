@@ -103,7 +103,7 @@ def plan(hw: Hardware | None = None, n_layers: int = 40) -> Plan:
     # a 21-token prefill on this box). Without reserving it the allocator has to page
     # once the decode kernels get their own workspace (reserved went past 11.9GB on an
     # 8GB card -> 0.10 tok/s). Small cards reserve it, big ones do not need to.
-    ws_gb = 1.6 if budget < 12 else 0.0
+    ws_gb = 2.3 if budget < 12 else 0.0
     resident = budget - EMBED_GB - slot_budget - flat_gb - ws_gb
     head_gpu = resident - HEAD_GB >= 20 * LAYER_GB
     if not head_gpu:
