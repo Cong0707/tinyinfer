@@ -74,7 +74,7 @@ def gemv_pq_kernel(N: int, K: int, rows: int, rope: bool, head_dim: int, rope_di
 
 
 @tilelang.jit(pass_configs=PASS)
-def gemv_bf16_kernel(N: int, K: int, rows: int):
+def gemv_bf16_kernel_v2(N: int, K: int, rows: int):
     nb = K // 32
     grid = T.ceildiv(N, rows)
 
@@ -180,7 +180,7 @@ def fused_fp8_gemv(x_bf16: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Ten
     k = x.numel()
     n = w_fp8.shape[0]
     y = torch.empty(n, device=x.device, dtype=torch.bfloat16)
-    gemv_bf16_kernel(n, k, int(rows))(x, w_fp8.contiguous(), w_scale.contiguous(), y)
+    gemv_bf16_kernel_v2(n, k, int(rows))(x, w_fp8.contiguous(), w_scale.contiguous(), y)
     return y.view(1, n)
 
 
