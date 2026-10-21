@@ -57,3 +57,14 @@ not code changes. The IO arithmetic in docs/lower_bounds.md is the invariant.
 The checkpoint is a **base (pre-SFT) model** with no chat template: its own top-1 for
 'The capital of France is' is '#' (13.25) over 'Paris' (12.5), so templated
 continuations are its behaviour, not an engine defect (docs/analysis.md).
+## Suggested next steps (in value order)
+
+1. Find the batch-vs-row MoE difference (item 1): it is the only blocker for MTP and
+   chunked long prompts. The components each verify exact, so trace the serve loop's
+   row/record sharing.
+2. Close the compressed-layer 0.87% residual against DeepInfer; it is the leading
+   candidate for item 1 and for the session drift.
+3. Re-run benchmarks when the disk volume is back at 4.5GB/s; the code path is unchanged
+   from the 1.66s/token measurement.
+4. If VRAM allows (>=16GB card), resident layers remove 6ms/token each and make the
+   1.23s floor reachable in practice.
