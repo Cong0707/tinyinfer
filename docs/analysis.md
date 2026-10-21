@@ -442,3 +442,21 @@ difference does not matter, and `TI_PREFILL_CHUNK=1` is there when it does.
 That is 1.7x on a long prompt with the default configuration -- no switch needed. The
 first generated token is `<|end|>`, which is what a repeated pangram should produce.
 
+
+### Candidate blocks now respect the per-query visibility (fix kept)
+
+`select_candidate_blocks` pooled block maxima from the raw logits, so a block could be
+scored by positions its query cannot see yet; only the last block was forced in. That is
+a genuine semantics bug for chunked passes (the block a chunk would pick could differ from
+the one the same tokens pick one at a time). It now masks positions beyond `compress_lens`
+before pooling. It did not by itself remove the 0.5% chunk difference, and the suite still
+passes with it, so it stays as a correctness fix rather than a performance one.
+
+Where the remaining chunk gap sits, as far as this investigation got: the first layer
+whose activation differs between chunk=1 and chunk=2 is the first *compressed* layer
+(layer 20, whose compressor is a ratio-1 source and whose indexer is the candidate source).
+Its compressor output matches to 1.6e-7 and its MoE matches exactly, so the gap is in how
+the compressed attention consumes the freshly published groups for several positions at
+once -- the remaining suspect is the group-visibility bookkeeping at the chunk boundary,
+not a matmul or a kernel.
+
