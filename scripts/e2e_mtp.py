@@ -1,9 +1,10 @@
-"""MTP stage smoke test: load mtp.0..2 and run the stage-0 draft chain.
+"""MTP smoke test: load mtp.0..2, run the full draft chain and the last-stage head.
 
 Official DFlash contract:
   golden token -> embed (noise-filled block)        -> draft hiddens x0
-  main_proj(concat device target hiddens) + norm    -> main_x (seeds draft KV)
-  forward(x0, pos, pre, main_x)                     -> draft hiddens (attn+MoE)
+  main_proj(concat target hiddens) + norm           -> main_x (seeds draft KV)
+  stage0..2 forward(x, pos, pre, main_x)            -> draft hiddens
+  stage2.forward_head(hidden, pre_mix, draft_ids)   -> logits + confidence
 """
 from __future__ import annotations
 
@@ -30,24 +31,30 @@ def main() -> None:
     eng = Engine.from_hf(model_dir, device="cuda", tokenizer=tok, max_layers=40, allow_missing_layers=True)
     print("blocks:", eng.max_layers, "gpu_layers:", eng.gpu_layers, flush=True)
     print("load_mtp:", eng.load_mtp(), flush=True)
-    s0 = eng.mtp[0]
+    stages = eng.mtp
+    s0 = stages[0]
 
     golden = torch.tensor([[19923]], dtype=torch.long, device="cuda")
-    eng.forward(golden, start_pos=0)
+    eng.forward(golden, start_pos=0)          # prefill: captures target hiddens + KV
     th = eng._target_hidden
     print("target layers:", sorted(th.keys()), flush=True)
-    target_hiddens = [th[i] for i in sorted(th.keys())]
-    s0.to("cuda")
-    main_x = s0.main_hiddens(target_hiddens)          # [1,1,5120]
+    main_x = s0.main_hiddens([th[i] for i in sorted(th.keys())])
     print("main_x:", tuple(main_x.shape), flush=True)
-    x0 = s0.forward_embed(golden)                     # [1,5,hc,dim]
-    print("x0:", tuple(x0.shape), flush=True)
-    pre = torch.zeros(1, x0.size(1), eng.cfg.hc_mult, device="cuda")
+    x = s0.forward_embed(golden)
+    print("x0:", tuple(x.shape), flush=True)
+    pos = 1                                    # first decode step after prefill
+    pre = torch.zeros(1, x.size(1), eng.cfg.hc_mult, device="cuda")
     pre[:, :, 0] = 1.0
-    # emulate the first decode step after prefill: draft positions 1..block_size
-    out, pre2 = s0.forward(x0, 1, pre, main_x)
+    for st in stages:
+        st.to("cuda")
+        x, pre = st.forward(x, pos, pre, main_x)
     torch.cuda.synchronize()
-    print("stage0 forward ok:", tuple(out.shape), "pre_mix:", tuple(pre2.shape), flush=True)
+    print("draft stages ok:", tuple(x.shape), flush=True)
+    logits, confidence = stages[-1].forward_head(x, pre, golden)
+    if logits is not None:
+        print("head logits:", tuple(logits.shape), "argmax:", int(logits[0, 0].argmax()), flush=True)
+    if confidence is not None:
+        print("confidence:", tuple(confidence.shape), [round(v, 4) for v in confidence[0, :3].tolist()], flush=True)
 
 
 if __name__ == "__main__":
