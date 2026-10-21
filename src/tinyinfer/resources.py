@@ -197,6 +197,7 @@ def model_profile(index: Any) -> dict:
             # this checkpoint: avg 162MB, worst 719MB, real streaming slab 468MB/layer).
             prof["layer_bytes"] = max(avg, 1.0 * mx)
             prof["max_layer_bytes"] = mx
+            prof["topk"] = int(model.get("num_experts_per_tok") or 0) or None
         for key, name in (("embed_bytes", "embed.weight"), ("head_bytes", "head.weight")):
             try:
                 h = header(wm[name])
@@ -420,6 +421,26 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
         spare = max(0.0, V - used)
     slots = int(spare * SLOT_FRACTION // max(1.0, expert_b))
     slots = max(slots, 2) if has_gpu else 0
+
+    # ---- expert coverage beats a device-resident table ---------------------------
+    # A token can route to topk*n_layers distinct experts. Once the slot pool covers
+    # all of them the expert IO term (topk*n_layers*18.8MB per token = 4.5GB, ~1s at
+    # 4.5GB/s) disappears; the price of moving the 1.32GB embedding/head table to the
+    # host is one 10KB row lookup per token (~1ms). On a 24GB card that is 5 -> 80 tok/s.
+    need_slots = int(model.get("topk") or 0) * n_layers
+
+    def _used_with(r, eg, hg):
+        return ((embed_b if eg else 0.0) + (head_b if hg else 0.0)
+                + r * layer_b * LAYER_SLACK + buffers * max_layer_b + ws0 + runtime_b)
+
+    if need_slots and has_gpu and slots < need_slots and (embed_gpu or head_gpu):
+        for _eg, _hg in ((False, False), (False, True), (True, False)):
+            _r2 = min(n_layers, layers_that_fit(_eg, _hg, buffers, ws0))
+            _slots2 = int(max(0.0, V - _used_with(_r2, _eg, _hg)) * SLOT_FRACTION
+                          // max(1.0, expert_b))
+            if _slots2 >= need_slots:
+                embed_gpu, head_gpu, resident, slots = _eg, _hg, _r2, _slots2
+                break
     # 8 is the measured sweet spot for this model's tilelang kernel set (a wave of 8
     # needs ~1.6GB of workspace and 165s for a 21-token prompt on 8GB; 16 needs 63s but
     # pages). Larger waves only pay on cards with room to spare.
