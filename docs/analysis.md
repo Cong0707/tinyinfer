@@ -268,3 +268,9 @@ from the slot-pool race. It stays open, and the regression test keeps its xfail.
   block's invocation in the multi-chunk entry point (pre_mix/handoff), not in the block
   math itself. That narrows the next investigation to `_forward_impl`'s chunk loop.
 
+
+- Fifth slot-race attempt (a separate per-slot "last use on the compute stream" event,
+  waited on before the next DMA) also failed: identical runs still differed by 0.52-0.57.
+  Reverted. The race is in a place these four/five theories do not cover; the interim
+  answer is `TI_NO_SLOTS=1` for deterministic logits.
+
