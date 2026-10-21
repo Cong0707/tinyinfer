@@ -15,6 +15,8 @@ Prompt shapes matter more than with a chat model (measured):
 
 The question/answer framing is the one that yields a sensible continuation; the
 chat-marker framing does not, because the base model never saw it as an instruction.
+Chinese question prompts instead land in its exercise-with-answer-key distribution
+('问题：...\n答案：' -> 'A\n\n解析：...'); English prompts answer directly.
 
 ## Why is it slower than the 4.5GB/s numbers in the docs?
 
