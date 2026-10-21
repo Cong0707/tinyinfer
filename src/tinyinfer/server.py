@@ -203,6 +203,7 @@ class SamplingParams:
     temperature: float = 1.0
     top_p: float = 1.0
     top_k: int = 0
+    repetition_penalty: float = 1.0  # vLLM-style: >1 discourages already generated ids
     stop: tuple[str, ...] = ()
     seed: int | None = None
 
@@ -913,9 +914,17 @@ class TinyModelBackend(BaseBackend):
                 self._trim_expert_cache()
 
     # -- generation --------------------------------------------------------
-    def _sample_token(self, logits, sampling: SamplingParams, generator) -> int:
+    def _sample_token(self, logits, sampling: SamplingParams, generator, recent=None) -> int:
         torch = self._torch
         logits = logits.float().view(-1)
+        if sampling.repetition_penalty and float(sampling.repetition_penalty) != 1.0 and recent:
+            # vLLM semantics: divide positive logits and multiply negative logits of
+            # already-generated tokens by the penalty (>1 => less likely to repeat)
+            penalty = float(sampling.repetition_penalty)
+            idx = torch.tensor(sorted(set(recent)), dtype=torch.long, device=logits.device)
+            sel = logits.index_select(0, idx)
+            sel = torch.where(sel > 0, sel / penalty, sel * penalty)
+            logits = logits.index_copy(0, idx, sel)
         if sampling.temperature <= 0:
             return int(torch.argmax(logits).item())
         logits = logits / max(float(sampling.temperature), 1e-5)
@@ -985,7 +994,7 @@ class TinyModelBackend(BaseBackend):
                             error_type="timeout_error",
                             code="timeout",
                         )
-                    next_id = self._sample_token(logits[:, -1, :], sampling, generator)
+                    next_id = self._sample_token(logits[:, -1, :], sampling, generator, generated)
                     if next_id in eos_ids:
                         finish = "stop"
                         break
