@@ -60,7 +60,7 @@ mtp.2.confidence_head.proj.weight [1, dim+256]       （官方 confidence_head.p
 - **投机解码（draft_len=2, 4 token）**：
   - **短上下文（"Hello"，prefill 1 token）**：accept_rate=0%——**MTP 无足够上下文**（draft 输出高频先验词），不是 bug。
   - **长上下文（"The quick brown fox jumps over the lazy dog"）**：**accept_rate=50%**（draft_len=2/4 token）、**100%**（两 token 快速验证），生成本身合理（". The quick brown"）——**MTP draft 是有效的**，之前的 0% 是 prefill 只有 1 token 的上下文饥饿。
-  - **仍慢**（0.031 tok/s）：长 prefill 16s + 投机开销 + **VRAM 10687MB（3.6GB 用于 3 stage 的 128 专家 ×3 权重常驻 GPU）**——8GB 卡必须把 MTP 专家放到专家槽/按需加载。
+  - **仍慢**（0.031 tok/s）：长 prefill 16s + 投机开销 + **VRAM 峰值 10617MB**。实测分解：load_mtp 后 **2797MB**，投机（prefill 9 + 3 stage draft + verify chunk）冲到 10.6GB——增量主要来自**流式层每 chunk b.to(device) 的临时分配被 torch 分配器缓存**（40 层 × ~190MB），不是 MTP 权重（stage attn 仅 ~0.6GB）。8GB 卡需要在投机前后限制分配器缓存（empty_cache / expandable_segments）或走 v5 flat buffer。
   - markov 已按官方改为逐 step；dflash_input 已改为 target 层 attn_norm 输出（官方语义）。这两处都对 accept 无负面影响。
   - 生产化待办：MTP 专家走 ExpertStore（或 CPU），投机路径单独预算 VRAM；长上下文下 >50% 的 accept 需要 main-KV 窗口/位置的进一步逐 token 对齐。
   - 其余待查：draft attention 的 main KV 窗口累积语义（官方 paged swa cache + slot mapping）、draft position 语义。
