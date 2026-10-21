@@ -58,16 +58,16 @@ loop is swapped we can pick T by the RAM budget (e.g. 8192 -> 80MB activation).
 
 ## Status
 
-- [x] loop-order swap prototype: Engine.prefill_layer_major (embed all chunks -> per
-      layer apply to every chunk -> head). **Blocked**: the compressed-attention path
-      keeps cross-layer shared state in module globals (shared_attn.candidates /
-      compress_kv / index_k, published by the kv_source layer and consumed by later
-      layers). Layer-major iteration interleaves chunks of different layers and those
-      globals go stale (measured: "tensor a(32) vs b(16)" in compressor). Making
-      layer-major work needs per-layer isolation of that shared state plus the
-      candidate/topk publishing order re-validated - a substantial change.
-- [ ] (blocked on the above) prefill T selection from resources.plan
-- [ ] 128K prefill measurement (target: minutes, not hours)
-
-Interim: chunk-major with chunk=8 keeps VRAM inside physical (7227MB) and is correct
-(finite), at 0.18-0.20 tok/s of prefill.
+- [x] per-kv-source handoff slots: SharedAttentionRuntime instances are now handed to
+      Compressor/Indexer per layer (Engine._rt_for picks the nearest kv_source). The
+      chunk-major path keeps the process singleton; layer-major uses one instance per
+      source.
+- [x] per-chunk candidate blocks: layer-major interleaves chunks across layers, so a
+      single candidate slot went stale ("tensor a(32) vs b(16)"). Candidates are now
+      stored per chunk (candidates_by_chunk) and consumed by the matching chunk index.
+- [x] **layer-major prefill works and is faster**: 32 tok 99.5s (0.32 tok/s), 64 tok
+      162.2s (0.39 tok/s) vs chunk-major 180s/314s -> **1.8-1.9x**, and the advantage
+      grows with prompt length (per-layer H2D is amortized over the whole prompt).
+- [ ] 128K prefill measurement (running; projected ~10-15 min at 0.3-0.4 tok/s,
+      vs hours for chunk-major)
+- [ ] prefill T selection from resources.plan (T=32 works in 7.9GB)
