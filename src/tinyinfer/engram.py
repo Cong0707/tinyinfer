@@ -170,7 +170,7 @@ class Engram:
     """One engram layer: fp8 table (row-read), wkv projection, gated residual write."""
 
     def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, hashes: EngramHashes):
-        p = f"layers.{layer_id}.attn.engram."
+        p = f"layers.{layer_id}.engram."  # checkpoint: layers.{L}.engram.* (no .attn.)
         self.layer_id = layer_id
         self.cfg = cfg
         self.hashes = hashes
@@ -222,9 +222,12 @@ class Engram:
     def _bf16_wkv(self) -> torch.Tensor:
         if self._bf16_cache is None:
             self._bf16_cache = dequant_fp8_block(self.wkv_w, self.wkv_s)
+            if getattr(self, "_device", None) is not None:
+                self._bf16_cache = self._bf16_cache.to(self._device)
         return self._bf16_cache
 
     def to(self, device):
+        self._device = device
         if self._bf16_cache is not None:
             self._bf16_cache = self._bf16_cache.to(device)
         self.q_weight = self.q_weight.to(device)
