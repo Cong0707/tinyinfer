@@ -203,3 +203,10 @@ at once, which is also where the batch-size sensitivity pointed.
 Consequence: chunk=1 stays the correct prefill path. A chunked prefill needs that 0.6%
 to be 0 first, because the error compounds with depth.
 
+
+- Nailed down further: on 8 tokens x 4 hc (32 rows) the gate indices are identical and
+  its weights differ by <=6e-8 versus the same rows run alone, and `quantize_act` is
+  bit-identical. The remaining per-layer 0.6% is therefore in the scatter/combination
+  (`index_add` of several experts at once versus one at a time), which is far larger than
+  fp32 association can explain; it stays the open lead for chunked prefill.
+
