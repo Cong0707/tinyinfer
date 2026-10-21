@@ -75,8 +75,21 @@ def softmax_sample(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tens
     return probs.div_(torch.empty_like(probs).exponential_(1)).argmax(dim=-1)
 
 
-def sample_logits(logits: torch.Tensor, temperature: float = 0.0, top_p: float = 1.0, top_k: int = 0) -> int:
-    """Greedy (temperature 0) or temperature/top-p/top-k sampling."""
+def sample_logits(logits: torch.Tensor, temperature: float = 0.0, top_p: float = 1.0,
+                  top_k: int = 0, repetition_penalty: float = 1.0,
+                  recent_tokens: list[int] | None = None) -> int:
+    """Greedy (temperature 0) or temperature/top-p/top-k sampling.
+
+    repetition_penalty / recent_tokens follow the vLLM sampler convention: a token
+    already present in the recent window gets its (positive/negative) logit divided/
+    multiplied by the penalty. The default 1.0 disables it.
+    """
+    if repetition_penalty != 1.0 and recent_tokens:
+        idx = torch.tensor(sorted(set(recent_tokens)), dtype=torch.long, device=logits.device)
+        vals = logits.index_select(-1, idx).float()
+        vals = torch.where(vals > 0, vals / repetition_penalty, vals * repetition_penalty)
+        logits = logits.clone()
+        logits.index_copy_(-1, idx, vals.to(logits.dtype))
     if temperature <= 0:
         return int(logits.argmax(dim=-1))
     logits = logits.float() / temperature

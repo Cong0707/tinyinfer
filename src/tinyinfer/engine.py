@@ -458,71 +458,76 @@ class Engine:
         return True
 
     def speculative_generate(self, prompt_ids, max_new_tokens: int = 32, draft_len: int | None = None,
-                             temperature: float = 0.0):
-        """Draft with MTP, verify with the main model (greedy accept), rollback on mismatch.
+                             temperature: float = 0.0, eos_token_id=None):
+        """MTP speculative decoding: draft with the DSpark stages, verify with one main forward.
 
-        Greedy verification: a draft token is accepted when the main model's argmax at
-        that position matches it; the first mismatch ends the run. KV is snapshotted
-        before the verify forward and rolled back so the main model state stays exact.
+        Draft chain (official DFlash contract, see mtp.py):
+            target hiddens -> main_x -> draft attention seed
+            golden token   -> noise-filled draft block -> stage0..2 -> forward_head logits
+        Verification: the main model's argmax at each accepted position must equal the
+        draft token; the first mismatch truncates the run. KV is snapshotted/rolled back
+        so the main model state stays exact. Returns (tokens, accept_rate).
         """
         from .nn import sample_logits
         if getattr(self, "mtp", None) is None and not self.load_mtp():
             raise RuntimeError("MTP weights are not available (model-00044..46 not downloaded?)")
         draft_len = draft_len or min(self.cfg.dspark_block_size, 4)
+        stages, s0 = self.mtp, self.mtp[0]
         ids = list(prompt_ids)
-        out = []
+        out: list[int] = []
+        accepted_total = drafted_total = 0
         with torch.inference_mode():
             logits = self.forward(torch.tensor([ids], device=self.device), 0)
             while len(out) < max_new_tokens:
-                nid = sample_logits(logits[0, -1], temperature)
+                nid = int(sample_logits(logits[0, -1], temperature))
                 out.append(nid)
+                if eos_token_id is not None and nid == eos_token_id:
+                    break
                 if len(out) >= max_new_tokens:
                     break
-                # main-model hidden for MTP stage 0 (KV already advanced by the token)
-                _ = self.forward(torch.tensor([[nid]], device=self.device), len(ids))
-                hidden = self._last_hidden
-                pos = len(ids) + 1
-                x, main_x, pre = None, None, None
-                for st in self.mtp:
-                    if st.stage == 0:
-                        x, main_x = st.forward_embed(hidden, torch.tensor([nid], device=self.device))
-                        pre = torch.zeros(1, x.size(1), self.cfg.hc_mult, device=self.device)
-                        pre[:, :, 0] = 1.0
-                    x, pre = st.forward(x, pos, pre, main_x if main_x is not None else x)
-                # draft the next tokens with the main head on the MTP hidden state
-                hd = x  # last stage hidden
-                drafts = [nid]
-                dlogits = self.head(hd.view(1, -1)) if self.head_on_cpu else torch.nn.functional.linear(
-                    hd.view(1, -1).float(), self.head).float()
-                for _ in range(draft_len - 1):
-                    nxt = int(dlogits[0].argmax())
-                    drafts.append(nxt)
-                if len(drafts) < 2:
-                    logits = self.forward(torch.tensor([[nid]], device=self.device), pos - 1)
-                    ids.append(nid)
+                # advance the main model with nid; captures dspark target hiddens
+                logits = self.forward(torch.tensor([[nid]], device=self.device), start_pos=len(ids))
+                ids.append(nid)
+                th = self._target_hidden
+                if not th:
                     continue
-                # verify the draft prefix with one main-model forward, then roll back
+                main_x = s0.main_hiddens([th[i] for i in sorted(th.keys())])
+                pos = len(ids)  # draft positions start after the accepted token
+                x = s0.forward_embed(torch.tensor([[nid]], device=self.device))
+                pre = torch.zeros(1, x.size(1), self.cfg.hc_mult, device=self.device)
+                pre[:, :, 0] = 1.0
+                for st in stages:
+                    x, pre = st.forward(x, pos, pre, main_x)
+                dlogits, _conf = stages[-1].forward_head(x, pre, None)
+                if dlogits is None:
+                    continue
+                drafts = [int(dlogits[0, i].argmax()) for i in range(min(draft_len - 1, dlogits.size(1)))]
+                if not drafts:
+                    continue
+                # verify: one main forward over the draft block, compare argmax position-wise
                 snap = self.snapshot()
-                cand = drafts[1:]
-                vlogits = self.forward(torch.tensor([cand], device=self.device), pos)
-                accept = 0
-                for t in range(len(cand)):
-                    if int(vlogits[0, t].argmax()) == cand[t]:
-                        accept += 1
+                vlogits = self.forward(torch.tensor([drafts], device=self.device), start_pos=pos)
+                self.restore(snap)
+                preds = [logits[0, -1]] + [vlogits[0, t] for t in range(len(drafts) - 1)]
+                accepted = 0
+                for t, cand in enumerate(drafts):
+                    if int(preds[t].argmax()) == cand:
+                        accepted += 1
                     else:
                         break
-                ids = ids + [nid] + cand[:accept]
-                out.extend(cand[:accept])
-                if accept == 0:
-                    self.restore(snap)
-                    logits = self.forward(torch.tensor([[nid]], device=self.device), pos - 1)
-                else:
-                    # keep the KV of the accepted prefix only
-                    self.restore(snap)
-                    logits = self.forward(torch.tensor([[nid]] + cand[:accept], device=self.device), pos - 1)
+                drafted_total += len(drafts)
+                accepted_total += accepted
+                if accepted:
+                    out.extend(drafts[:accepted])
+                    ids.extend(drafts[:accepted])
+                    logits = self.forward(torch.tensor([drafts[:accepted]], device=self.device), start_pos=pos)
                 if len(out) >= max_new_tokens:
                     break
-        return out[:max_new_tokens]
+                if not accepted and len(drafts) and len(out) < max_new_tokens:
+                    # no progress from the draft block: fall back to a plain decode step
+                    pass
+        rate = accepted_total / drafted_total if drafted_total else 0.0
+        return out[:max_new_tokens], rate
 
     def generate(self, prompt_ids, max_new_tokens: int = 16, temperature: float = 0.0, eos_token_id=None,
                  top_p: float = 1.0, top_k: int = 0):

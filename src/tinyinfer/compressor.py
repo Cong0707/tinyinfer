@@ -119,6 +119,11 @@ def select_candidate_blocks(logits, compress_lens, topk_blocks: int, block_size:
     scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
     num_blocks = scores.size(-1)
     last = (compress_lens - 1) // block_size
+    if isinstance(last, torch.Tensor) and last.dim() > 0:
+        # per-query compress_lens (chunk/prefill): [s] -> [s, 1] so the block arange
+        # broadcasts to [s, num_blocks] (official: compress_lens broadcasts against
+        # logits' leading dims).
+        last = last.unsqueeze(-1)
     scores = scores.masked_fill(torch.arange(num_blocks, device=logits.device) == last, torch.inf)
     top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
     keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(-1, top.indices, top.values > -torch.inf)
