@@ -1793,7 +1793,7 @@ class ExpertStore:
         policy: str = "arc",
         vram_slots: int = 0,
         device: str = "cuda",
-        reader_threads: int = 6,
+        reader_threads: int = 6,  # measured optimum: 4-8 threads ~5.3GB/s (buffered IO ceiling)
         direct: bool = False,
         max_pinned_bytes: int | None = None,
         index: ShardIndex | None = None,
