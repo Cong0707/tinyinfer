@@ -299,6 +299,17 @@ class MLACompressedAttention:
 
         if compress_idxs is not None and compress_idxs.size(-1) > 0:
             kv_all = torch.cat([kv_w, compress_kv], dim=1)
+            # Right-pad the compressed slots to the configured top-k. Near the start of a
+            # sequence t = min(index_topk, end_pos // ratio) is smaller than top_k, and two
+            # layers in one layer-major pass then hand the sparse kernel different widths
+            # (8 vs 7 columns) -- the layer-major prefill used to die on that cat(). -1 is
+            # the kernel's empty-slot marker, so padding changes no value and makes the
+            # kernel shape constant.
+            _k = int(self.cfg.index_topk)
+            if compress_idxs.size(-1) < _k:
+                _pad = torch.full((*compress_idxs.shape[:-1], _k - compress_idxs.size(-1)),
+                                  -1, dtype=compress_idxs.dtype, device=compress_idxs.device)
+                compress_idxs = torch.cat([compress_idxs, _pad], dim=-1)
             idxs_all = torch.cat([win_idxs, compress_idxs], dim=-1)
         else:
             kv_all, idxs_all = kv_w, win_idxs

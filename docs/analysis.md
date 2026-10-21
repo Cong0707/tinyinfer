@@ -178,3 +178,9 @@ positions, and the indexer's visibility mask is built for the chunk's end positi
 That is why chunked prefill is still restricted to chunk=1: it is not a kernel problem,
 it is the compressed-attention semantics at s>1 (docs/ROADMAP.md item 4).
 
+
+- Layer-major prefill no longer crashes on the variable compressed-slot width (it is
+  right-padded to `index_topk` with -1, the kernel's empty marker), but it still does not
+  match chunk-major (rel 1.17), so it stays off. The padding itself is a strict
+  improvement: the sparse kernel now always sees one width.
+
