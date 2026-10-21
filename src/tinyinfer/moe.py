@@ -122,11 +122,16 @@ class Expert:
         # flattens a [rows, K] activation into the kernel's [K] slot and reads it wrong,
         # which is what made a multi-token forward disagree with token-by-token decoding.
         def _lin(aqq, assc, w, s):
-            # multi-row in one launch; the earlier 35% error was the kernel's 2-D grid
-            # putting the row index on an ambiguous axis (fixed to a flat grid, and
-            # re-verified bit-exact for M=1..8)
-            if aqq.dim() == 2 and aqq.size(0) > 1:
+            # The multi-row kernel is exact on synthetic weights (M=1..8, rel 0) but
+            # measured 42% off with real expert-34 weights, while the single-row kernel
+            # is exact on both. Rows are therefore done one at a time unless the batch
+            # kernel is explicitly requested; a chunk routes 1-2 rows per expert anyway.
+            if (aqq.dim() == 2 and aqq.size(0) > 1
+                    and __import__("os").environ.get("TI_MULTIROW_GEMV") == "1"):
                 return gemv_fp4_m8(aqq, assc, w, s)
+            if aqq.dim() == 2 and aqq.size(0) > 1:
+                rows = [gemv_fp4_pq(aqq[i], assc[i], w, s) for i in range(aqq.size(0))]
+                return torch.cat(rows, 0)
             a1 = aqq[0] if aqq.dim() == 2 else aqq
             s1 = assc[0] if assc.dim() == 2 else assc
             return gemv_fp4_pq(a1, s1, w, s)

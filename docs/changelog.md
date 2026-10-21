@@ -102,3 +102,12 @@ after hours of repeated sweeps, so late measurements are disk-bound, not code-bo
   8 (`torch.cat([win_idxs, compress_idxs])` in compressed_attention). The chunk-major path
   with chunk=1 handles 63 tokens correctly (136s), which is what long prompts use.
 
+
+- Expert 34 with two routed rows still differs (51%) between one multi-row call and two
+  single-row calls, and it does so through the *exact* per-row path as well; the
+  single-row result is what decode uses, so generation is unaffected. The multi-row batch
+  path is therefore opt-in (`TI_MULTIROW_GEMV=1`) and the default stays row-at-a-time.
+  Layer-0 attention, gate, activation quantisation and all solo-expert checks are exact,
+  so the remaining suspect is state shared across rows inside the batch (slot/record
+  reuse), not arithmetic.
+
