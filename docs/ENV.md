@@ -31,6 +31,7 @@ them is required to run.
 | TI_MULTIROW_GEMV | 1 opts into the multi-row fp4 kernel (exact on synthetic weights, not on real ones) |
 | TI_NO_SLOTS | 1 disables the VRAM expert-slot pool: deterministic logits, ~40% slower decode (docs/analysis.md §10) |
 | TI_PREFILL_CHUNK | token block size for prefill; 1 = exactly reference-matching, planner's value ~1.6x faster but 0.5%/layer off (docs/analysis.md §13) |
+| TI_REF_ATTN | 1 routes sparse attention through the PyTorch reference (diagnostic; slow) |
 
 ## Measurement
 

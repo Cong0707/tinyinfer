@@ -119,6 +119,13 @@ def sparse_attn_tl(q, kv, attn_sink, topk_idxs, scale: float, h_chunk: int = 16,
 
 
 def sparse_attn_dispatch(q, kv, attn_sink, topk_idxs, scale: float, prefer_tilelang: bool = True):
+    import os as _o
+    if _o.environ.get("TI_REF_ATTN") == "1":
+        # Reference form: plain gather + torch softmax. Bit-matches the reference and is
+        # used to test whether the tiled online-softmax is what makes a multi-row
+        # prefill differ from the token-by-token path.
+        from .nn import sparse_attn_ref
+        return sparse_attn_ref(q, kv, attn_sink, topk_idxs, scale)
     """Official sparse_attn first (tilelang kernel.py), then our kernel, then torch.
 
     Levels 0-2 must produce the same numbers as the reference implementation, so the
