@@ -44,3 +44,6 @@ invariant to compare across runs is the ratio to the IO floor (docs/lower_bounds
 | 1.8-1.9s | disk 1.5GB/s | serve batch sweep: 1 -> 1.84s, 2 -> 1.83s, 3 -> 1.82s (one
   outlier at 3.8s was a disk dip, not the batch size), 6 -> 1.89s. The serve term is
   the same either way, so the batching strategy is not what limits decode. |
+| 13.3s warm / 0.485 tok/s | disk 1.58GB/s | final run of the round: first forward 31.7s,
+  warm prefill 13.3s, cache hit 16%. Code path unchanged from the 1.66s/0.60 run at
+  4.5GB/s. |

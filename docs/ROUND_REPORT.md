@@ -43,6 +43,14 @@ the next real prefill speedup (8x) once the compressed path is made position-exa
 
 ## What is still unproven
 
+- **Bit-reproducibility.** Two identical forwards differ by 0.63-0.78 relative with the
+  VRAM slot pool enabled and 0.000000 with it disabled: a slot can be re-targeted while
+  the GEMV that reads it is still queued. Four fixes were attempted and reverted (see
+  docs/analysis.md section 10). Decode output stays coherent (top-1 is stable), so this is
+  a correctness/reproducibility debt rather than a functional break -- but it also means
+  the batch-vs-token and chunk-vs-token numbers recorded earlier in docs/analysis.md were
+  measured through that noise and are not evidence of a routing difference.
+
 - Tensor parallel on real multi-GPU hardware (the math and the slicing are verified, the
   distributed run is not).
 - CUDA graphs: capture is keyed on `start_pos`, which advances every decode step, so the
