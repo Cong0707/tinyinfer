@@ -29,7 +29,7 @@ def main() -> None:
     eng = Engine.from_hf(model_dir, device="cuda", tokenizer=tok, max_layers=40, allow_missing_layers=True)
     print("blocks:", eng.max_layers, "gpu_layers:", eng.gpu_layers, flush=True)
     print("load_mtp:", eng.load_mtp(), flush=True)
-    prompt = tok.encode("Hello") if tok is not None else [1, 2, 3]
+    prompt = tok.encode("The quick brown fox jumps over the lazy dog") if tok is not None else [1, 2, 3, 4, 5, 6, 7, 8]
     t0 = time.time()
     out, rate = eng.speculative_generate(prompt, max_new_tokens=n_tokens, draft_len=2, temperature=0.0)
     torch.cuda.synchronize()

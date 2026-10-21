@@ -53,6 +53,13 @@ def main() -> None:
     logits, confidence = stages[-1].forward_head(x, pre, golden)
     if logits is not None:
         print("head logits:", tuple(logits.shape), "argmax:", int(logits[0, 0].argmax()), flush=True)
+        main_logits = eng.forward(golden, start_pos=0)
+        a = int(logits[0, 0].argmax())
+        b = int(main_logits[0, -1].argmax())
+        top5m = torch.topk(main_logits[0, -1].float(), 5).indices.tolist()
+        top5d = torch.topk(logits[0, 0].float(), 5).indices.tolist()
+        print("MTP argmax:", a, "| main argmax:", b, "| match:", a == b, flush=True)
+        print("MTP top5:", top5d, "| main top5:", top5m, flush=True)
     if confidence is not None:
         print("confidence:", tuple(confidence.shape), [round(v, 4) for v in confidence[0, :3].tolist()], flush=True)
 
