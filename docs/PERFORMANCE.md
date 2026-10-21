@@ -52,3 +52,15 @@ what the 24GB plan buys (docs/HARDWARE.md).
 
 The output includes the disk rate measured in the same run; compare tok/s only against
 runs with a similar disk rate, otherwise compare the ratio to the 1.23s floor.
+## Prefill (measured)
+
+| prompt | path | time | per token |
+| --- | --- | --- | --- |
+| 12 tokens | chunk=1 (exact path) | 18.3s | 1.52s |
+| 12 tokens | chunk=4 | 11.6s | 0.97s |
+| 63 tokens | default chunk (8) | 79.7s | 1.27s |
+
+The gain is smaller than the chunk factor because prefill is also expert-IO bound; the
+chunk only dedups routing and amortises the per-block layer streaming. The chunked path
+is what `generate()` uses by default and it answers correctly; `TI_PREFILL_CHUNK=1`
+forces the exactly reference-matching path when a caller needs it (docs/analysis.md §13).
