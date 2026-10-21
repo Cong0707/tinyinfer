@@ -74,6 +74,7 @@ tinyinfer/
 - [x] P4 分层执行：7 层常驻 + 33 层流式、RAM 专家缓存（弹性）、VRAM 槽状态机
 - [x] P5 端到端：**全 40 层真实权重**（42 分片 SHA256 校验）prefill/decode/生成通过
   - decode **0.20 tok/s**（5.0s/token，8GB 卡 + 33 流式层）；生成语义正确（"Hello, I am DeepSeek"）
+  - warm 复测（2026-10-22 10:35）：40 层 load 1.6s、first forward 16.3s（JIT）、**second forward 2.98s = 0.335 tok/s**、vram 7048MB
   - OpenAI API（多 slot/SSE/function calling 回显）端到端通过
 - [x] 测试 68 passed / 文档（benchmarks/kernels/loading/api/mtp_design/deepinfer_ref）/ bootstrap / git
 
