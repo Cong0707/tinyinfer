@@ -212,6 +212,10 @@ class Indexer:
             self._k_cache = cache
         if self.owns_k:
             shared_attn.index_k = self._k_cache
+        import os as _os
+        if _os.environ.get("TI_DEBUG_IDX"):
+            print(f"[idx] start={start_pos} s={s} owns_k={self.owns_k} latent={None if latent is None else tuple(latent.shape)} "
+                  f"kcache={None if self._k_cache is None else tuple(self._k_cache.shape)} shared={None if shared_attn.index_k is None else tuple(shared_attn.index_k.shape)}", flush=True)
 
         q = F.linear(qr.float(), self.wq_b).view(b, s, self.n_heads, self.head_dim)
         apply_rope(q[..., -rd:], self.freqs_cis[start_pos:end_pos])
