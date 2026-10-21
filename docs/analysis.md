@@ -133,3 +133,8 @@ docs/parity.md, and the open item is to close that 0.87% (docs/ROADMAP.md, item 
   rounding should allow, which is itself evidence that some rows are being accumulated
   with the wrong value rather than in a different order.
 
+
+- Batch size changes the answer (3 -> 26%, 1 -> 36%), far more than fp32 ordering can
+  explain, so some rows are accumulated with a wrong value rather than in a different
+  order. Next: log the (row, expert) pairs fed to index_add per batch.
+
