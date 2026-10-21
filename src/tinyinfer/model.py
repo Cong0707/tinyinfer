@@ -155,13 +155,18 @@ class Block(HCBlockMixin):
                     return t
 
             self._cpu_refs = [_pin(t) for (_, _, t) in paths]
-        from .cpu_kernels import stage_tensor_to_device
+        import os as _os
+        if _os.environ.get("TI_STAGING"):
+            from .cpu_kernels import stage_tensor_to_device
 
-        for (owner, name, _), cpu in zip(paths, self._cpu_refs):
-            # pinned staging: Windows refuses a large cudaHostRegister pool, so a
-            # per-tensor pin_memory() downgrades to pageable (~8.9GB/s). Feeding the
-            # H2D from the process-wide pinned slab uses ~26GB/s instead.
-            setattr(owner, name, stage_tensor_to_device(cpu, device))
+            for (owner, name, _), cpu in zip(paths, self._cpu_refs):
+                # pinned staging measured SLOWER here (0.142 vs 0.304 tok/s): each small
+                # tensor waits for a synchronous H2D, and the win of pinned bandwidth
+                # does not cover the serialization. Opt-in only.
+                setattr(owner, name, stage_tensor_to_device(cpu, device))
+        else:
+            for (owner, name, _), cpu in zip(paths, self._cpu_refs):
+                setattr(owner, name, cpu.to(device, non_blocking=True))
         if getattr(self, "engram", None) is not None:
             # engram tables stay on disk (row reads) but its small projection weights
             # (q/k/wkv, cached bf16) must follow the block.
