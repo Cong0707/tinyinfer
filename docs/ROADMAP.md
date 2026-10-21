@@ -4,9 +4,11 @@
 
 Blocker for MTP and for chunk>1 prefill. Evidence so far: identical rows are exact,
 distinct rows differ by ~26-70% at layer 0; attention, gate, activation quantisation,
-single-row GEMV and the batch GEMV each verify 0.000000 in isolation. Next probe: split
-the batch call into (gate from batch, shared from rows, experts from rows) and see which
-swap removes the difference.
+single-row GEMV and the batch GEMV each verify 0.000000 in isolation, and the VRAM-slot
+path is identical to the RAM-record path. Ruled out: kernels, quantisation, gate, shared
+expert, slot pressure. Remaining suspects: the serve loop's 3-expert batching
+(`_val_acc`/`_idx_acc` concatenation order feeding one `index_add`) and record lifetime.
+Next probe: one expert per serve batch and compare.
 
 ## 2. Compressed-layer parity 0.87%
 
