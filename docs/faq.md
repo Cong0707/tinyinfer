@@ -75,3 +75,8 @@ the checkpoint's capability, not the engine's: the engine reproduces the model's
 distribution bit-comparably (docs/parity.md). A chat/SFT variant is what makes it reliable
 at instruction-style questions.
 
+
+Creative prompts likewise follow a math-answer template ('Write a haiku about the moon'
+-> ' The answer is 1, but the obvious proof is not much at'), consistent with the
+capability note above.
+
