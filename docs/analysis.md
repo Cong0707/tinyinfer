@@ -290,3 +290,12 @@ from the slot-pool race. It stays open, and the regression test keeps its xfail.
 - Everything else in this round is either measured (GEMV +11%, planner matrix, TP slicing)
   or explicitly labelled as an estimate.
 
+
+- New lead on the reproducibility debt: the 24-token prefill routes 96 rows (24 tokens x 4
+  hc) through `y.index_add_`, and CUDA's index_add accumulates in nondeterministic order
+  when several rows hit the same output row (one token's experts all accumulate into the
+  same row). That matches every observation: the single-token path is reproducible
+  (fewer collisions), the failing case is the multi-chunk/multi-row one, and the drift is
+  independent of reset. A deterministic accumulation (sort by index, or accumulate into a
+  per-expert buffer and reduce in fixed order) is the next thing to try.
+
