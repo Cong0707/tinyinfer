@@ -206,8 +206,14 @@ class MoE:
         xf = x.view(-1, self.cfg.dim)
         weights, indices = self.gate.forward(xf, None if image_mask is None else image_mask.flatten())
         y = torch.zeros_like(xf, dtype=torch.float32)
-        counts = torch.bincount(indices.flatten(), minlength=self.cfg.n_routed_experts).tolist()
-        active = [i for i, cnt in enumerate(counts) if cnt > 0]
+        import os as _os
+        if _os.environ.get("TI_NO_SYNC") == "1":
+            # experiment only: routing needs a host sync (bincount). Skipping it shows how
+            # much of the step is the CPU waiting for the GPU to finish this layer.
+            active = list(range(min(6, self.cfg.n_routed_experts)))
+        else:
+            counts = torch.bincount(indices.flatten(), minlength=self.cfg.n_routed_experts).tolist()
+            active = [i for i, cnt in enumerate(counts) if cnt > 0]
         self._last_ids = list(active)  # already the unique routed set (one host sync total)
         target = xf.device
         use_fp4_kernel = target.type == "cuda"

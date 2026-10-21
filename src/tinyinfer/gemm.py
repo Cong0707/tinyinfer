@@ -63,6 +63,20 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
             return gemv_fp8(x, w_fp8, w_scale)
         except Exception:
             pass
+    # M in 2..8: pre-quantise once, then one gemv_pq per row. The bf16-input gemv
+    # variant crashes (misaligned address at N=1280/K=5120), the pq variant does not.
+    if x.dim() == 2 and 1 < x.size(0) <= 8 and x.is_cuda:
+        try:
+            from .gemv_fp8 import fused_fp8_gemv_pq
+            with _bf16_default():
+                x_fp8, x_s = _k.act_quant(x, block, SCALE_FMT, SCALE_DTYPE)
+            outs = []
+            for i in range(x.size(0)):
+                outs.append(fused_fp8_gemv_pq(
+                    x_fp8[i].reshape(-1), x_s[i].reshape(-1), w_fp8, w_scale).reshape(1, -1))
+            return torch.cat(outs, dim=0)
+        except Exception:
+            pass
     with _bf16_default():
         x_fp8, x_s = _k.act_quant(x, block, SCALE_FMT, SCALE_DTYPE)
         return _k.fp8_gemm(x_fp8, x_s, w_fp8, w_scale, SCALE_DTYPE, block_size=block)
