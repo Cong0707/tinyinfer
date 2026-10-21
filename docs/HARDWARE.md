@@ -71,3 +71,21 @@ Compare `decode_tok_per_s` with the `floor` column above and with
 `docs/PERFORMANCE.md`. If a box is far below its floor, the usual causes are a slow
 checkpoint volume (read `disk_gb_s` in the same bench output) or another process
 holding VRAM.
+## Choosing a machine for this checkpoint
+
+Measured constants: 4.5GB of expert reads per token, 6.0GB of streamed layers on an 8GB
+card, 26.5GB/s pinned H2D.
+
+| budget | verdict |
+| --- | --- |
+| 6-8GB VRAM | works, ~0.8 tok/s floor; the disk is the bottleneck, a faster NVMe helps most |
+| 12GB | works, same disk bottleneck; a few more layers resident |
+| 16GB | works; residency grows, expert coverage still low |
+| 24GB | the first class where every routable expert fits in VRAM: the IO term vanishes and the card becomes compute-bound (~10-20 tok/s estimated) |
+| 32GB+ | same, more headroom for KV and batch |
+| <6GB | refused with an explicit message (needs ~2.9GB for ring + workspace alone) |
+| 47GB+ RAM | required for the pinned slab (~13GB) plus the expert cache; 32GB runs with a small cache |
+
+Two things do not depend on the card: the checkpoint is 510GB, so the volume must be
+fast (4.5GB/s measured best, 1.5GB/s after long sweeps) and the host needs ~13GB pinned for
+the streaming slab. A machine with a small SSD will be slower than the 8GB laptop.
