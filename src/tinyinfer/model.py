@@ -162,6 +162,10 @@ class Block(HCBlockMixin):
             # per-tensor pin_memory() downgrades to pageable (~8.9GB/s). Feeding the
             # H2D from the process-wide pinned slab uses ~26GB/s instead.
             setattr(owner, name, stage_tensor_to_device(cpu, device))
+        if getattr(self, "engram", None) is not None:
+            # engram tables stay on disk (row reads) but its small projection weights
+            # (q/k/wkv, cached bf16) must follow the block.
+            self.engram.to(device)
         self._device = device
         return self
 
