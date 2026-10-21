@@ -297,6 +297,13 @@ class MLACompressedAttention:
             else:
                 compress_idxs = self.rt.topk_idxs
 
+        if __import__("os").environ.get("TI_DEBUG_ATTN") and \
+                getattr(self, "_active_layer", -1) == 20:
+            print(f"[attn20] start={start_pos} s={s} ratio={ratio_now} "
+                  f"compress_len={compress_len} "
+                  f"kv={None if compress_kv is None else tuple(compress_kv.shape)} "
+                  f"idxs={None if compress_idxs is None else tuple(compress_idxs.shape)} "
+                  f"win={tuple(win_idxs.shape)}", flush=True)
         if compress_idxs is not None and compress_idxs.size(-1) > 0:
             kv_all = torch.cat([kv_w, compress_kv], dim=1)
             # Right-pad the compressed slots to the configured top-k. Near the start of a
