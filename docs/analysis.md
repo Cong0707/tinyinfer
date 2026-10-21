@@ -352,3 +352,10 @@ Consistent picture:
 So there is **one** defect here (the slot pool race), not three. The unimplemented fixes
 are documented above; `TI_NO_SLOTS=1` is the working answer until the race is found.
 
+
+- Sixth attempt (copying on the compute stream instead of a private copy stream, so the
+  DMA and the GEMV are ordered by the stream): identical runs still differed by 0.62.
+  Reverted. Six theories, six failures -- the remaining suspect is not in the copy path
+  at all but in how `fetch` hands records to `serve` across the thread pool
+  (`_fetch_batch` runs on a worker, `rec_by_id` is rebuilt per call).
+
