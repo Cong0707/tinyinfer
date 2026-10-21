@@ -46,6 +46,7 @@ degraded output.
     # the base model answers question-shaped prompts best (measured):
     #   "Question: What is the capital of France?\nAnswer:" -> " France is a country in Europe..."
     #   "Question: What is pi?\nAnswer:"                   -> " The answer is 3.14..."
+    #   multi-turn: append 'Question: ...\nAnswer: ...' pairs to one transcript
 
     # or from Python
     from tinyinfer.engine import Engine
