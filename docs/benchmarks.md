@@ -13,6 +13,8 @@
 | 生成 | " Deep..  I am Deep." | 修复 L20 ratio=1 kv_source 的 src_ratio 后语义正常 |
 | 每层成本 | MoE 56ms/层（72%）、attn 3ms/层、HC 1.7ms/层 | 专家 IO + fp4 kernel |
 
+**优化状态（2026-10-22）**：MoE 融合 kernel（gate+up 单 kernel + silu，M>1 走 fused、M=1 走官方 fp4_gemm 保稳定）；专家 fetch 8 线程并行（锁外读盘）；RAM 缓存按可用内存弹性（psutil）；MTP 三 stage 加载成功（forward 链待全 40 层验证）；fp4 GEMV（M=1）已实现但集成路径异常慢，暂未启用。
+
 ## 1. 已验证的层数 vs 性能
 
 | 层数 | 完整分片 | decode | prefill | GPU 常驻 | VRAM 峰值 | 备注 |
