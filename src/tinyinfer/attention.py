@@ -1,4 +1,15 @@
-"""MLA sliding-window attention for DeepSeek-V4.1 (window-only path, compress_ratio == 0)."""
+"""MLA sliding-window attention for DeepSeek-V4.1 (window-only path, compress_ratio == 0).
+
+Reference implementations (consult when fixing this file):
+  * DeepInfer  deepinfer/model_executor/models/v4_modules/attn.py
+        (MLA attention: wq_a/wq_b/wkv/wo_a/wo_b layout, q_norm/kv_norm, attn_sink,
+         sparse_attn dispatch, decode_mla_mqa_sparse)
+  * Official   reference/official/kernel.py (sparse_attn, _window_kv, rope application)
+  * vLLM       vllm/model_executor/layers/attention/mla/ (MLA paging; same math)
+
+Checkpoint tensor names (do not rename):
+  layers.{L}.attn.{wq_a,wq_b,wkv,wo_a,wo_b}.{weight,scale}, q_norm/kv_norm.weight, attn_sink
+"""
 from __future__ import annotations
 
 import torch

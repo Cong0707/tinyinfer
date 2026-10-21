@@ -1,5 +1,11 @@
 """OpenAI-compatible HTTP server for tinyinfer.
 
+Reference implementations (consult when fixing this file):
+  * vLLM       vllm/entrypoints/openai/api_server.py + serving_* (OpenAI schema,
+        SSE streaming, usage accounting, request ids) -- mirrored here without engine deps
+  * HF TGI     text-generation-inference (same OpenAI-compatible surface)
+  * fastapi    starlette/FastAPI streaming responses and pydantic validation
+
 This module implements the service layer of tinyinfer: an OpenAI-shaped API
 (/v1/models, /v1/completions, /v1/chat/completions, /v1/slots, /health) with
 SSE streaming, request ids, usage accounting, API keys and per-session slots.
