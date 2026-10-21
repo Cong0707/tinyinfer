@@ -22,6 +22,8 @@ class SharedAttentionRuntime:
     index_k: torch.Tensor | None = None
     topk_idxs: torch.Tensor | None = None
     candidates: torch.Tensor | None = None
+    src_ratio: int = 0  # compress ratio of the kv_source layer that produced compress_kv
+    src_ratio: int = 0  # compress ratio of the kv_source layer that produced compress_kv
 
 
 shared_attn = SharedAttentionRuntime()
@@ -82,6 +84,7 @@ class Compressor:
         b, s, _ = x.shape
         xf = x.float()
         if self.ratio == 1:
+            shared_attn.src_ratio = 1  # ratio-1 sources publish without pooling
             return rms_norm(F.linear(xf, self.wkv), self.norm_w, self.eps).to(x.dtype)
         kv = F.linear(xf, self.wkv)
         score = F.linear(xf, self.wgate)
@@ -93,6 +96,7 @@ class Compressor:
         all_kv = torch.cat([pkv, kv], dim=1)
         all_sc = torch.cat([psc, score], dim=1)
         total = all_kv.size(1)
+        shared_attn.src_ratio = self.ratio
         n_groups = total // self.ratio
         if n_groups == 0:
             self._pending_kv, self._pending_score = all_kv, all_sc
@@ -187,7 +191,8 @@ class Indexer:
 
     def forward(self, x, qr, latent, start_pos: int, offset: int):
         b, s, _ = x.shape
-        ratio, rd, end_pos = self.ratio, self.rope_dim, start_pos + s
+        ratio = self.ratio if self.owns_k else (shared_attn.src_ratio or self.ratio)
+        rd, end_pos = self.rope_dim, start_pos + s
         groups_so_far = start_pos // ratio
 
         if self.owns_k and latent is not None:

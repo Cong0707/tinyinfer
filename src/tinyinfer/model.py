@@ -25,7 +25,9 @@ class Block(HCBlockMixin):
         self.engram = None
         self._device = "cpu"
         self.profile = False
-        self._stream_cache = None   # (owner, attr) -> device tensor (reused by copy_)
+        self._stream_cache = None
+        self._stream_flat = None    # (pinned cpu flat, device flat) for streamed layers
+        self._flat_offsets = None
         self._cpu_refs = None       # original CPU tensors, restored on to("cpu")
         if hashes is not None and layer_id in cfg.engram_layer_ids:
             shard = store.shard_of(f"layers.{layer_id}.engram.embed.weight")
@@ -92,30 +94,57 @@ class Block(HCBlockMixin):
                 out.append((f.shared, name, t))
         return out
 
+    def _ensure_flat(self, device):
+        """Pack all weights into one aligned pinned flat buffer + one device flat buffer."""
+        if getattr(self, "_stream_flat", None) is not None:
+            return
+        paths = self._weight_paths()
+        refs = [t for (_, _, t) in paths]
+        # pack grouped by element size; pad every tensor to 256B so tilelang kernels
+        # see aligned pointers (misaligned flat views segfault in vectorized loads)
+        order = sorted(range(len(refs)), key=lambda j: -refs[j].element_size())
+        offsets: dict[int, tuple[int, int]] = {}
+        off = 0
+        for j in order:
+            t = refs[j]
+            nbytes = t.numel() * t.element_size()
+            off = (off + 255) // 256 * 256
+            offsets[j] = (off, nbytes)
+            off += nbytes
+        total = off
+        cpu_flat = torch.empty(total, dtype=torch.uint8, pin_memory=True)
+        for j, t in enumerate(refs):
+            o, n = offsets[j]
+            cpu_flat[o:o + n].copy_(t.reshape(-1).view(torch.uint8))
+        gpu_flat = torch.empty(total, dtype=torch.uint8, device=device)
+        self._stream_flat = (cpu_flat, gpu_flat)
+        self._flat_offsets = offsets
+        self._flat_order = order
+        self._cpu_refs = [t for (_, _, t) in paths]
+
     def to(self, device):
         """Move/preload this block's weights.
 
-        Weights are read-only at inference time, so moving to CPU only swaps the
-        original CPU tensors back (zero copy). Moving to CUDA copies into cached
-        device tensors (one H2D per token instead of fresh allocations).
+        Weights are read-only at inference time: to CPU only swaps the original
+        tensors back (zero copy), to CUDA does a single H2D of the packed flat
+        buffer and points the attributes at views of it.
         """
         if device == self._device:
             return self
         paths = self._weight_paths()
         if device == "cpu":
-            if self._cpu_refs is None:
+            if getattr(self, "_cpu_refs", None) is None:
                 self._device = "cpu"
                 return self
             for (owner, name, _), ref in zip(paths, self._cpu_refs):
                 setattr(owner, name, ref)
             self._device = "cpu"
             return self
-        if self._cpu_refs is None:
-            # pinned host copies so copy_ is a true async DMA (pageable copies serialise)
+        # per-tensor copies: a packed flat buffer cannot be freed per layer (views pin
+        # it), which leaked ~190MB/layer on 8GB cards
+        if getattr(self, "_cpu_refs", None) is None:
             self._cpu_refs = [t.pin_memory() if t.is_cpu and t.device.type == "cpu" else t
                               for (_, _, t) in paths]
-        # no per-layer cache: a shared slot is managed by the engine (streamed layers
-        # would otherwise keep one device copy each and blow the VRAM budget)
         for (owner, name, _), cpu in zip(paths, self._cpu_refs):
             setattr(owner, name, cpu.to(device, non_blocking=True))
         self._device = device

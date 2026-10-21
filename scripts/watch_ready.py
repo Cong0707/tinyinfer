@@ -41,14 +41,18 @@ def main() -> int:
             if args.bench:
                 # end-to-end generation smoke on the real model
                 print("[watch] running generation smoke", flush=True)
-                subprocess.run([py, "-c",
+                gen_script = (
                     "import sys; sys.path.insert(0, 'src'); "
                     "from tinyinfer.engine import Engine; from tinyinfer.tiers import OptLevel; "
-                    "eng = Engine('" + args.model_dir + "', tier=OptLevel.BALANCED, device='cuda'); "
-                    "tok = eng._tokenizer; "
+                    "from transformers import AutoTokenizer; "
+                    "d = '" + args.model_dir + "'; "
+                    "tok = AutoTokenizer.from_pretrained(d, trust_remote_code=True); "
+                    "eng = Engine(d, tier=OptLevel.BALANCED, device='cuda'); "
                     "prompt = tok('Hello, I am DeepSeek.', return_tensors='pt').input_ids[0].tolist(); "
                     "out = eng.generate(prompt, max_new_tokens=16, temperature=0.0); "
-                    "print('generated:', tok.decode(out) if tok else out)"])
+                    "print('generated:', repr(tok.decode(out)))"
+                )
+                subprocess.run([py, "-c", gen_script])
             return 0
         time.sleep(args.interval)
     print("[watch] timed out waiting for the download", flush=True)

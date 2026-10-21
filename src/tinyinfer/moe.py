@@ -59,10 +59,24 @@ class Expert:
         return self
 
     def forward_fp4(self, x: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
-        """Official fp4 kernel path: fp8 activations x fp4 weights (no bf16 dequant copy)."""
+        """fp4 kernel path; M==1 (decode) uses the GEMV kernels (GEMM wastes 31/32 rows)."""
         from .gemm import fp4_linear
 
         w1, s1, w2, s2, w3, s3 = self.fp4
+        if x.size(0) == 1 and x.is_cuda:
+            try:
+                from .gemv_fp4 import gemv_fp4
+                gate = gemv_fp4(x, w1, s1).float()
+                up = gemv_fp4(x, w3, s3).float()
+                if self.swiglu_limit > 0:
+                    up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
+                    gate = torch.clamp(gate, max=self.swiglu_limit)
+                y = F.silu(gate) * up
+                if weights is not None:
+                    y = weights * y
+                return gemv_fp4(y.to(torch.bfloat16), w2, s2)
+            except Exception:
+                pass
         gate = fp4_linear(x, w1, s1).float()
         up = fp4_linear(x, w3, s3).float()
         if self.swiglu_limit > 0:
@@ -161,10 +175,10 @@ class MoE:
         shape = x.shape
         xf = x.view(-1, self.cfg.dim)
         weights, indices = self.gate.forward(xf, None if image_mask is None else image_mask.flatten())
-        self._last_ids = sorted(int(v) for v in torch.unique(indices).tolist())
         y = torch.zeros_like(xf, dtype=torch.float32)
         counts = torch.bincount(indices.flatten(), minlength=self.cfg.n_routed_experts).tolist()
         active = [i for i, cnt in enumerate(counts) if cnt > 0]
+        self._last_ids = list(active)  # already the unique routed set (one host sync total)
         target = xf.device
         use_fp4_kernel = target.type == "cuda"
         limit = self._max_bf16

@@ -30,6 +30,8 @@
 
 14. **decode 专用 fp8 GEMV（O2/O3 本轮）**：`gemv_fp8.py` 用“每线程一个输出行 + K 串行累加”替代官方 block_M=32 的 GEMM。真实 L0、M=1：wq_b **251.7 → 139.7 µs（1.80×，300 GB/s）**、wo_b **270.9 → 147.1 µs（1.84×）**、wkv **37.3 → 20.1 µs（1.86×）**、wq_a 37.5 → 26.9 µs（1.4×）；带 RoPE epilogue 的 wq_b/wkv 正确性 rel 1.3–1.4e-3。**<60 µs 对 wq_b/wo_b 物理上不可达**（42 MB 权重 / 实测 338 GB/s ≈ 124 µs 下界）；wq_a/wkv 已 <60 µs。四个 GEMM 合计 ~597 → ~350 µs/层（省 ~0.25 ms/层）。
 
+15. **MoE 融合 kernel（O2/O3 本轮）**：`moe_fused.py` 把每个专家的 gate/up 两次 fp4 GEMM + clamp + silu 融成一个 kernel，down GEMM + 路由权重融成第二个。真实 L0 专家权重：M=8 **246.2 → 146.5 µs（1.68×）**、M=64 **387 → 274 µs（1.41×）**，rel **1.9e-3**（<1e-2）。每专家 launch-ish op **19 → 4**（2 次 act_quant + 2 个 tilelang）；6 专家/层 114 → 24。**未达 ~6 kernel 目标**：只有“全专家 grouped kernel”（2–4 个/层）能到，但需要堆叠权重/gather，单专家单 kernel 不可行（down 需要完整 h 行）。
+
 ### 可用性矩阵（本机，✅=实测通过，⚠️=可运行但有条件，❌=不可用/未通过，—=未测）
 
 | 能力 | torch | tilelang 0.1.15 | DeepGEMM | FlashInfer | FlashMLA | SDPA(torch) |
@@ -54,6 +56,8 @@
 | 融合 HC pre/post | — | ✅ 23.1/20.5 µs vs torch 58.6/69.9 | — | — | — | — |
 | decode fp8 GEMV（M=1） | — | ✅ wq_b 139.7 / wo_b 147.1 / wkv 20.1 / wq_a 26.9 µs | — | — | — | — |
 | GEMV + RoPE epilogue | — | ✅ rel 1.3–1.4e-3，wq_b 139.7 µs | — | — | — | — |
+| MoE gate/up+silu 融合 | — | ✅ M=8 146.5 µs vs 246.2（1.68×），rel 1.9e-3 | — | — | — | — |
+| MoE down+权重融合 | — | ✅ 含在整专家 146.5 µs 内 | — | — | — | — |
 
 > DeepGEMM / FlashInfer / FlashMLA 的“已合并”指上游 PR 状态（GitHub API 查证：DeepGEMM #324 merged 2026-06-24；FlashInfer #3395 merged 2026-06-15；vLLM #43477 merged 2026-06-22），但**本机 Windows 未安装/未编译/未实测**，不计入“今天可用”。
 
@@ -376,6 +380,40 @@ M=1 时官方 `fp8_gemm` 的 block_M=32 浪费 31/32 行，且实测只有 ~167 
 - 限制/下一步：权重读仍是 32 B/warp/迭代的 sector 交易，未用 16 B 向量 load；下一步可做 16B/thread + 2 warps/行、或把 wq_b 与 `act_quant` 融合成单 kernel；wo_a 是分组 8×(1024×4096)，本表未按单 GEMV 计（Lead 列的 wo_b K=4096 应为 wo_a 的组形状）。
 - 接入点：`gemm.py` 增加 decode 分支（M==1 且 fp8 权重）→ `fused_fp8_gemv/_pq/_pq4`；prefill M≥64 仍走 `fp8_gemm`。
 
+### 2.15 MoE 融合 kernel（O2/O3 本轮）：fp4 gate/up + silu、down + 路由权重
+
+`moe_fused.py`（真实 L0 expert 0 权重，fp4 packed + 1×32 e8m0；官方对照 = 2 次 `fp4_gemm` + torch silu/clamp + 1 次 `fp4_gemm` + 权重）：
+
+| kernel | 语义 | 说明 |
+|---|---|---|
+| `fused_fp4_swiglu_pq` | gate=A@W1ᵀ, up=A@W3ᵀ，一个 kernel 内两次 fp4 GEMM（共享 A 和 A 量化）→ clamp → silu(gate)*up → h [M,2304] bf16 | A 预量化（act_quant 一次，供 gate/up 复用）；epilogue 先按官方语义把 gate/up round 到 bf16 再 clamp/silu |
+| `fused_fp4_down_pq` | y = (A@W2ᵀ) * weights[:,None]，A=h 预量化 → y [M,5120] bf16 | down GEMM + 路由权重 |
+| `fused_fp4_expert_ffn`（集成入口） | act_quant(x) → swiglu → act_quant(h) → down | 4 kernel/专家；可直接换掉 `moe.Expert.forward` 里的 3 次 fp4/dequant GEMM 与逐元素 |
+| `fused_fp4_swiglu` / `fused_fp4_down`（bf16 入口、内部量化） | 单 kernel，无外部 act_quant | **实测很慢（1.7 ms/专家）**：每个 N block 重复量化 A；不推荐，保留作 API/对照 |
+
+**正确性（vs 官方 fp4_gemm + torch 逐元素路径，真实 L0 权重）**
+
+| M | rel err | 说明 |
+|---:|---:|---|
+| 8 | **1.97e-3** | <1e-2；差异主要来自 fp8 激活量化与 bf16 舍入 |
+| 64 | **1.91e-3** | 同上 |
+
+> 关键修复：官方 expert 的 gate/up 是 `fp4_gemm` 输出的 bf16，再 clamp/silu；最初用 fp32 累加器直接 silu，h 差 0.2%，经 h 的 act_quant 放大到 ~1.4e-2。epilogue 先 round 到 bf16 后 rel 降到 1.9e-3。
+
+**性能（真实 L0 专家，median of 3；包含 act_quant）**
+
+| M | 官方 fp4 分步 | fused（pq，最佳配置） | 加速 | 配置 |
+|---:|---:|---:|---:|---|
+| 8 | 246.2 µs | **146.5 µs** | **1.68×** | block_M=16, block_N=64 |
+| 64 | 387.0 µs | **273.9 µs** | **1.41×** | block_M=64, block_N=128 |
+
+- 每专家 launch-ish op：官方 **19**（2 act_quant + 3 fp4_gemm + torch 逐元素）→ fused **4**（2 act_quant + 2 tilelang）；6 专家/层 **114 → 24**。
+- 每层节省约 6×(246−146)=0.6 ms（M=8）或 6×(387−274)=0.68 ms（M=64）；按 40 层约 24–27 ms/token。
+- 变体：M=8 用 block_M=16/block_N=64 最好（block_M=32 慢 20%）；M=64 用 block_M=64 最好（block_M=16 反而慢）；bf16 内置量化版本 1.7 ms，**不要用**（每个 N block 重复量化 A）。
+- **~6 kernel/层目标未达**：当前 24 kernel/层。要到 2–4 只能做“全专家 grouped kernel”：把 6 个专家的 W1/W3/W2 堆叠或 pointer table，grid 加 expert 维，同时 batch 各专家 token；代价是每层堆叠 6×17.7 MB 权重（或 zero-copy pointer 传递）。单专家单 kernel 不可行：down 需要完整 h 行（2304），必须跨 block 同步。
+- 接入点：`moe.py::MoE.forward` 把每个专家的 `Expert.forward` 换成 `fused_fp4_expert_ffn`（专家权重保持 fp4 packed）；路由权重传入 down；shared expert 仍走 fp8 路径。
+- 下一步：grouped expert kernel（expert 维 grid + token gather）、shared expert 的 fp8 GEMM 与 routed expert 合并调度、M=1 时 block_M=8/16 专用。
+
 ---
 
 
@@ -600,6 +638,8 @@ V4.1 的 non-expert 权重只有 17.7 GB（fp8 + e8m0 scale），expert 296 GB�
 | `fused/bench_hc_fused.py` | 真实 L0 HC 权重：torch vs fused，正确性/耗时/kernel 数 | ✅ |
 | `fused/gemv_fp8.py` | decode fp8 GEMV（bf16 入口 / 预量化 / pq4 / RoPE epilogue） | ✅ |
 | `fused/bench_gemv_fp8.py` | 真实 L0 四个 GEMM：official vs GEMV，带宽/正确性 | ✅ |
+| `fused/moe_fused.py` | fused_fp4_swiglu / down / expert_ffn（pq + bf16 变体） | ✅ |
+| `fused/bench_moe_fused.py` | 真实 L0 专家：官方 fp4 分步 vs fused，正确性/耗时/kernel 数 | ✅ |
 
 ---
 

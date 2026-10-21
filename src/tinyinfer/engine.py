@@ -46,9 +46,17 @@ class Engine:
             # production tiers own their ExpertStore (RAM cache + VRAM slots)
             try:
                 from .loading import ExpertStore
+                # elastic RAM budget: size the expert cache from what is actually free,
+                # so other agents/processes on the box do not cause MemoryError
+                try:
+                    import psutil
+                    avail = psutil.virtual_memory().available
+                    cache_budget = int(avail * 0.35)
+                except Exception:
+                    cache_budget = int(self.tier.expert_cache_gb * (1 << 30))
                 self.expert_store = ExpertStore.from_store(
                     self.store,
-                    cache_bytes=max(256 << 20, int(self.tier.expert_cache_gb * (1 << 30))),
+                    cache_bytes=min(16 << 30, max(512 << 20, cache_budget)),
                     policy="arc",
                     vram_slots=48 if device != "cpu" else 0,
                     device=device if device != "cpu" else "cpu",
@@ -252,6 +260,7 @@ class Engine:
 
     # -- forward -----------------------------------------------------------
     def _forward_chunk(self, ids: torch.Tensor, start_pos: int):
+        self._last_hidden = None  # filled after the final layer (MTP stage-0 input)
         if self.layer_ids is not None:
             layer_seq = self.layer_ids
             if self.allow_missing_layers:
@@ -307,6 +316,7 @@ class Engine:
                 b.to("cpu")  # free VRAM for the next streamed layer
         if self.predictor is not None and tok_now is not None and self._last_routing:
             self.predictor.observe(tok_now, dict(self._last_routing))
+        self._last_hidden = h  # [1, T, hc, dim] before collapse (MTP main hidden)
         if self.profile:
             torch.cuda.synchronize()
             self._timings = [(i, a.elapsed_time(b)) for i, a, b in events]
@@ -358,11 +368,11 @@ class Engine:
 
     def speculative_generate(self, prompt_ids, max_new_tokens: int = 32, draft_len: int | None = None,
                              temperature: float = 0.0):
-        """Draft with the MTP stages, verify with the main model, accept the longest prefix.
+        """Draft with MTP, verify with the main model (greedy accept), rollback on mismatch.
 
-        TODO(mtp): skeleton only -- needs the real MTP shards (model-00044..46) and a
-        proper main-model verify pass (capture_hidden + chunk scoring + KV rollback).
-        Do not call in production until that verification lands.
+        Greedy verification: a draft token is accepted when the main model's argmax at
+        that position matches it; the first mismatch ends the run. KV is snapshotted
+        before the verify forward and rolled back so the main model state stays exact.
         """
         from .nn import sample_logits
         if getattr(self, "mtp", None) is None and not self.load_mtp():
@@ -372,46 +382,56 @@ class Engine:
         out = []
         with torch.inference_mode():
             logits = self.forward(torch.tensor([ids], device=self.device), 0)
-            main_hidden = None  # last-layer hidden needed by stage 0 (filled below)
-            for _step in range(max_new_tokens):
+            while len(out) < max_new_tokens:
                 nid = sample_logits(logits[0, -1], temperature)
                 out.append(nid)
-                snap = self.snapshot()
-                # draft
-                drafts = [nid]
-                h = self.forward(torch.tensor([[nid]], device=self.device), len(ids), capture_hidden=True)
+                if len(out) >= max_new_tokens:
+                    break
+                # main-model hidden for MTP stage 0 (KV already advanced by the token)
+                _ = self.forward(torch.tensor([[nid]], device=self.device), len(ids))
                 hidden = self._last_hidden
-                x = None
-                main_x = None
-                pre = torch.zeros(1, 1, self.cfg.hc_mult, device=self.device)
-                pre[:, :, 0] = 1.0
+                pos = len(ids) + 1
+                x, main_x, pre = None, None, None
                 for st in self.mtp:
                     if st.stage == 0:
-                        mx = st.main_norm(torch.nn.functional.linear(hidden.float(), st.main_proj))
-                        draft_ids = torch.full((1, st.block_size), st.cfg.dspark_noise_token_id if hasattr(st.cfg, "dspark_noise_token_id") else 0,
-                                               dtype=torch.long, device=self.device)
-                        draft_ids[:, 0] = nid
-                        emb = self.embed[draft_ids]
-                        x = emb.unsqueeze(2).repeat(1, 1, self.cfg.hc_mult, 1)
-                        main_x = mx
-                    x, pre = st.forward(x, len(ids) + 1, pre, main_x or x)
-                # verify: main model scores the draft tokens
-                self.restore(snap) if False else None
-                self.restore(snap)
-                cand = drafts[:draft_len]
-                logits = self.forward(torch.tensor([cand], device=self.device), len(ids))
+                        x, main_x = st.forward_embed(hidden, torch.tensor([nid], device=self.device))
+                        pre = torch.zeros(1, x.size(1), self.cfg.hc_mult, device=self.device)
+                        pre[:, :, 0] = 1.0
+                    x, pre = st.forward(x, pos, pre, main_x if main_x is not None else x)
+                # draft the next tokens with the main head on the MTP hidden state
+                hd = x  # last stage hidden
+                drafts = [nid]
+                dlogits = self.head(hd.view(1, -1)) if self.head_on_cpu else torch.nn.functional.linear(
+                    hd.view(1, -1).float(), self.head).float()
+                for _ in range(draft_len - 1):
+                    nxt = int(dlogits[0].argmax())
+                    drafts.append(nxt)
+                if len(drafts) < 2:
+                    logits = self.forward(torch.tensor([[nid]], device=self.device), pos - 1)
+                    ids.append(nid)
+                    continue
+                # verify the draft prefix with one main-model forward, then roll back
+                snap = self.snapshot()
+                cand = drafts[1:]
+                vlogits = self.forward(torch.tensor([cand], device=self.device), pos)
                 accept = 0
-                for t in range(len(cand) - 1):
-                    pred = int(logits[0, t].argmax())
-                    if pred == cand[t + 1]:
+                for t in range(len(cand)):
+                    if int(vlogits[0, t].argmax()) == cand[t]:
                         accept += 1
-                        out.append(cand[t + 1])
                     else:
                         break
+                ids = ids + [nid] + cand[:accept]
+                out.extend(cand[:accept])
                 if accept == 0:
+                    self.restore(snap)
+                    logits = self.forward(torch.tensor([[nid]], device=self.device), pos - 1)
+                else:
+                    # keep the KV of the accepted prefix only
+                    self.restore(snap)
+                    logits = self.forward(torch.tensor([[nid]] + cand[:accept], device=self.device), pos - 1)
+                if len(out) >= max_new_tokens:
                     break
-                ids.extend(out[-accept:])
-        return out
+        return out[:max_new_tokens]
 
     def generate(self, prompt_ids, max_new_tokens: int = 16, temperature: float = 0.0, eos_token_id=None,
                  top_p: float = 1.0, top_k: int = 0):

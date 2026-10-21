@@ -3,6 +3,16 @@
 测量日期 2026-10-21/22，模型 DeepSeek-V4.1-Flash-1017（HF safetensors 原格式，逐层下载中）。
 所有数据来自真实权重（非合成），balanced 档（fp8 常驻 + fp4 专家 kernel + 学习型预取）。
 
+## 0. 全 40 层（完整模型，2026-10-22 实测）
+
+| 项 | 实测 | 条件 |
+|---|---|---|
+| 全 40 层加载 | 1.6s（懒构造） | 40 层分片 SHA256 校验通过 |
+| prefill 8 tok（冷） | 54.6s | 含 40 层 Block 构造 + JIT 首编 |
+| decode | **5882 ms/token（0.17 tok/s）** | 7 常驻 + 33 流式，vram 峰值 8122MB |
+| 生成 | " Deep..  I am Deep." | 修复 L20 ratio=1 kv_source 的 src_ratio 后语义正常 |
+| 每层成本 | MoE 56ms/层（72%）、attn 3ms/层、HC 1.7ms/层 | 专家 IO + fp4 kernel |
+
 ## 1. 已验证的层数 vs 性能
 
 | 层数 | 完整分片 | decode | prefill | GPU 常驻 | VRAM 峰值 | 备注 |
