@@ -18,9 +18,11 @@ from .weights import ShardStore
 
 
 class MLACompressedAttention:
-    def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, *, quant: bool = False):
+    def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, *, quant: bool = False,
+                 rt=None):
         p = f"layers.{layer_id}.attn."
         self.layer_id = layer_id
+        self.rt = rt if rt is not None else shared_attn  # per-kv-source handoff slots
         self.cfg = cfg
         self.quant = quant
         self.eps = cfg.rms_norm_eps
@@ -62,8 +64,8 @@ class MLACompressedAttention:
             32.0,
             1.0,
         )
-        self.compressor = Compressor(store, layer_id, cfg, quant=quant) if self.is_kv_source else None
-        self.indexer = Indexer(store, layer_id, cfg, self.freqs_cis) if self.is_index_source else None
+        self.compressor = Compressor(store, layer_id, cfg, quant=quant, rt=rt) if self.is_kv_source else None
+        self.indexer = Indexer(store, layer_id, cfg, self.freqs_cis, rt=rt) if self.is_index_source else None
         # per-layer runtime state (shared streaming slots serve several layers)
         self._states: dict[int, dict] = {}
         self._active_layer = 0
@@ -106,10 +108,10 @@ class MLACompressedAttention:
             self.compressor.reset()
         if self.indexer is not None:
             self.indexer.reset()
-        shared_attn.compress_kv = None
-        shared_attn.index_k = None
-        shared_attn.topk_idxs = None
-        shared_attn.candidates = None
+        self.rt.compress_kv = None
+        self.rt.index_k = None
+        self.rt.topk_idxs = None
+        self.rt.candidates = None
 
     def to(self, device):
         for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
@@ -158,7 +160,7 @@ class MLACompressedAttention:
 
         # ---- compressed KV ----
         end_pos = start_pos + s
-        ratio_now = self.ratio if self.is_kv_source else (shared_attn.src_ratio or self.ratio)
+        ratio_now = self.ratio if self.is_kv_source else (self.rt.src_ratio or self.ratio)
         compress_len = end_pos // ratio_now
         latent = self.compressor.forward(x, start_pos) if self.compressor is not None else None
         if latent is not None:
@@ -170,16 +172,16 @@ class MLACompressedAttention:
                     grown[:, : self._compress_kv.shape[1]] = self._compress_kv
                 self._compress_kv = grown
             self._compress_kv[:, start_group : start_group + latent.size(1)] = latent
-            shared_attn.compress_kv = self._compress_kv
+            self.rt.compress_kv = self._compress_kv
         if compress_len <= 0:
             compress_kv = compress_idxs = None
         else:
-            compress_kv = shared_attn.compress_kv[:, :compress_len]
+            compress_kv = self.rt.compress_kv[:, :compress_len]
             if self.indexer is not None:
                 compress_idxs = self.indexer.forward(x, qr, latent, start_pos, kv_w.size(1))
-                shared_attn.topk_idxs = compress_idxs
+                self.rt.topk_idxs = compress_idxs
             else:
-                compress_idxs = shared_attn.topk_idxs
+                compress_idxs = self.rt.topk_idxs
 
         if compress_idxs is not None and compress_idxs.size(-1) > 0:
             kv_all = torch.cat([kv_w, compress_kv], dim=1)

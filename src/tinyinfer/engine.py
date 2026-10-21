@@ -177,12 +177,37 @@ class Engine:
             n = i + 1
         return n
 
+    def _rt_for(self, layer_id: int):
+        """Handoff slots for a layer: the nearest kv_source at or below it.
+
+        Chunk-major execution reuses one process singleton because layers run in order;
+        layer-major needs a separate instance per source so followers of different
+        chunks cannot observe a stale neighbour's state.
+        """
+        from .compressor import SharedAttentionRuntime, shared_attn
+
+        if not getattr(self, "_layer_major_mode", False):
+            return shared_attn
+        cache = getattr(self, "_rt_cache", None)
+        if cache is None:
+            self._rt_cache = cache = {}
+        if layer_id in cache:
+            return cache[layer_id]
+        sources = [s for s in self.cfg.kv_source_layer_ids if s <= layer_id]
+        src = max(sources) if sources else -1
+        rt = cache.get(src)
+        if rt is None:
+            rt = cache[src] = SharedAttentionRuntime()
+        cache[layer_id] = rt
+        return rt
+
     def block(self, layer_id: int) -> Block:
         b = self._blocks.get(layer_id)
         if b is None:
             b = Block(self.store, layer_id, self.cfg, expert_store=self.expert_store,
                       quant=self.tier.keep_weights_quantized, hashes=self.hashes,
-                      cache_wo_a=self.cache_wo_a, expert_topk=self.tier.expert_topk)
+                      cache_wo_a=self.cache_wo_a, expert_topk=self.tier.expert_topk,
+                      rt=self._rt_for(layer_id))
             b.hc_post_on_cpu = getattr(self, "small_ops_on_cpu", False)
             if layer_id < self.gpu_layers and self.device != "cpu":
                 b.to(self.device)
@@ -342,7 +367,7 @@ class Engine:
         while len(pair) < 2:
             blk = Block(self.store, layer_id, self.cfg, expert_store=self.expert_store,
                         quant=self.tier.keep_weights_quantized, hashes=None,
-                        expert_topk=self.tier.expert_topk)
+                        expert_topk=self.tier.expert_topk, rt=self._rt_for(layer_id))
             blk.hc_post_on_cpu = getattr(self, "small_ops_on_cpu", False)
             blk.to(self.device)
             pair.append(blk)
@@ -487,6 +512,17 @@ class Engine:
             ids = ids.to(self.device)
         b, T = ids.shape
         step = max_chunk or self.prefill_chunk
+        # per-kv-source handoff slots for the whole pass (blocks are constructed lazily,
+        # so the flag has to be set before any block() call below).
+        self._layer_major_mode = True
+        self._rt_cache = {}
+        try:
+            return self._prefill_layer_major_impl(ids, T, step)
+        finally:
+            self._layer_major_mode = False
+            self._rt_cache = {}
+
+    def _prefill_layer_major_impl(self, ids, T: int, step: int):
         if not hasattr(self, "_v5_enabled"):
             self._v5_enabled = bool(int(__import__("os").environ.get("TI_V5", "0")))
         # layer sequence identical to _forward_chunk
@@ -512,7 +548,11 @@ class Engine:
             if self.hashes is not None:
                 hash_ids = self.hashes(chunk_ids.reshape(-1).tolist(), off)
             acts.append([h.cpu(), pre_mix.cpu(), hash_ids, off])
-        # 2) per layer: one H2D, apply to every chunk, free
+        # 2) per layer: one H2D, apply to every chunk, free. Cross-layer shared state in
+        # compressed attention (shared_attn.candidates/compress_kv/index_k) is published
+        # by the kv_source layer and consumed by its followers, so it must be cleared at
+        # every layer boundary in layer-major order (chunk-major keeps them within one
+        # layer's chunk sequence, which is why it never needed this).
         self._timings = []
         for i in layer_seq:
             bobj = self.block(i)
