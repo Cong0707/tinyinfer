@@ -99,6 +99,23 @@ class ShardStore:
         flat = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
         return flat.view(dtype).reshape(tuple(entry["shape"]))
 
+    def read_many(self, names: list[str], *, threads: int = 8) -> dict[str, torch.Tensor]:
+        """Parallel tensor reads (thread pool over pread); warms the OS cache for get().
+
+        Startup is dominated by per-tensor reads (one open+seek+read each); reading a
+        layer's weights through this pool saturates the SSD instead of serializing.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        if not names:
+            return {}
+        out: dict[str, torch.Tensor] = {}
+        with ThreadPoolExecutor(max_workers=max(1, threads)) as pool:
+            futures = [pool.submit(self.get, n) for n in names]
+            for n, fut in zip(names, futures):
+                out[n] = fut.result()
+        return out
+
     def get_slice_info(self, name: str) -> tuple[tuple[int, ...], str]:
         shard = self.shard_of(name)
         header, _ = self._header(shard)
