@@ -434,3 +434,11 @@ The France/population prompt through `generate()` with `TI_PREFILL_CHUNK=4` retu
 (11.6s vs 18.3s on 12 tokens). So the chunk mode is usable when the ~0.5%/layer numerical
 difference does not matter, and `TI_PREFILL_CHUNK=1` is there when it does.
 
+
+### Long prompt, default chunk (measured)
+
+63-token prompt, default planner chunk (8): **79.7s of prefill = 1.27s/token**, versus
+136s for the same prompt through the token-at-a-time path (the earlier measurement).
+That is 1.7x on a long prompt with the default configuration -- no switch needed. The
+first generated token is `<|end|>`, which is what a repeated pangram should produce.
+
