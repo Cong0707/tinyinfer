@@ -40,6 +40,13 @@ engine 侧 `open_adapter` 对 `deepseek_v41` 架构自动挂 HFDeepSeekV41Adapte
 
 end-to-end 验证脚本：`scripts/e2e_models.py <model_dir> [n_tokens]`。
 
+## 0.2 Engram 行读验证（2026-10-22）
+
+- 张量名：`layers.{1,14}.engram.{embed.weight, embed.scale, wkv.weight, wkv.scale, q_weight, k_weight}`（注意没有 `.attn.` 前缀）。
+- `EngramHashes`（压缩词表哈希，n_cols=24）+ `Engram.forward`（行读 24 行 × 256B → fp8 解码 → wkv → sigmoid gate 写入残差）。
+- L1（00047 已下载）实测：构建 0.1s、首调 forward **1.18s**（含表行读缓存/分配）；L14（00048）待分片完成后同路径启用。
+- Engine 仅在两张 engram 表的分片都存在时才启用（`all(shards exist)`），避免半表状态。
+
 ## 1. 事实与实测基线
 
 ### 1.1 模型布局（解析 48 个 safetensors header，非估算）

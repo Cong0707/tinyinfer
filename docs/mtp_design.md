@@ -59,7 +59,10 @@ mtp.2.confidence_head.proj.weight [1, dim+256]       （官方 confidence_head.p
 - **全链可跑**：prefill→target hidden→main_x→draft embeds→3 stage→forward_head（logits+confidence）无崩溃。
 - **投机解码（speculative_generate, draft_len=2, 4 token）**：0.056 tok/s，accept_rate=0%。
   - 结论：MTP 输出分布与主模型不一致，**draft 无效**——投机当前是**负收益**（比常规 decode 0.2 tok/s 慢）。
-  - 待查（参考官方 dflash 数值）：markov 修正的 draft_ids 语义（官方每步用上一步采样 token，当前用 noise 填充首轮）、main_x 的 target hidden 语义（collapse 时机）、draft attention 的 main KV 窗口累积。
+  - markov 已按官方改为逐 step（每步用上一步采样的 draft token 作为 markov_w1 输入），accept 仍为 0 —— 根因不在 markov。
+  - 下一处怀疑：**dflash_input 的捕获时机**。官方在 target 层 attn_norm_forward 之后存 residual.residual（attention 输入 norm 后、collapse 的 [T,dim]）；tinyinfer 现在捕获的是 Block 输出后的 hc_pre(h, pre_mix)（ffn 之后），语义不同。需在 Block.forward 里暴露 attn_norm 输出才能对齐。
+  - 其余待查：draft attention 的 main KV 窗口累积语义（官方 paged swa cache + slot mapping）、draft position 语义。
+- **当前投机关闭**；MTP 权重加载 + 前向链保留为已验证能力。
 - **VRAM**：投机时 3 stage 权重上卡 → 峰值 10.7GB > 8GB（WDDM 分页）。投机路径需 stage 权重换出（CPU）或按需加载。
 
 ## 已知限制
