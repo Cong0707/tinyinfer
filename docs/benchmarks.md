@@ -15,6 +15,7 @@
 | **2026-10-22 10:43（expandable_segments）** | 40 层 decode **2013-2946ms，稳态 ~2.0s = 0.432 tok/s**、vram **7049MB** | `PYTORCH_ALLOC_CONF=expandable_segments:True`（+14% vs 默认分配器） |
 | **2026-10-22 11:45（placement）** | 40 层 forward finite ✓，小算子（HC post/comb）走 CPU | 8GB 机的 placement 决策；大显存机自动全 GPU |
 | **2026-10-21 12:46（LAYER_GB 校准）** | **9 层常驻基准：0.34 tok/s**（2519-3329ms）、vram **7822MB** | 旧 0.44GB/层低估导致 11 层 8671MB 触发 WDDM 分页（0.271）；校准 0.55GB/层后自动 9 层，回到物理显存内 |
+| **2026-10-21 14:45（pinned expert 直读）** | **0.47 tok/s**（热 1915-2282ms；冷 0.423）、vram 7822MB | **readinto pinned host memory（7.4GB/s vs pageable 3.2）+ 全程 pinned H2D（13.3 vs 8.3）**；decode +38%，本机首个正收益 A/B |
 | **2026-10-22 10:45 稳态复测** | 40 层 8 token 延迟 2342-2995ms、**mean 2644ms = 0.378 tok/s**、vram **7048MB** | cache/weights HF 平铺目录；warm（专家 RAM 热 + JIT 缓存 + acquire_many）；对比 14 日 5.0s/token |
 | **2026-10-22 10:35 复测（warm）** | 40 层 load **1.6s**、first forward 16.3s（JIT）、**second forward 2.98s（0.335 tok/s）**、vram **7048MB** | cache/weights HF 平铺目录；VramSlotCache.acquire_many 批量槽 |
 | **2026-10-22 10:10 复测** | 40 层加载 **1.5s**、vram **7048MB**、decode 6.3-11.5s/token（下载 IO 竞争时变慢） | cache/weights HF 平铺目录；VramSlotCache.acquire_many 批量槽 |
