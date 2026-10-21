@@ -64,15 +64,20 @@ tinyinfer/
 - [llama.cpp PR #25294](https://github.com/ggml-org/llama.cpp/pull/25294) —— MoE 专家磁盘流式
 - [vLLM PR #43477](https://github.com/vllm-project/vllm/pull/43477) —— SM120 上的 DeepSeek V4
 
-## 状态
+## 状态（2026-10-22）
 
-- [x] P0.1 环境：WSL2 Ubuntu 26.04（GPU 透传确认）
-- [ ] P0.2 工具链：CUDA / Python 3.12 / torch cu132 / DeepInfer vendor
-- [ ] P1 权重侦察与资源预算
-- [ ] P2 单组件参考前向
-- [ ] P3 HF 直接加载器
-- [ ] P4 分层执行
-- [ ] P5 端到端
+- [x] P0.1 环境：Windows 11 + Python 3.13 + torch 2.9.0+cu130（无 WSL，直接 Windows CUDA）
+- [x] P0.2 工具链：tilelang 0.1.15（vcvars64 + CUDA_HOME）、uv、官方 kernel.py 复用
+- [x] P1 权重侦察与资源预算：510GB 权重结构、专家 4.5GB/token、显存预算 0.44GB/层
+- [x] P2 单组件参考前向：attention/MoE/HC/compressor/indexer 全部单测
+- [x] P3 HF 直接加载器：pread 直读（修复 mmap 多分片崩溃）、fp8/fp4/engram
+- [x] P4 分层执行：7 层常驻 + 33 层流式、RAM 专家缓存（弹性）、VRAM 槽状态机
+- [x] P5 端到端：**全 40 层真实权重**（42 分片 SHA256 校验）prefill/decode/生成通过
+  - decode **0.20 tok/s**（5.0s/token，8GB 卡 + 33 流式层）；生成语义正确（"Hello, I am DeepSeek"）
+  - OpenAI API（多 slot/SSE/function calling 回显）端到端通过
+- [x] 测试 68 passed / 文档（benchmarks/kernels/loading/api/mtp_design/deepinfer_ref）/ bootstrap / git
+
+**进行中**：engram 表下载（72%，~3.5h）；MTP 投机验证（三 stage 加载成功）；流式层 H2D 与专家 IO 进一步重叠（显存预算约束）。
 ## 优化分级（O1 → O4）
 
 像编译器的 -O 级别一样，tinyinfer 的加速按可验证的阶梯推进；每一级都保留上一级的正确性基准：
