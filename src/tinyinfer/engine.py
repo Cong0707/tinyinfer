@@ -116,7 +116,11 @@ class Engine:
             # placement: while most layers stream, small activations round-trip every
             # op; keep HC-style tiny ops on the host (big-VRAM boxes stay all-GPU).
             from .placement import small_op_on_cpu
-            self.small_ops_on_cpu = small_op_on_cpu(self.gpu_layers, self.max_layers)
+            # hc_post on the host costs one D2H sync per call (four per layer). At M=1
+            # that is cheap because the GPU queue is short; at M>1 the sync waits for
+            # the whole layer (measured: 4 x 150ms x 38 layers = 24s of a 29s forward).
+            self.small_ops_on_cpu = (small_op_on_cpu(self.gpu_layers, self.max_layers)
+                                     and __import__("os").environ.get("TI_HC_GPU") != "1")
         self._blocks: dict[int, Block] = {}
         self._last_routing: dict[int, list[int]] = {}
         # expert prefetch is opt-in: with the RAM cache holding ~600 of 15360 experts
@@ -862,6 +866,12 @@ class Engine:
         dlogits, _conf = stages[-1].forward_head(x, pre, tok)
         if dlogits is None:
             return []
+        import os as _os
+        if _os.environ.get("TI_SPEC_DEBUG"):
+            top = dlogits[0, 0].topk(3)
+            print(f"[draft] pos={pos} main_x_mean={float(main_x.abs().mean()):.4f} "
+                  f"hidden_mean={float(x.abs().mean()):.3f} top3={[int(i) for i in top.indices]}",
+                  flush=True)
         n = min(draft_len, dlogits.size(1))
         return [int(dlogits[0, i].argmax()) for i in range(n)]
     def load_mtp(self) -> bool:
@@ -926,6 +936,12 @@ class Engine:
                         j += 1
                     else:
                         break
+                import os as _os
+                if _os.environ.get("TI_SPEC_DEBUG"):
+                    _p0 = int(preds[0].argmax())
+                    print(f"[spec] pos={pos} draft0={drafts[0]} pred0={_p0} "
+                          f"match={_p0 == drafts[0]} logits_argmax={int(logits[0, -1].argmax())} "
+                          f"n_drafts={len(drafts)}", flush=True)
                 drafted += len(drafts)
                 acc += j
                 if j < len(drafts):
