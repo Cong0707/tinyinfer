@@ -1,4 +1,17 @@
-"""MoE with fp4 routed experts and one fp8 shared expert, loaded straight from HF shards."""
+"""MoE with fp4 routed experts and one fp8 shared expert, loaded straight from HF shards.
+
+Reference implementations (consult when fixing this file):
+  * DeepInfer  deepinfer/model_executor/models/v4_modules/mlp.py  (DeepseekMoE:
+        sqrtsoftplus gate scoring, n_activated_experts=6, route_scale, shared expert)
+  * Official   reference/official/model.py (Gate / Expert FFN) and kernel.py
+        (fused_fp4_expert_ffn: gate+up+silu / down, block-scaled fp4)
+  * flash-moe  expert fetch/cache/eviction model (384-expert top-6 layout)
+
+Checkpoint tensor names (do not rename):
+  layers.{L}.ffn.gate.{weight,bias,bias_vl}
+  layers.{L}.ffn.experts.{i}.{w1,w2,w3}.{weight,scale}    fp4 E2M1 + ue8m0
+  layers.{L}.ffn.shared_experts.{w1,w2,w3}.{weight,scale} fp8 E4M3
+"""
 from __future__ import annotations
 
 import torch

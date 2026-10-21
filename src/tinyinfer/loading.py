@@ -1,5 +1,14 @@
 """Tiered weight loading, expert caches and router prefetching for tinyinfer.
 
+Reference implementations (consult when fixing this file):
+  * flash-moe  expert fetch/cache/eviction design (same 384-expert top-6 layout:
+        LRU/ARC caches, VRAM slot ring, prefetch gating, -18% result when ungated)
+  * llama.cpp  mmap row reads for shared weights, O_DIRECT experiments, page-aligned IO
+  * DeepInfer  deepinfer/model_executor/layers/... (expert aggregation, engram row reads)
+  * vLLM       vllm/model_executor/models/... (paged KV, block manager ideas)
+  Measured here: single-shard read ceiling ~5.3 GB/s (buffered readinto, 6 threads),
+  page-aligned OVERLAPPED direct 4.76 GB/s, H2D pinned 26.1 GB/s / pageable 8.96 GB/s.
+
 This module is the storage/IO half of tinyinfer.  The model code (tinyinfer.moe)
 only knows how to compute; this module decides *where* the bytes live and *when*
 they are read:

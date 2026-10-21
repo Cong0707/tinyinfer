@@ -1,6 +1,11 @@
 """O3: reuse the official reference tilelang kernels (kernel.py) for quantized GEMM.
 
-Official code is at reference/official/kernel.py (act_quant / fp8_gemm / fp4_gemm).
+Reference implementations (consult when fixing this file):
+  * Official   reference/official/kernel.py (act_quant / w8a8_block_fp8_linear / fp4_gemm)
+  * DeepInfer  deepinfer/model_executor/layers/quantization (fp8/fp4 linear, ue8m0 scales)
+  * PyTorch    torch._scaled_mm (cuBLAS fp8) and plain F.linear fallbacks
+
+Tolerance: fp8 block GEMM rel <= 1e-2, fp4 rel <= 3e-2 vs bf16 reference.
 These are lazy: importing this module does not compile anything; the first call
 compiles (needs vcvars64 + nvcc).
 """
