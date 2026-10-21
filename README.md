@@ -40,7 +40,7 @@ degraded output.
     export E:\Develop\Deepseek\tinyinfer\.venv\Scripts\python.exe
     export PYTHONPATH=E:\Develop\Deepseek\tinyinfer\src
 
-    python -m tinyinfer.serve --model E:\Models\DeepSeek-V4.1-Flash-1017 --port 8000
+    python -m tinyinfer.cli serve --backend tiny --model-dir E:\Models\DeepSeek-V4.1-Flash-1017 --port 8000
     curl -X POST http://127.0.0.1:8000/generate -d '{"prompt": "...", "max_new_tokens": 8}'
 
     # or from Python
