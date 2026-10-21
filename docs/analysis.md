@@ -331,3 +331,24 @@ chunk=1 and an 8x faster prefill.
   but prefill is IO-bound anyway) -- that is the concrete next step, and it is what
   chunked prefill needs before it can be enabled.
 
+
+## 12. Final resolution of the drift question
+
+On a 4-token prompt, `_forward_impl(ids, 0, chunk=1)` (four single-token chunks) and four
+separate `_forward_impl(one token, i)` calls agree on the argmax (271) but differ by 0.92
+relative in the logits. Those two call sequences are *identical* up to where the
+token-by-token loop lives, so the difference cannot be a chunking/state bug: it is the
+same nondeterminism as the slot pool, just measured through a different door.
+
+Consistent picture:
+
+- `TI_NO_SLOTS=1` -> identical runs and identical call sequences agree exactly (0.000000),
+- default (slot pool) -> any two forwards of the same prompt differ by 0.5-1.0 relative,
+- argmax is stable in every case, which is why generation looks correct,
+- the earlier "chunk differs by 42%" and "batch differs by 26%" numbers were this same
+  noise, and the per-layer "first differing layer 0" observation matches a race in the
+  expert path rather than depth accumulation.
+
+So there is **one** defect here (the slot pool race), not three. The unimplemented fixes
+are documented above; `TI_NO_SLOTS=1` is the working answer until the race is found.
+
