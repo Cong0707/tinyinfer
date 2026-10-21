@@ -63,18 +63,13 @@ class Expert:
         from .gemm import fp4_linear
 
         w1, s1, w2, s2, w3, s3 = self.fp4
-        if x.size(0) == 1 and x.is_cuda:
+        if x.size(0) > 1 and x.is_cuda:
+            # chunked prefill: one fused kernel does gate+up+silu, another does down+scale
             try:
-                from .gemv_fp4 import gemv_fp4
-                gate = gemv_fp4(x, w1, s1).float()
-                up = gemv_fp4(x, w3, s3).float()
-                if self.swiglu_limit > 0:
-                    up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
-                    gate = torch.clamp(gate, max=self.swiglu_limit)
-                y = F.silu(gate) * up
-                if weights is not None:
-                    y = weights * y
-                return gemv_fp4(y.to(torch.bfloat16), w2, s2)
+                from .moe_fused import fused_fp4_expert_ffn
+                w = None if weights is None else weights.reshape(-1)
+                return fused_fp4_expert_ffn(x, w1, s1, w3, s3, w2, s2, w,
+                                            limit=float(self.swiglu_limit))
             except Exception:
                 pass
         gate = fp4_linear(x, w1, s1).float()

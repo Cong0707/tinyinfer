@@ -1833,28 +1833,16 @@ class ExpertStore:
         return ExpertRecord((layer, expert), self.slots.buffer(slot), blob.tensors, self.device)
 
     def fetch(self, layer: int, experts: Iterable[int], *, cache: bool = True) -> list[ExpertRecord]:
-        experts = [int(e) for e in experts]
-        if len(experts) <= 1:
-            records = []
-            for expert in experts:
-                records.append(self._materialize(layer, expert, cache=cache))
-                with self._lock:
-                    self._open[(layer, expert)] += 1
-            return records
-        # parallel materialisation: cache misses read the disk outside the cache lock,
-        # so 6 experts per layer can hit the SSD concurrently instead of serially
-        if getattr(self, "_fetch_executor", None) is None:
-            import concurrent.futures
-            self._fetch_executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(8, max(2, len(experts))), thread_name_prefix="expert-fetch")
-
-        def work(expert: int):
-            rec = self._materialize(layer, expert, cache=cache)
+        # sequential materialisation: the VRAM slot state machine and the cache share
+        # locks that deadlock under a thread pool, so fetch stays single-threaded
+        # (cache-miss disk reads are already overlapped by the RAM prefetcher threads)
+        records = []
+        for expert in experts:
+            expert = int(expert)
+            records.append(self._materialize(layer, expert, cache=cache))
             with self._lock:
                 self._open[(layer, expert)] += 1
-            return rec
-
-        return list(self._fetch_executor.map(work, experts))
+        return records
 
     def prefetch_to_vram(self, layer: int, experts: Iterable[int], *, cache: bool = True) -> int:
         """Stage experts in VRAM slots without taking references (prefill waves).
