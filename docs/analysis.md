@@ -87,3 +87,14 @@ state inside the batch (slot/record reuse in the serve loop), not in arithmetic.
 single-row path is what decode uses, which is why answers are unaffected, and it is the
 default; the batch kernel is opt-in (`TI_MULTIROW_GEMV=1`).
 
+
+## 7. Per-row diff is uniform (new data)
+
+On an 8-row batch every row differs from its single-row reference by 1.3-1.9 (row 5,
+whose experts are least shared, by 0.54), including rows 0/1/2/7 that route to *no*
+shared expert. So the batch error is not caused by multi-row experts; it is uniform.
+The batch routes ~40 experts while the VRAM slot pool holds 16; the extra records fall
+back to RAM records (`acquire` returns -1 and `rec.tensor` then reads the RAM buffer),
+which is a different code path from the slot view. That path difference is the leading
+suspect now. Decode (T=1) routes 6 experts, always fits the pool, and is exact.
+
