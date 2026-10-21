@@ -72,8 +72,8 @@ by `tests/test_planner_hardware.py` and printed by `tools/plan_matrix.py`:
 | --- | --- | --- | --- | --- |
 | 8GB / 47GB (this box) | 4 | 12 | 0.8 tok/s | disk-bound |
 | 12GB / 32GB | 15 | 15 | 0.8 tok/s | disk-bound |
-| 24GB / 64GB | 40 | 298 | 83 tok/s | every routable expert resident |
-| 32GB+ | 40 | 240+ | 83 tok/s | compute-bound |
+| 24GB / 64GB | 40 | 298 | ~18 tok/s | every routable expert resident; compute-bound |
+| 32GB+ | 40 | 240+ | ~18 tok/s | compute-bound |
 | 4GB | - | - | - | refused with the minimum size |
 | CPU only | 0 | 0 | - | host path, minutes/token |
 
