@@ -22,7 +22,7 @@ experts top-6, fp8 non-expert + fp4 experts) that runs **on an 8GB laptop GPU wi
 
 | metric | value |
 | --- | --- |
-| decode | **1.66s/token = 0.60 tok/s** (top-6, quality preserving) |
+| decode | **1.66s/token = 0.60 tok/s** at 4.5GB/s disk; 0.4-0.5 tok/s at the 1.4-1.9GB/s the volume currently reports |
 | theoretical floor | 1.23s/token = 0.81 tok/s (IO only) |
 | prefill, 8 tokens, warm | ~3s |
 | process start (pinned slab, 13GB) | ~13s, one-off |

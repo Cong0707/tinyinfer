@@ -91,6 +91,13 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, resp)
 
     def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/v1/models":
+            self._send(200, {"object": "list", "data": [{
+                "id": _CONFIG["model"] or "tinyinfer",
+                "object": "model",
+                "owned_by": "tinyinfer",
+            }]})
+            return
         if self.path == "/health":
             self._send(200, {"ok": _ENGINE is not None,
                              "model": _CONFIG["model"],
