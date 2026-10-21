@@ -50,11 +50,20 @@ At 512K the compressed KV alone is ~32GB, so the design must also stand up the K
 quantization tier (kv_bits=8 in the AGGRESSIVE tier halves it) and stream KV pages
 like experts. 128K is comfortable with the current RAM budget.
 
-## Chunk budget TBD
+## Chunk budget (measured on this 8GB card)
 
-Layer-major prefill still chunks the token dimension (T=4096 is 40MB of activation,
-well inside RAM); the difference is the loop order, not the chunk size. Once the
-loop is swapped we can pick T by the RAM budget (e.g. 8192 -> 80MB activation).
+256-token prefill with different max_chunk:
+
+| T | time | throughput | VRAM |
+|---|---|---|---|
+| 32 | 316.3s | 0.81 tok/s | 9804MB |
+| **64** | **220.8s** | **1.16 tok/s** | 11043MB |
+| 128 | 516.9s | 0.50 tok/s | 11963MB (pages badly) |
+
+T=64 is the sweet spot: the larger T amortizes the per-layer H2D better, but beyond
+64 the activation growth pushes VRAM into WDDM paging and throughput collapses. The
+same rule sets the long-context ceiling on a bigger card: pick T so that VRAM stays
+under the physical limit, ~4x the resident-layer footprint.
 
 ## Status
 
