@@ -274,3 +274,19 @@ from the slot-pool race. It stays open, and the regression test keeps its xfail.
   Reverted. The race is in a place these four/five theories do not cover; the interim
   answer is `TI_NO_SLOTS=1` for deterministic logits.
 
+
+## Round summary (acceleration + portability)
+
+- Measured constants that drive every decision here: 4.5GB of expert reads and 6.0GB of
+  streamed layers per decode token at 4.5GB/s disk; 26.5GB/s pinned H2D; 18.8MB per
+  expert blob; topk*n_layers = 240 distinct experts per token.
+- On this box decode is disk-bound (fetch ~1.4s of a ~2.0s step) and the only software
+  lever left is the expert cache hit rate.
+- On a 24GB card the plan now covers all 240 experts in VRAM, so the IO term vanishes and
+  the card becomes compute-bound (~0.06s/token estimated).
+- Two real defects were found and documented rather than papered over: the VRAM slot pool
+  makes runs non-reproducible (fix unknown; `TI_NO_SLOTS=1` trades 40% speed for exact
+  repeats) and the multi-chunk prefill path drifts between identical calls.
+- Everything else in this round is either measured (GEMV +11%, planner matrix, TP slicing)
+  or explicitly labelled as an estimate.
+
