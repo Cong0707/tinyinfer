@@ -21,6 +21,7 @@
 | PERFORMANCE.md | one-page performance summary |
 | OPERATIONS.md | runbook: start, monitor, failure modes, resource budget |
 | EXTENDING.md | adding models, operators, endpoints; changing the planner |
+| CHECKLIST.md | release checklist (code, numerics, performance, service, docs) |
 
 ## Reading order
 
