@@ -77,6 +77,7 @@ tinyinfer/
   - warm 复测（2026-10-22 10:35）：40 层 load 1.6s、first forward 16.3s（JIT）、**second forward 2.98s = 0.335 tok/s**、vram 7048MB
   - 分配器复测（2026-10-22 10:43）：`expandable_segments:True` 下稳态 **~2.0s = 0.432 tok/s**（+14%）
   - **当前基线（2026-10-21 12:46，全量 E:\Models）**：resources.plan 自动 9 常驻层（LAYER_GB 校准 0.55），decode **0.34 tok/s @ vram 7822MB**（物理显存内、无分页）；engram L1+L14 开；prefill 16/32/64 token 正确（finite），首次需 tilelang 按 M 预编译（warm_prefill.py）
+  - **API 服务（2026-10-21 13:50）**：OpenAI 兼容 server 的 Engine 后端端到端通过（tier=balanced，否则专家全量上卡 OOM）；SamplingParams 支持 repetition_penalty（vLLM 语义）；server 测试 51 passed。长上下文 prefill 用 scripts/precompile_long.py 预热 M=2048 chunk。
   - OpenAI API（多 slot/SSE/function calling 回显）端到端通过
 - [x] 测试 68 passed / 文档（benchmarks/kernels/loading/api/mtp_design/deepinfer_ref）/ bootstrap / git
 
