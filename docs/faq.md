@@ -7,6 +7,15 @@ The checkpoint is a base (pre-SFT) model with no chat template. Its own top-1 fo
 continuations are its behaviour. The engine reproduces the model's distribution
 (component parity 0.000000). A chat-aligned variant would change the output.
 
+Prompt shapes matter more than with a chat model (measured):
+
+    'The capital of France is'                 -> '# 1. 使用 Python 的 `'
+    'Question: What is the capital of France?\nAnswer:' -> ' France is a country in Europe. ...'
+    '<|User|>What is ...?<|Assistant|>'        -> ' 1.1.1.1.1'
+
+The question/answer framing is the one that yields a sensible continuation; the
+chat-marker framing does not, because the base model never saw it as an instruction.
+
 ## Why is it slower than the 4.5GB/s numbers in the docs?
 
 The checkpoint volume measured 4.5GB/s at the start and 1.5-1.9GB/s after hours of
