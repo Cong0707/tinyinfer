@@ -240,12 +240,13 @@ class Engine:
             self._stream_buffer_cache = cache = {}
         ent = cache.get(kind)
         if ent is None:
+            # offsets only; shapes are resolved per layer at copy time
             layout = []
             off = 0
             for owner, name, t in b._weight_paths():
                 n = t.numel() * t.element_size()
                 off = (off + 255) // 256 * 256
-                layout.append((owner, name, t.dtype, t.shape, off, n))
+                layout.append((owner, name, None, off, n))
                 off += n
             bufs = [torch.empty(off, dtype=torch.uint8, device=self.device) for _ in range(2)]
             ent = cache[kind] = (layout, bufs)
@@ -263,9 +264,9 @@ class Engine:
     def _stream_prefetch(self, layer_id: int, stream) -> None:
         """Copy a streamed layer's weights into its rotating buffer (copy stream).
 
-        The layout (weight order/sizes) comes from the first layer of a kind; the
-        owners here are the CURRENT layer's objects, so every layer gets its own
-        attribute wiring onto the shared buffers.
+        layout offsets come from the first layer of this kind; shapes always come
+        from the CURRENT layer (the same kind can still be packed differently across
+        the source/consumer boundary).
         """
         (layout, bufs) = self._ensure_stream_buffers(layer_id)
         b = self.block(layer_id)
@@ -273,12 +274,14 @@ class Engine:
         if b._cpu_refs is None:
             b._cpu_refs = [t.pin_memory() if t.is_cpu and t.device.type == "cpu" else t
                            for (_, _, t) in paths]
+        if len(paths) != len(layout):
+            raise RuntimeError(f"L{layer_id}: {len(paths)} weights vs layout {len(layout)}")
         buf = bufs[layer_id % 2]
         with torch.cuda.stream(stream):
-            for (_, _, dt, sh, off, n), cpu in zip(layout, b._cpu_refs):
-                buf[off:off + n].view(cpu.dtype).view(cpu.shape).copy_(cpu)
-        for (_, _, dt, sh, off, n), (owner, name, t) in zip(layout, paths):
-            setattr(owner, name, buf[off:off + n].view(t.dtype).view(t.shape))
+            for (owner, name, t), (_, _, _, off, _) in zip(paths, layout):
+                buf[off:off + t.numel() * t.element_size()].view(t.dtype).view(t.shape).copy_(t)
+        for (owner, name, t), (_, _, _, off, _) in zip(paths, layout):
+            setattr(owner, name, buf[off:off + t.numel() * t.element_size()].view(t.dtype).view(t.shape))
         b._device = self.device
 
     # -- streaming slots ---------------------------------------------------
