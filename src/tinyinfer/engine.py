@@ -238,31 +238,42 @@ class Engine:
 
     # -- double-buffered streaming -----------------------------------------
     def _ensure_stream_buffers(self, layer_id: int):
-        """Two flat device buffers per layer-kind, laid out from this layer's weights.
+        """Two flat device buffers per EXACT weight signature (v5).
 
-        The first streamed layer of each kind defines the layout (same kind = same
-        weight names/shapes); later layers reuse the buffers via rotating copy-in.
+        v4 grouped by (ratio>0, compressor, indexer) and broke at the L20 boundary
+        (ratio=1 kv_source has a different weight count than the ratio=1 consumers).
+        v5 keys the cache by the full (name, shape) signature, so layers that can
+        share a flat buffer are exactly the ones whose weight list is identical.
         """
         b = self.block(layer_id)
-        kind = (self.cfg.compress_ratios[layer_id] > 0,
-                getattr(b.attn, "compressor", None) is not None,
-                getattr(b.attn, "indexer", None) is not None)
+        paths = b._weight_paths()
+        sig = tuple((name, tuple(t.shape)) for (_, name, t) in paths)
         cache = getattr(self, "_stream_buffer_cache", None)
         if cache is None:
             self._stream_buffer_cache = cache = {}
-        ent = cache.get(kind)
+        ent = cache.get(sig)
         if ent is None:
-            # offsets only; shapes are resolved per layer at copy time
             layout = []
             off = 0
-            for owner, name, t in b._weight_paths():
+            for owner, name, t in paths:
                 n = t.numel() * t.element_size()
                 off = (off + 255) // 256 * 256
                 layout.append((owner, name, None, off, n))
                 off += n
             bufs = [torch.empty(off, dtype=torch.uint8, device=self.device) for _ in range(2)]
-            ent = cache[kind] = (layout, bufs)
+            ent = cache[sig] = (layout, bufs)
         return ent
+
+    def _stream_copy_sync(self, layer_id: int) -> None:
+        """Copy a streamed layer's weights into its rotating buffer on the compute stream."""
+        (layout, bufs) = self._ensure_stream_buffers(layer_id)
+        b = self.block(layer_id)
+        paths = b._weight_paths()
+        buf = bufs[layer_id % 2]
+        for (owner, name, t), (_, _, _, off, _) in zip(paths, layout):
+            buf[off:off + t.numel() * t.element_size()].view(t.dtype).view(t.shape).copy_(t)
+            setattr(owner, name, buf[off:off + t.numel() * t.element_size()].view(t.dtype).view(t.shape))
+        b._device = self.device
 
     def _stream_layers(self):
         """Layers that are re-copied every token (the tail beyond the resident set)."""
@@ -273,12 +284,13 @@ class Engine:
                 self._stream_set = set(range(self.gpu_layers, self.max_layers))
         return self._stream_set
 
-    def _stream_prefetch(self, layer_id: int, stream) -> None:
-        """Copy a streamed layer's weights into its rotating buffer (copy stream).
+    def _stream_prefetch(self, layer_id: int, stream):
+        """Async-copy a streamed layer's weights into its rotating buffer (copy stream).
 
-        layout offsets come from the first layer of this kind; shapes always come
-        from the CURRENT layer (the same kind can still be packed differently across
-        the source/consumer boundary).
+        v5: the buffer is keyed by the exact weight signature, so layout and the
+        current layer always agree (L20 has its own buffers). Pinned CPU refs make
+        the H2D run at pinned bandwidth. Returns the CUDA event to wait on before
+        the layer computes.
         """
         (layout, bufs) = self._ensure_stream_buffers(layer_id)
         b = self.block(layer_id)
@@ -289,12 +301,14 @@ class Engine:
         if len(paths) != len(layout):
             raise RuntimeError(f"L{layer_id}: {len(paths)} weights vs layout {len(layout)}")
         buf = bufs[layer_id % 2]
+        ev = torch.cuda.Event()
         with torch.cuda.stream(stream):
-            for (owner, name, t), (_, _, _, off, _) in zip(paths, layout):
-                buf[off:off + t.numel() * t.element_size()].view(t.dtype).view(t.shape).copy_(t)
-        for (owner, name, t), (_, _, _, off, _) in zip(paths, layout):
-            setattr(owner, name, buf[off:off + t.numel() * t.element_size()].view(t.dtype).view(t.shape))
-        b._device = self.device
+            for (owner, name, t), cpu, (_, _, _, off, n) in zip(paths, b._cpu_refs, layout):
+                buf[off:off + n].view(t.dtype).view(t.shape).copy_(cpu, non_blocking=True)
+            ev.record(stream)
+        for (owner, name, t), (_, _, _, off, n) in zip(paths, layout):
+            setattr(owner, name, buf[off:off + n].view(t.dtype).view(t.shape))
+        return ev
 
     # -- streaming slots ---------------------------------------------------
     def _ensure_slots(self):
@@ -346,6 +360,14 @@ class Engine:
         self._last_hidden = None  # filled after the final layer (MTP stage-0 input)
         self._target_layers = set(self.cfg.dspark_target_layer_ids)
         self._target_hidden: dict[int, torch.Tensor] = {}
+        # v5 streamed-layer double buffering (signature-grouped flat buffers, pinned H2D).
+        # DISABLED by default: two 190MB flat buffers per weight signature (~6 groups on
+        # this checkpoint) needs 2.3GB VRAM on top of the 7GB budget -> WDDM paging on an
+        # 8GB card. Keep the code for >=16GB cards / future unified pool experiments.
+        self._v5_enabled = False
+        self._v5_stream = None
+        self._v5_pending: dict[int, object] = {}
+        self._v5_prefetched: set[int] = set()
         if self.layer_ids is not None:
             layer_seq = self.layer_ids
             if self.allow_missing_layers:
@@ -380,11 +402,32 @@ class Engine:
                         self._prefetch_layer(layer_i, ids_)
         self._timings = []
         events = []
-        for i in layer_seq:
+        if self._v5_enabled and self._v5_stream is None:
+            self._v5_stream = torch.cuda.Stream(device=self.device)
+        streamed_seq = [i for i in layer_seq if i in self._stream_layers()] if self._v5_enabled else []
+        for pos_i, i in enumerate(layer_seq):
             b = self.block(i)
             streamed = i in self._stream_layers()
             if streamed and self.device != "cpu":
-                b.to(self.device)
+                if self._v5_enabled and streamed_seq:
+                    try:
+                        ev = self._v5_pending.pop(i, None)
+                        if ev is not None:
+                            torch.cuda.current_stream().wait_event(ev)
+                        else:
+                            self._stream_copy_sync(i)
+                        # prefetch the next streamed layer into the other parity buffer
+                        if i in streamed_seq:
+                            k = streamed_seq.index(i)
+                            if k + 1 < len(streamed_seq):
+                                nxt = streamed_seq[k + 1]
+                                if (nxt % 2) != (i % 2) and nxt not in self._v5_pending:
+                                    self._v5_pending[nxt] = self._stream_prefetch(nxt, self._v5_stream)
+                    except Exception:
+                        self._v5_enabled = False
+                        b.to(self.device)
+                else:
+                    b.to(self.device)
             if self.profile:
                 ev0 = torch.cuda.Event(enable_timing=True)
                 ev0.record()
