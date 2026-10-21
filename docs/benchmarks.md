@@ -11,6 +11,7 @@ invariant to compare across runs is the ratio to the IO floor (docs/lower_bounds
 | after planner fp8 fix | 4.5GB/s | 1.66s | 0.60 | slab halved, cache 6.5 -> 14GB |
 | after batching/fused work | 3.6GB/s | 2.5-4.5s | 0.22-0.48 | disk degraded; cache share 0.85, hit 33% |
 | late round | 1.9GB/s | 2.5s | 0.46 | disk degraded further |
+| end of round | 1.4GB/s | 2.5-3s | 0.40-0.46 | disk at its slowest; code unchanged from the 1.66s run |
 
 ## Where the time goes (1.66s step, 4.5GB/s disk)
 
