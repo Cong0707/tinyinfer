@@ -151,3 +151,9 @@ English question prompts work ('Paris', '3.14'), so this is the base model's Chi
 training distribution, not an engine difference. Inference is correct either way; only the
 continuation style differs.
 
+
+- Chinese prompt variants were tried too; all land in the exercise/key distribution:
+  '请回答：...' -> ' 我猜你大概会用到包括住家', '请用一句话回答：...' -> 'A 点\n\n解析：由题意'. The
+  engine is computing the checkpoint's distribution correctly; producing Chinese answers
+  needs a chat-aligned checkpoint, not a prompt trick.
+
