@@ -96,3 +96,9 @@ after hours of repeated sweeps, so late measurements are disk-bound, not code-bo
   answers stay correct; chunked prefill (chunk>1) accumulates the error and is why it is
   restricted to chunk=1 for long prompts.
 
+
+- **Layer-major prefill** (`prefill_layer_major`) fails on a prompt whose length is not a
+  multiple of the chunk size: the last chunk has 7 tokens while `win_idxs` still carries
+  8 (`torch.cat([win_idxs, compress_idxs])` in compressed_attention). The chunk-major path
+  with chunk=1 handles 63 tokens correctly (136s), which is what long prompts use.
+
