@@ -50,6 +50,11 @@ class Engine:
         self.adapter = open_adapter(adapter) if isinstance(adapter, str) else adapter
         self.cfg = self.adapter.load_config()
         self.store = self.adapter.store
+        # hardware-derived plan (VRAM/RAM budget -> resident layers, slots, cache, chunk)
+        from .resources import plan as _hw_plan
+        self.hw_plan = _hw_plan(None, self.cfg.n_layers) if device != "cpu" else None
+        if self.hw_plan is not None:
+            print(f"[tinyinfer] {self.hw_plan.reason}", flush=True)
         if isinstance(tier, str):
             from .tiers import plan as _tier_plan
             tier = _tier_plan(OptLevel[tier.upper()])
@@ -66,11 +71,12 @@ class Engine:
                     cache_budget = int(avail * 0.5)  # larger RAM cache = fewer disk misses in fetch
                 except Exception:
                     cache_budget = int(self.tier.expert_cache_gb * (1 << 30))
+                hw = self.hw_plan
                 self.expert_store = ExpertStore.from_store(
                     self.store,
-                    cache_bytes=min(16 << 30, max(512 << 20, cache_budget)),
+                    cache_bytes=min(16 << 30, max(512 << 20, cache_budget)) if hw is None else hw.cache_bytes,
                     policy="arc",
-                    vram_slots=96 if device != "cpu" else 0,  # 96*18.8MB=1.8GB, covers a token's experts
+                    vram_slots=(96 if device != "cpu" else 0) if hw is None else hw.expert_slots,
                     device=device if device != "cpu" else "cpu",
                     direct=False,
                 )
@@ -81,7 +87,7 @@ class Engine:
             self.expert_store = expert_store
         self.max_layers = self.cfg.n_layers if max_layers is None else min(max_layers, self.cfg.n_layers)
         self.allow_missing_layers = allow_missing_layers
-        self.prefill_chunk = 2048
+        self.prefill_chunk = 2048  # overridden by the hardware plan on cuda
         # how many layers may stay resident on the device; the rest stream per forward
         if gpu_layers is not None:
             self.gpu_layers = gpu_layers
@@ -92,21 +98,12 @@ class Engine:
             self.gpu_layers = 40
             self.head_gpu = False
         else:
-            # dynamic VRAM budget: reserve embed + expert slots, then trade the 1.3GB output
-            # head against resident layers (a streamed layer costs ~46ms/token, the head
-            # costs ~65ms/token on CPU) -- keep the head on GPU unless few layers can stay.
-            # measured on this box: ~0.44GB VRAM per resident fp8 layer (weights 0.19 +
-            # allocator/state), embed 1.3GB, 48 expert slots 0.9GB. Stay under 7.0GB
-            # so nothing pages out (paging made attn 4x slower).
-            if self.tier.keep_weights_quantized:
-                layer_gb, embed_gb, slot_gb, budget = 0.44, 1.3, 0.9, 7.0
-            else:
-                layer_gb, embed_gb, slot_gb, budget = 0.65, 1.3, 0.0, 6.0
-            usable = budget - embed_gb - slot_gb
-            self.head_gpu = (usable - 1.3) / layer_gb >= 20
-            head_gb = 0.0 if self.head_gpu else 1.3
-            room = usable - head_gb
-            self.gpu_layers = min(40, max(1, int(room / layer_gb)))
+            # hardware-derived plan (resources.py): adaptive VRAM/RAM budgeting for any
+            # card size (8GB laptop .. 80GB desktop .. unified-memory boxes), no manual flags.
+            hw = self.hw_plan
+            self.gpu_layers = hw.gpu_layers
+            self.head_gpu = not hw.head_on_cpu
+            self.prefill_chunk = hw.prefill_chunk
         self._blocks: dict[int, Block] = {}
         self._last_routing: dict[int, list[int]] = {}
         self.enable_prefetch = True

@@ -143,8 +143,18 @@ class Block(HCBlockMixin):
         # per-tensor copies: a packed flat buffer cannot be freed per layer (views pin
         # it), which leaked ~190MB/layer on 8GB cards
         if getattr(self, "_cpu_refs", None) is None:
-            self._cpu_refs = [t.pin_memory() if t.is_cpu and t.device.type == "cpu" else t
-                              for (_, _, t) in paths]
+            # pinned host memory makes the H2D run at pinned bandwidth. Windows can
+            # refuse registrations once the per-process pinned pool is large
+            # ("resource already mapped"); fall back to pageable memory in that case.
+            def _pin(t):
+                if not (t.is_cpu and t.device.type == "cpu"):
+                    return t
+                try:
+                    return t.pin_memory()
+                except Exception:
+                    return t
+
+            self._cpu_refs = [_pin(t) for (_, _, t) in paths]
         for (owner, name, _), cpu in zip(paths, self._cpu_refs):
             setattr(owner, name, cpu.to(device, non_blocking=True))
         self._device = device
