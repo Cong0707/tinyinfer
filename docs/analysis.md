@@ -261,3 +261,10 @@ from the slot-pool race. It stays open, and the regression test keeps its xfail.
   own, separate from the slot race, and it starts at the first layer rather than
   accumulating with depth. Not fixed in this round; documented for the next one.
 
+
+- Refinement: layer 0's **block** is exactly reproducible (rel 0.000000) when called
+  twice with the same embedding, yet the layer-0 activation recorded inside two
+  `forward(t, 0)` calls differs by 0.19. So the drift enters before or around the first
+  block's invocation in the multi-chunk entry point (pre_mix/handoff), not in the block
+  math itself. That narrows the next investigation to `_forward_impl`'s chunk loop.
+
