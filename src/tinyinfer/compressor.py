@@ -145,6 +145,16 @@ class Compressor:
 
 def select_candidate_blocks(logits, compress_lens, topk_blocks: int, block_size: int) -> torch.Tensor:
     width = logits.size(-1)
+    # Mask what each query cannot see *before* pooling into blocks. The block max used to
+    # include positions beyond compress_lens, so a chunked pass (more positions visible in
+    # one shot) selected different blocks than the same tokens one at a time -- which is
+    # what made a chunked prefill differ from the token path from the first candidate
+    # source layer on.
+    _ar = torch.arange(width, device=logits.device)
+    _cl = compress_lens
+    while _cl.dim() < logits.dim() - 1:
+        _cl = _cl.unsqueeze(-1)
+    logits = logits.masked_fill(_ar >= _cl, -torch.inf)
     scores = F.pad(logits, (0, -width % block_size), value=-torch.inf)
     scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
     num_blocks = scores.size(-1)
