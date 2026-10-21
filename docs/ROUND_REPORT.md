@@ -50,6 +50,20 @@ the next real prefill speedup (8x) once the compressed path is made position-exa
   a correctness/reproducibility debt rather than a functional break -- but it also means
   the batch-vs-token and chunk-vs-token numbers recorded earlier in docs/analysis.md were
   measured through that noise and are not evidence of a routing difference.
+  `TI_NO_SLOTS=1` disables the pool and makes runs exactly reproducible (~40% slower
+  decode: 0.29 vs 0.49 tok/s here), so a caller that needs determinism has a switch.
+
+## Final measured state of the round
+
+| metric | value | condition |
+| --- | --- | --- |
+| first forward | 31.7s | cold, 8GB, disk 1.58GB/s |
+| warm prefill (8 tokens) | 13.3s | same |
+| decode | 0.485 tok/s | same |
+| expert cache hit | 16% | same |
+| decode with `TI_NO_SLOTS=1` | 0.29 tok/s | deterministic |
+| parity (window/experts/gate/hc) | 0.000000 | vs DeepInfer |
+| parity (compressed layers) | 0.87% / 1.42% | the known residual |
 
 - Tensor parallel on real multi-GPU hardware (the math and the slicing are verified, the
   distributed run is not).
