@@ -66,3 +66,12 @@ continues sensibly (measured):
 
 so multi-turn use works by appending turns to one transcript and calling `/v1/completions`.
 
+
+### How capable is the base model?
+
+Measured: it answers some factual questions ('Paris', '3.14', Paris population) but fails
+simple arithmetic and trivia ('What is 2+2?' -> ' 2.', 'largest planet?' -> ' 8'). That is
+the checkpoint's capability, not the engine's: the engine reproduces the model's
+distribution bit-comparably (docs/parity.md). A chat/SFT variant is what makes it reliable
+at instruction-style questions.
+
