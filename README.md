@@ -70,6 +70,7 @@ picks resident layers, ring size, cache size and chunking itself.
 - docs/level2_mechanisms.md  - the level 1/2 mechanisms and where they come from
 - docs/flare_analysis.md - NVIDIA Flare (b12x) mechanisms, ported and rejected ones
 - docs/benchmarks.md   - benchmark history (the disk rate is part of every row)
+- docs/PERFORMANCE.md  - one-page performance summary and how to measure it
 - docs/analysis.md     - routing predictability, speculative ceiling, batch-vs-row probe
 - docs/architecture.md - module map, streaming model, expert path, sessions
 - docs/ENV.md          - every environment switch

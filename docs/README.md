@@ -18,6 +18,7 @@
 | CONTRIBUTING.md | ground rules, workflow, how to add an optimisation |
 | GLOSSARY.md | the project's terms (slab, ring, slot, record, tier, ...) |
 | PHILOSOPHY.md | why the project is shaped the way it is |
+| PERFORMANCE.md | one-page performance summary |
 
 ## Reading order
 
