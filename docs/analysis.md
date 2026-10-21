@@ -359,3 +359,27 @@ are documented above; `TI_NO_SLOTS=1` is the working answer until the race is fo
   at all but in how `fetch` hands records to `serve` across the thread pool
   (`_fetch_batch` runs on a worker, `rec_by_id` is rebuilt per call).
 
+
+## 13. Chunked prefill: what it buys and why it is not enabled
+
+With the slot pool off (so the numbers are reproducible), a 12-token prefill:
+
+| chunk | time | per token | speedup |
+| --- | --- | --- | --- |
+| 1 | 18.27s | 1.52s | 1.00x |
+| 4 | 11.60s | 0.97s | **1.58x** |
+| 8 | 12.54s | 1.05s | 1.46x |
+
+The gain is smaller than the 4-8x one would hope because most of a prefill is expert IO,
+which only shrinks by the routing dedup a chunk buys, not by the chunk factor.
+
+**Why it is not the default:** a chunked prefill changes the compressed-attention
+semantics. The first differing layer in a chunk=1 vs chunk=2 comparison is layer 20, the
+first `kv_source` (compressed) layer: the compressor pools a group per block, so with s=2
+it emits one group where two s=1 passes emit a group at a different moment, and the
+followers read a different `compress_kv`. The argmax actually changes for a 4-token
+prompt. Without DeepInfer's prefill to compare against, chunk=1 (which matches the
+token-by-token reference exactly, rel 0.000000) stays the default; `chunk=4` is available
+for callers who want the 1.58x and accept that difference. This is the honest state of
+the 8x prefill goal: the wall is semantics, not speed.
+
