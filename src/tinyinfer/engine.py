@@ -419,14 +419,21 @@ class Engine:
         # k+1 and k+2 stream in.
         bufs = [torch.empty(mx, dtype=torch.uint8, device=self.device) for _ in range(3)]
         pinned_gb = 0.0
+        # Pinned budget. Pinning all 17.9GB of streamed weights starved the expert
+        # cache: pinned sources are the only ones that can use async DMA, and the
+        # pinned pool also has to hold the expert blobs.
+        pin_budget = int(float(__import__("os").environ.get("TI_FLAT_PIN_GB", "8")) * (1 << 30))
+        pinned_used = 0
         for i in streamed:
             b = self.block(i)
             paths = b._weight_paths()
             refs = []
             for (_, _, t) in paths:
-                if t.is_cpu and not t.is_pinned():
+                nbytes = t.numel() * t.element_size()
+                if (t.is_cpu and not t.is_pinned() and pinned_used + nbytes <= pin_budget):
                     try:
                         t = t.pin_memory()
+                        pinned_used += nbytes
                     except Exception:
                         pass
                 refs.append(t)

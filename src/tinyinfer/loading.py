@@ -2025,10 +2025,15 @@ class ExpertStore:
                         # budget lasts; past it fall back to a pageable copy so the
                         # cudaHostAlloc pool is never exhausted.
                         self._pinned_cache_bytes = getattr(self, "_pinned_cache_bytes", 0)
-                        # Pageable copy. Keeping the pinned tensor measured 57ms/fetch
-                        # vs 22ms for the pageable copy: the pinned pool is already
-                        # holding 17.9GB of layer weights and the extra registrations
-                        # cost more than the async DMA buys back.
+                        # keep the pinned tensor when the lambda budget allows it: a
+                        # pinned source is the only one that can use async DMA
+                        pin_cache = __import__("os").environ.get("TI_PIN_CACHE", "1") == "1"
+                        if pin_cache:
+                            self._pinned_cache_bytes = getattr(self, "_pinned_cache_bytes", 0)
+                            if self._pinned_cache_bytes < (4 << 30):
+                                self._pinned_cache_bytes += int(d.numel())
+                                self.ram.admit(layer, b.key[1], d)
+                                continue
                         arr = d.numpy().copy()
                         self.ram.admit(layer, b.key[1], arr)
                 except Exception:

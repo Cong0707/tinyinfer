@@ -90,9 +90,20 @@ class HCBlockMixin:
         global _FUSED_POST_OK
         if x.is_cuda and getattr(self, "hc_post_on_cpu", False) and x.numel() <= (1 << 22):
             return self._hc_post_cpu(x, residual, post, comb)
-        if x.is_cuda and _FUSED_POST_OK:
+        import os as _os
+        if x.is_cuda and _FUSED_POST_OK and _os.environ.get("TI_HC_NOFUSE") != "1":
             try:
                 from .hc_fused import fused_hc_post
+                if _os.environ.get("TI_HC_T") == "1":
+                    import time as _t
+                    _t0 = _t.perf_counter()
+                    y = fused_hc_post(x, residual, post, comb)
+                    self._hc_f = getattr(self, "_hc_f", [0.0, 0])
+                    self._hc_f[0] += (_t.perf_counter() - _t0) * 1e3
+                    self._hc_f[1] += 1
+                    if self._hc_f[1] == 8 and getattr(self, "layer_id", -1) == 5:
+                        print(f"[hc_post fused] mean={self._hc_f[0]/self._hc_f[1]:.2f}ms", flush=True)
+                    return y
                 return fused_hc_post(x, residual, post, comb)
             except Exception as _e:
                 _FUSED_POST_OK = False
@@ -108,9 +119,10 @@ class HCBlockMixin:
             self._hc_t = getattr(self, "_hc_t", [0.0, 0])
             self._hc_t[0] += _dt
             self._hc_t[1] += 1
-            if self._hc_t[1] == 4:
-                print(f"[hc_post] x contig={x.is_contiguous()} res contig={residual.is_contiguous()} "
-                      f"post contig={post.is_contiguous()} x={tuple(x.shape)} res={tuple(residual.shape)} "
+            if self._hc_t[1] == 8 and getattr(self, "layer_id", -1) in (5, 20):
+                print(f"[hc_post L{self.layer_id}] contig x={x.is_contiguous()} res={residual.is_contiguous()} "
+                      f"post={post.is_contiguous()} dtype x={x.dtype} post={post.dtype} "
+                      f"x={tuple(x.shape)} res={tuple(residual.shape)} "
                       f"mean={self._hc_t[0]/self._hc_t[1]:.2f}ms", flush=True)
             return y.type_as(x)
         y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
