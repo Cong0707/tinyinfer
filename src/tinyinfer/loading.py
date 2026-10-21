@@ -1941,6 +1941,39 @@ class ExpertStore:
             self.slots.wait_event(slot)
         return ExpertRecord((layer, expert), self.slots.buffer(slot), blob.tensors, self.device)
 
+    def _iocp_reader(self):
+        if getattr(self, "_iocp", None) is None:
+            from .win_iocp import IocpShardReader
+            self._iocp = IocpShardReader(depth=8)
+            self._iocp_lock = threading.Lock()
+        return self._iocp
+
+    def _read_misses_iocp(self, layer: int, misses: list[int]) -> list[Any]:
+        """Read every missed expert through one IOCP batch (QD = 2 x misses).
+
+        Measured: 6 threads doing one synchronous read each reach 2.5-4.6GB/s, while
+        eight overlapped reads in flight from one thread reach 7.3GB/s -- the SSD needs
+        queue depth, not more threads.
+        """
+        blobs = [self.index.expert_blob(layer, e) for e in misses]
+        spans = []
+        for b in blobs:
+            for seg in b.segments:
+                spans.append((str(self.index.model_dir / seg.shard), seg.file_offset, seg.nbytes))
+        reader = self._iocp_reader()
+        with self._iocp_lock:
+            parts = reader.read_many(spans)
+        out = []
+        k = 0
+        for b in blobs:
+            buf = bytearray(b.total_bytes)
+            for seg in b.segments:
+                data = parts[k]
+                k += 1
+                buf[seg.dest_offset:seg.dest_offset + len(data)] = data[:seg.nbytes]
+            out.append(buf)
+        return out
+
     def fetch(self, layer: int, experts: Iterable[int], *, cache: bool = True) -> list[ExpertRecord]:
         experts = [int(e) for e in experts]
         # batch the disk misses through read_many (parallel pread, lock-free), then
@@ -1955,10 +1988,20 @@ class ExpertStore:
                 misses = [e for (_, e) in self._settle_pending([(layer, e) for e in misses])]
             if misses:
                 blobs = [self.index.expert_blob(layer, e) for e in misses]
+                datas = None
+                if __import__("os").environ.get("TI_IOCP") == "1":
+                    try:
+                        datas = self._read_misses_iocp(layer, misses)
+                    except Exception:
+                        datas = None
+                if datas is not None:
+                    for b, d in zip(blobs, datas):
+                        self.ram.admit(layer, b.expert, d)
+                    blobs = []
                 try:
                     # pinned reads: 7.4GB/s vs 3.2 pageable, and the bytes stay pinned
                     # for the H2D-to-slot copy (13.3GB/s vs 8.3)
-                    datas = self._reader.read_many_pinned(blobs)
+                    datas = self._reader.read_many_pinned(blobs) if blobs else []
                     for b, d in zip(blobs, datas):
                         # Admit a PAGEABLE copy. Keeping the pinned block alive in the
                         # cache meant ~600 live cudaHostAlloc blocks (11GB), so every
