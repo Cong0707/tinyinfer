@@ -473,6 +473,78 @@ class Engine:
             h = h.cpu()
         return torch.nn.functional.linear(h, self.head).float()
 
+    def prefill_layer_major(self, ids: torch.Tensor, max_chunk: int | None = None) -> torch.Tensor:
+        """Layer-major prefill: stream each layer once for the whole prompt.
+
+        The chunk-major path (forward) re-streams all 40 layers per chunk, so a long
+        prompt pays the layer H2D and the expert reads once per chunk (measured
+        prefill 64 = 314s at chunk 8, i.e. hours for 128K). Here the loop order is
+        swapped: activations for every chunk sit in host RAM, each layer is moved to
+        the device once, applied to all chunks, then freed. Only the activation list
+        grows with the prompt (T x hc x dim x 2B = 5.2GB at 128K, fits in 47GB).
+        """
+        if ids.device.type != self.device and self.device != "cpu":
+            ids = ids.to(self.device)
+        b, T = ids.shape
+        step = max_chunk or self.prefill_chunk
+        if not hasattr(self, "_v5_enabled"):
+            self._v5_enabled = bool(int(__import__("os").environ.get("TI_V5", "0")))
+        # layer sequence identical to _forward_chunk
+        if self.layer_ids is not None:
+            layer_seq = self.layer_ids
+            if self.allow_missing_layers:
+                avail = self.available_layers()
+                layer_seq = [i for i in layer_seq if i < avail]
+        else:
+            n = self.max_layers
+            if self.allow_missing_layers:
+                n = min(n, self.available_layers())
+            layer_seq = list(range(n))
+        # 1) embed every chunk once; keep the activation on the host between layers
+        acts = []
+        for off in range(0, T, step):
+            chunk_ids = ids[:, off:off + step]
+            h = self.embed[chunk_ids]
+            h = h.unsqueeze(2).repeat(1, 1, self.cfg.hc_mult, 1)
+            pre_mix = torch.zeros(h.size(0), h.size(1), self.cfg.hc_mult, dtype=torch.float32, device=h.device)
+            pre_mix[:, :, 0] = 1.0
+            hash_ids = None
+            if self.hashes is not None:
+                hash_ids = self.hashes(chunk_ids.reshape(-1).tolist(), off)
+            acts.append([h.cpu(), pre_mix.cpu(), hash_ids, off])
+        # 2) per layer: one H2D, apply to every chunk, free
+        self._timings = []
+        for i in layer_seq:
+            bobj = self.block(i)
+            streamed = i in self._stream_layers()
+            if streamed and self.device != "cpu":
+                bobj.to(self.device)
+            elif self.device != "cpu":
+                bobj.to(self.device)
+            for slot in acts:
+                h_cpu, pre_cpu, hash_ids, off = slot
+                h = h_cpu.to(self.device, non_blocking=False)
+                pre_mix = pre_cpu.to(self.device, non_blocking=False)
+                if bobj.engram is not None and hash_ids is not None:
+                    h = bobj.engram.forward(h, hash_ids[bobj.engram.hash_index])
+                h, pre_mix = bobj.forward(h, off, pre_mix)
+                slot[0] = h.cpu()
+                slot[1] = pre_mix.cpu()
+            if getattr(bobj.ffn, "_last_ids", None):
+                self._last_routing[i] = bobj.ffn._last_ids
+            if streamed and self.device != "cpu":
+                bobj.to("cpu")
+        # 3) final head on the last chunk
+        h_cpu, pre_cpu, _, _ = acts[-1]
+        h = h_cpu.to(self.device, non_blocking=False)
+        pre_mix = pre_cpu.to(self.device, non_blocking=False)
+        self._last_hidden = h
+        h = (pre_mix.unsqueeze(-1) * h.float()).sum(dim=2).to(h.dtype)
+        h = rms_norm(h, self.out_norm, self.eps)
+        if self.head_on_cpu:
+            h = h.cpu()
+        return torch.nn.functional.linear(h, self.head).float()
+
     def forward(self, ids: torch.Tensor, start_pos: int = 0, chunk: int | None = None):
         """Chunked prefill: KV/hash state carries across chunks (attention uses start_pos)."""
         if ids.device.type != self.device and self.device != "cpu":

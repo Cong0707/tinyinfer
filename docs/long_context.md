@@ -58,7 +58,16 @@ loop is swapped we can pick T by the RAM budget (e.g. 8192 -> 80MB activation).
 
 ## Status
 
-- [ ] loop-order swap in Engine._forward_chunk (per-layer iteration with an activation
-      ring), keeping the existing KV cache machinery per layer
-- [ ] prefill T selection from resources.plan (RAM budget rather than VRAM)
+- [x] loop-order swap prototype: Engine.prefill_layer_major (embed all chunks -> per
+      layer apply to every chunk -> head). **Blocked**: the compressed-attention path
+      keeps cross-layer shared state in module globals (shared_attn.candidates /
+      compress_kv / index_k, published by the kv_source layer and consumed by later
+      layers). Layer-major iteration interleaves chunks of different layers and those
+      globals go stale (measured: "tensor a(32) vs b(16)" in compressor). Making
+      layer-major work needs per-layer isolation of that shared state plus the
+      candidate/topk publishing order re-validated - a substantial change.
+- [ ] (blocked on the above) prefill T selection from resources.plan
 - [ ] 128K prefill measurement (target: minutes, not hours)
+
+Interim: chunk-major with chunk=8 keeps VRAM inside physical (7227MB) and is correct
+(finite), at 0.18-0.20 tok/s of prefill.
