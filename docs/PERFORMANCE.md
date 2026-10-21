@@ -29,6 +29,22 @@ fewer routed experts or more VRAM; docs/lower_bounds.md has the arithmetic.
 - Expert activation quantisation: once per layer instead of once per expert per row.
 - Indexer mask: cached per (start_pos, s, t, ratio) instead of rebuilt per layer.
 - Session reset: no longer rebuilds the pinned slab (it leaked/freed the host grant).
+- fp4 GEMV: software-pipelined over the k blocks, 1.11x and bit-identical (rel 0).
+
+## Where an 8GB decode step goes (measured with TI_MOE_PROF=1, disk 1.5GB/s)
+
+| phase | ms/token | what it is |
+| --- | --- | --- |
+| expert fetch | ~1400 | 6 experts x 40 layers from disk, ~32% cache hit |
+| expert serve | ~180 | 18 GEMVs per layer plus the RAM->VRAM copy of the blobs |
+| streamed layers | ~240 | 36 x 166MB H2D |
+| gate + bincount + shared | ~120 | routing and its host sync |
+| attention + head + hc | ~60 | compute |
+
+The serve term is mostly **the host-to-device copy of the expert weights** (113MB per
+layer at 26.5GB/s is 4.3ms of the 4.6ms), which is why more VRAM slots help: a slot hit
+removes that copy. On a card where the experts are resident the term disappears, which is
+what the 24GB plan buys (docs/HARDWARE.md).
 
 ## How to measure it yourself
 
