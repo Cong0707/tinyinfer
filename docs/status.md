@@ -63,6 +63,26 @@ question; templated continuations come from the model's own distribution.
 The checkpoint is a **base (pre-SFT) model** with no chat template: its own top-1 for
 'The capital of France is' is '#' (13.25) over 'Paris' (12.5), so templated
 continuations are its behaviour, not an engine defect (docs/analysis.md).
+## This round's changes (summary)
+
+| change | effect |
+| --- | --- |
+| planner portable (cpu-only / unified memory / small-card refusal) | plans are sane on nine hypothetical boxes (tests/test_planner_hardware.py) |
+| planner covers all routable experts at 24GB | 197 -> 298 slots, embed on host, decode becomes compute-bound |
+| fp4 GEMV pipelined k loop | 1.11x, bit-identical |
+| TP shards block-aligned + per-layout scale slicing | multi-GPU sharding was numerically wrong; now verified (tests/test_tp.py) |
+| MoE serve used `idx[0]` (first routed row only) | batches silently served one row per expert; fixed |
+| compressed slot indices padded to a constant width | removes the variable-width cat that killed layer-major |
+| `TI_NO_SLOTS` | reproducible logits (slot pool races; see below) |
+
+## Reproducibility (new, important)
+
+Two identical forwards differ by 0.63-0.78 relative with the VRAM slot pool on and
+0.000000 with `TI_NO_SLOTS=1`. Decode text stays coherent (top-1 stable), but the logits
+are not reproducible. This also means the batch-vs-token and chunk-vs-token deltas
+recorded earlier were measured through that noise. A second prefill in one session drifts
+by ~20 logits for a separate reason (multi-chunk state handoff); the test keeps its xfail.
+
 ## Portability to other machines (this round)
 
 The planner is the portability layer; it is now checked against nine hypothetical boxes
