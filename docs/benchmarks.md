@@ -12,6 +12,8 @@
 | decode | **5882 ms/token（0.17 tok/s）** | 7 常驻 + 33 流式，vram 峰值 8122MB |
 | 生成 | " Deep..  I am Deep." | 修复 L20 ratio=1 kv_source 的 src_ratio 后语义正常 |
 | 每层成本 | MoE 56ms/层（72%）、attn 3ms/层、HC 1.7ms/层 | 专家 IO + fp4 kernel |
+| **2026-10-22 14:10 复测** | 40 层加载 **1.5s**、vram **7048MB**、decode 6.3-11.5s/token（下载 IO 竞争时变慢） | cache/weights HF 平铺目录；VramSlotCache.acquire_many 批量槽 |
+| MTP 投机（实测） | **accept_rate 0%**、0.056 tok/s、vram 10686MB | draft_len=2；负结果——draft 分布与主模型不一致，待参考数值验证 |
 
 **流式双缓冲（2026-10-22）**：每个层类型（window / compressed-source / compressed-consumer）预分配 2 个固定 GPU flat buffer，流式层轮换 copy-in（pinned→buffer，copy stream），**层 i 计算时**层 i+1 的 H2D 已在后台进行——目标消除每层 26-60ms 的同步拷贝等待（33 个流式层合计 0.9-2s/token）。
 
