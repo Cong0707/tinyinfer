@@ -28,6 +28,7 @@ them is required to run.
 | TI_FUSED_KV | 1 enables the fused rope+fp8 KV kernel (verified exact; off by default) |
 | TI_BF16_CACHE | 1 keeps up to 8 bf16 expert copies per layer (VRAM cost, use on big cards) |
 | TI_NO_MASK_CACHE | 1 disables the indexer visibility-mask cache |
+| TI_MULTIROW_GEMV | 1 opts into the multi-row fp4 kernel (exact on synthetic weights, not on real ones) |
 
 ## Measurement
 
