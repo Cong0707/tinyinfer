@@ -6,9 +6,10 @@ Blocker for MTP and for chunk>1 prefill. Evidence so far: identical rows are exa
 distinct rows differ by ~26-70% at layer 0; attention, gate, activation quantisation,
 single-row GEMV and the batch GEMV each verify 0.000000 in isolation, and the VRAM-slot
 path is identical to the RAM-record path. Ruled out: kernels, quantisation, gate, shared
-expert, slot pressure. Remaining suspects: the serve loop's 3-expert batching
-(`_val_acc`/`_idx_acc` concatenation order feeding one `index_add`) and record lifetime.
-Next probe: one expert per serve batch and compare.
+expert, slot pressure. The serve loop batches as (first 3, rest) and concatenates
+`_val_acc`/`_idx_acc` before one `index_add`, which is order-independent up to fp32
+rounding, so the remaining suspects are record lifetime inside a batch and the
+`torch.zeros_like(xf)` accumulation buffer under different row counts.
 
 ## 2. Compressed-layer parity 0.87%
 
