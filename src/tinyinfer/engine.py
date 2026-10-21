@@ -154,6 +154,15 @@ class Engine:
         self.max_layers = self.cfg.n_layers if max_layers is None else min(max_layers, self.cfg.n_layers)
         self.allow_missing_layers = allow_missing_layers
         self.prefill_chunk = 2048  # overridden by the hardware plan on cuda
+        # TI_PREFILL_CHUNK=1 forces the exactly reference-matching prefill path (each
+        # token its own block); the planner's chunk is ~0.5% harder but 1.6x faster
+        # (docs/analysis.md 13).
+        _pc = __import__("os").environ.get("TI_PREFILL_CHUNK")
+        if _pc:
+            try:
+                self.prefill_chunk = max(1, int(_pc))
+            except ValueError:
+                pass
         # how many layers may stay resident on the device; the rest stream per forward
         if gpu_layers is not None:
             self.gpu_layers = gpu_layers
