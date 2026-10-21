@@ -251,8 +251,11 @@ class MoE:
                                 self._expert_cache.pop(next(iter(self._expert_cache)))
                             self._expert_cache[i] = e
 
-                # One async read per expert, so all six hit the disk at once; the GPU
-                # consumes the first three while the last three are still landing.
+                # One async read per expert, consumed in two batches of three: the GPU
+                # works on the first three while the last three are still on disk.
+                # (An IOCP batch with QD=12 was tried too: 7.3GB/s standalone vs 6.3 for
+                # the thread pool, but two extra copies per blob made it 2.3x slower
+                # in-engine -- see TI_IOCP in loading.ExpertStore.)
                 futs = {i: store.fetch_async(self.layer_id, [i]) for i in to_fetch}
                 keys = list(to_fetch)
                 import time as _t
