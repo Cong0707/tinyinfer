@@ -429,7 +429,9 @@ class MoE:
                 by_id = {rec.key[1]: rec for rec in recs_all}
                 try:
                     _s0 = _tp.perf_counter() if _prof else 0.0
-                    for batch in (keys[:3], keys[3:]):
+                    _bs = max(1, int(__import__("os").environ.get("TI_SERVE_BATCH", "3")))
+                    for _i in range(0, len(keys), _bs):
+                        batch = keys[_i:_i + _bs]
                         if not batch:
                             continue
                         serve(batch, [by_id[i] for i in batch if i in by_id])

@@ -127,3 +127,9 @@ docs/parity.md, and the open item is to close that 0.87% (docs/ROADMAP.md, item 
   so the batch error is not a multi-row-expert artefact. The VRAM-slot vs RAM-record path
   was ruled out (0.000000 with `store.slots = None`).
 
+
+- Serve batch size is now `TI_SERVE_BATCH` (default 3). Setting it to 1 changed the batch
+  difference from 26% to 36% -- i.e. accumulation order matters far more than fp32
+  rounding should allow, which is itself evidence that some rows are being accumulated
+  with the wrong value rather than in a different order.
+
