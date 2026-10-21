@@ -49,6 +49,47 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _openai(self) -> None:
+        """Minimal OpenAI-compatible completion endpoint (one request at a time)."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            req = json.loads(self.rfile.read(length) or b"{}")
+        except Exception as exc:
+            self._send(400, {"error": {"message": f"bad request: {exc}"}})
+            return
+        if _ENGINE is None:
+            self._send(503, {"error": {"message": "model still loading"}})
+            return
+        chat = self.path.endswith("/chat/completions")
+        if chat:
+            messages = req.get("messages") or []
+            prompt = "".join(str(m.get("content", "")) for m in messages)
+        else:
+            prompt = req.get("prompt") or ""
+            if isinstance(prompt, list):
+                prompt = prompt[0] if prompt else ""
+        max_new = int(req.get("max_tokens") or req.get("max_new_tokens") or 16)
+        with _LOCK:
+            try:
+                ids = _TOKENIZER.encode(prompt, add_special_tokens=False)
+                out = _ENGINE.generate(ids, max_new_tokens=max_new)
+                text = _TOKENIZER.decode(out, skip_special_tokens=False)
+            except Exception as exc:
+                self._send(500, {"error": {"message": repr(exc)}})
+                return
+        resp = {
+            "id": "tinyinfer-" + str(id(out)),
+            "object": "chat.completion" if chat else "text_completion",
+            "model": _CONFIG["model"] or "tinyinfer",
+            "choices": [{"index": 0, "text": text, "finish_reason": "length"}]
+            if not chat else
+            [{"index": 0, "finish_reason": "length",
+              "message": {"role": "assistant", "content": text}}],
+            "usage": {"prompt_tokens": len(ids), "completion_tokens": len(out),
+                      "total_tokens": len(ids) + len(out)},
+        }
+        self._send(200, resp)
+
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/health":
             self._send(200, {"ok": _ENGINE is not None,
@@ -58,6 +99,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path in ("/v1/completions", "/v1/chat/completions"):
+            self._openai()
+            return
         if self.path != "/generate":
             self._send(404, {"error": "not found"})
             return
