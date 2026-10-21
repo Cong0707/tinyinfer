@@ -53,8 +53,11 @@ def floor_seconds(p):
     return stream_b / H2D + experts_b * (1.0 - covered) / DISK
 
 
-print(f"{'machine':32s} {'res':>3s} {'str':>3s} {'slots':>5s} {'chunk':>5s} "
-      f"{'cache':>6s} {'floor s':>8s} {'tok/s':>6s}  fit")
+JSON = "--json" in sys.argv[1:]
+rows = []
+if not JSON:
+    print(f"{'machine':32s} {'res':>3s} {'str':>3s} {'slots':>5s} {'chunk':>5s} "
+          f"{'cache':>6s} {'floor s':>8s} {'tok/s':>6s}  fit")
 for name, cards_gb, ram, avail, unified in MACHINES:
     cards = [Card(i, "card", gb, gb) for i, gb in enumerate(cards_gb)]
     hw = Hardware(name=name, vram_gb=sum(cards_gb), ram_gb=ram, ram_avail_gb=avail,
@@ -69,6 +72,17 @@ for name, cards_gb, ram, avail, unified in MACHINES:
         t = max(floor_seconds(p), COMPUTE_S)
     else:
         t = float("inf")
-    print(f"{name:32s} {p.gpu_layers:3d} {p.stream_layers:3d} {p.expert_slots:5d} "
-          f"{p.prefill_chunk:5d} {p.cache_bytes / GB:5.1f}G {t:8.2f} {1.0 / t:6.1f}  "
-          f"{'cpu' if not cards else ('yes' if p.fits else 'NO ')}")
+    row = {"machine": name, "resident": p.gpu_layers, "stream": p.stream_layers,
+           "slots": p.expert_slots, "chunk": p.prefill_chunk,
+           "cache_gb": round(p.cache_bytes / GB, 1),
+           "floor_s": None if t != t else round(t, 4),
+           "tok_per_s": None if t != t else round(1.0 / t, 2),
+           "fits": bool(p.fits), "gpu": bool(cards)}
+    rows.append(row)
+    if not JSON:
+        print(f"{name:32s} {p.gpu_layers:3d} {p.stream_layers:3d} {p.expert_slots:5d} "
+              f"{p.prefill_chunk:5d} {p.cache_bytes / GB:5.1f}G {t:8.2f} {1.0 / t:6.1f}  "
+              f"{'cpu' if not cards else ('yes' if p.fits else 'NO ')}")
+if JSON:
+    import json
+    print(json.dumps(rows, indent=2))
