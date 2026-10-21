@@ -27,7 +27,8 @@
 | deepseek_kernels.py | TileLang ports of DeepInfer ops (compress_pool, norm_rope, rope_quant) |
 | official_kernels.py | b12x GEMV re-expressed in TileLang |
 | tp.py | tensor-parallel shard helpers (untested on this box) |
-| serve.py | stdlib HTTP server (/health, /generate) |
+| server.py | FastAPI OpenAI-compatible service (/v1/models, /v1/completions, /v1/chat/completions, /health), SSE streaming, API keys, per-session slots; driven by cli.py |
+| cli.py | `python -m tinyinfer.cli serve|generate` |
 | bench.py | reproducible benchmark (build/prefill/decode/cache/disk as JSON) |
 
 ## Streaming model
