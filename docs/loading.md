@@ -47,6 +47,19 @@ end-to-end 验证脚本：`scripts/e2e_models.py <model_dir> [n_tokens]`。
 - L1（00047 已下载）实测：构建 0.1s、首调 forward **1.18s**（含表行读缓存/分配）；L14（00048）待分片完成后同路径启用。
 - Engine 仅在两张 engram 表的分片都存在时才启用（`all(shards exist)`），避免半表状态。
 
+## 0.3 CPU / GPU 分工（placement.py，按机器现实决策）
+
+决策规则（实测推导）：数据需要往返时才比较，**CPU 跑当且仅当**
+
+    cpu_ms < gpu_ms + 2 * bytes / h2d_bandwidth
+
+- H2D：pinned 26GB/s、pageable 8.9GB/s（本机实测）。
+- **8GB 卡（大量流式层）**：每层激活都往返，小算子（HC post/comb 164KB）实测 **GPU 3.2ms vs CPU 0.2ms** -> 放 CPU（40 层省 ~0.2s/token）。
+- **大显存卡（全常驻）**：数据已在 device，H2D 成本为 0，GPU 全赢 -> 全 GPU（placement.small_op_on_cpu 返回 False）。
+- 判定函数 `placement.small_op_on_cpu(gpu_layers, n_layers)`：存在流式层时小算子走 CPU，否则全 GPU。
+
+矩阵计算层实测（40 层 1 token 的 GPU 时间分布）：H2D 678ms(55.7%)、fp8_gemm 233ms(19.2%, 221 次×1.05ms，M=1 浪费 tile)、tilelang sparse_attn 140ms(11.5%, 32 次×4.4ms)、HC bmm 92ms(7.6%, 48 次×1.9ms)。**值得 GPU 的**：专家 fp4 GEMM、fp8 GEMM、sparse attention（均为计算密集、数据量大）；**值得 CPU 的**：HC post/comb、采样、路由预测（数据小、H2D 成本高于计算差）。
+
 ## 1. 事实与实测基线
 
 ### 1.1 模型布局（解析 48 个 safetensors header，非估算）
