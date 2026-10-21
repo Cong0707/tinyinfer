@@ -54,8 +54,17 @@ mtp.2.confidence_head.proj.weight [1, dim+256]       （官方 confidence_head.p
 4. 主模型 verify（一次并行 forward），贪心匹配接受前缀；不匹配则回滚 KV（snapshot/restore）。
 5. 接受率与加速比记录到 benchmarks。
 
+## 实测状态（2026-10-22 13:50，cache/weights 40 层）
+
+- **全链可跑**：prefill→target hidden→main_x→draft embeds→3 stage→forward_head（logits+confidence）无崩溃。
+- **投机解码（speculative_generate, draft_len=2, 4 token）**：0.056 tok/s，accept_rate=0%。
+  - 结论：MTP 输出分布与主模型不一致，**draft 无效**——投机当前是**负收益**（比常规 decode 0.2 tok/s 慢）。
+  - 待查（参考官方 dflash 数值）：markov 修正的 draft_ids 语义（官方每步用上一步采样 token，当前用 noise 填充首轮）、main_x 的 target hidden 语义（collapse 时机）、draft attention 的 main KV 窗口累积。
+- **VRAM**：投机时 3 stage 权重上卡 → 峰值 10.7GB > 8GB（WDDM 分页）。投机路径需 stage 权重换出（CPU）或按需加载。
+
 ## 已知限制
 
 - 专家 IO 不减少（每 token 40 层×6 专家）——投机省 launch/步数，预计 +10-30%，实测为准。
 - markov head 与 confidence 需在 GPU 上融合（1.84ms/5-token 量级）。
-- 当前 forward_head 的 markov/confidence 分支为 TODO（logits 部分已接主 head）。
+- forward_head 的 markov 修正首轮用 noise 填充（官方为逐步 draft token）——正确性待参考数值验证。
+- 投机路径 VRAM 需要单独预算（stage 权重不要常驻）。
