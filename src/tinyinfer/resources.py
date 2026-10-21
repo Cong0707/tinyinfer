@@ -58,7 +58,10 @@ class Hardware:
         # under-fills the card (0 resident layers on an 8GB card that comfortably runs 2).
         vram = sum(c.total_gb for c in self.cards) if self.cards else self.vram_gb
         if self.unified:
-            vram = max(vram, self.ram_gb * 0.55)  # unified memory: share the pool
+            # One physical pool: the driver's wired-memory limit is ~2/3 of RAM on
+            # Apple silicon, and counting RAM *and* VRAM separately double-books the
+            # same bytes (a 48GB Mac planned 46GB of VRAM plus 36GB of cache).
+            vram = min(vram if vram > 0 else self.ram_gb, self.ram_gb * 0.70)
         # Per-card reserve: display/context/FX, allocator slack and the transient
         # buffers one layer needs while it is being copied in. 0.9GB was measured to be
         # too tight (a planned 6.4GB layout actually allocated 7.0GB on an 8GB card).
@@ -123,6 +126,9 @@ class Plan:
     prefill_chunk: int
     stream_layers: int
     reason: str
+    # False when even the streaming skeleton (ring + workspace + tables) does not fit
+    # the VRAM budget: the engine refuses to start instead of OOMing mid-prefill.
+    fits: bool = True
     # layer -> CUDA index, and per-card expert slot counts. Single-GPU boxes get
     # {layer: 0} and {0: slots} and the engine behaves exactly as before.
     layer_card: dict[int, int] = dataclasses.field(default_factory=dict)
@@ -304,6 +310,9 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
 
     V = hw.vram_budget_gb * GB
     cards = hw.cards or [Card(0, hw.name, hw.vram_gb, hw.vram_gb)]
+    # No CUDA device at all: everything runs out of host memory (the engine has a CPU
+    # path), so a "GPU head" would be a lie. Short-circuit the placement problem.
+    has_gpu = bool(hw.cards) and V > 0
 
     H2D_BPS = 26.5e9            # measured pinned H2D
     PREFILL_TEMP = 0.60 * GB   # dequant/activation peak during prefill
@@ -380,6 +389,19 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     if resident >= n_layers:
         buffers = 0
         resident = n_layers
+    if not has_gpu:
+        # everything runs from host memory on this box
+        embed_gpu = head_gpu = False
+        buffers = 0
+        resident = 0
+    elif resident == 0:
+        # Too small for even one resident layer with the tables on the device: give the
+        # VRAM back to the streaming ring and keep the expert slots minimal but non-zero
+        # (a zero-slot plan allocates a fresh 18.8MB buffer per expert per layer per
+        # token, which is the failure mode a 4GB card would hit).
+        embed_gpu = head_gpu = False
+        buffers = min(buffers, 2)
+        resident = min(n_layers, layers_that_fit(False, False, buffers, ws0))
 
     # A handful of expert slots is worse than one fewer resident layer: without a
     # staging pool every expert allocates a fresh 18.8MB device buffer per layer per
@@ -397,6 +419,7 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
         used = _used(resident)
         spare = max(0.0, V - used)
     slots = int(spare * SLOT_FRACTION // max(1.0, expert_b))
+    slots = max(slots, 2) if has_gpu else 0
     # 8 is the measured sweet spot for this model's tilelang kernel set (a wave of 8
     # needs ~1.6GB of workspace and 165s for a 21-token prompt on 8GB; 16 needs 63s but
     # pages). Larger waves only pay on cards with room to spare.
@@ -410,6 +433,9 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     # is genuinely left after the slab, the tables kept on the host, and ~6GB of page
     # cache, then take half of that as the cache.
     host = hw.ram_budget_gb * GB
+    if hw.unified:
+        # same physical pool: subtract what the device side already booked
+        host = max(0.0, host - V)
     slab_b = max(0.0, (n_layers - resident) * layer_b)
     cpu_tables = (embed_b if not embed_gpu else 0.0) + (head_b if not head_gpu else 0.0)
     page_cache_b = min(6.0 * GB, 0.20 * host)
@@ -426,13 +452,21 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
         layer_card, card_slots = _spread_cards(cards, n_layers, resident, slots,
                                                ws0 / GB, head_gpu, layer_b,
                                                max_layer_b, embed_b, head_b)
+    fixed_b = ((embed_b if embed_gpu else 0.0) + (head_b if head_gpu else 0.0)
+               + buffers * max_layer_b + ws0 + runtime_b)
+    fits = fixed_b <= V
+    if not fits:
+        need_gb = (fixed_b + 1.5 * max(1, len(cards) or 1) * GB) / GB
+        reason_extra = f" INSUFFICIENT VRAM: needs about {need_gb:.1f}GB for the streaming skeleton"
+    else:
+        reason_extra = ""
     reason = (
         f"{hw.name} vram={hw.vram_gb:.1f}GB({len(cards)} card) ram={hw.ram_gb:.1f}GB"
         f"(avail {hw.ram_avail_gb:.1f}) -> layers={resident}/{n_layers}"
         f" stream={n_layers - resident} buf={buffers} slots={slots}"
         f" cache={cache_b/GB:.1f}GB chunk={chunk}"
         f" embed={'gpu' if embed_gpu else 'cpu'} head={'gpu' if head_gpu else 'cpu'}"
-        f" layer={layer_b/MB:.0f}MB expert={expert_b/MB:.1f}MB"
+        f" layer={layer_b/MB:.0f}MB expert={expert_b/MB:.1f}MB{reason_extra}"
     )
     return Plan(
         layer_card=layer_card,
@@ -446,4 +480,5 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
         prefill_chunk=chunk,
         stream_layers=n_layers - resident,
         reason=reason,
+        fits=fits,
     )

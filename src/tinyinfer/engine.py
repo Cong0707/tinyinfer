@@ -89,6 +89,13 @@ class Engine:
             self.hw_plan = None
         if self.hw_plan is not None:
             print(f"[tinyinfer] {self.hw_plan.reason}", flush=True)
+            if not getattr(self.hw_plan, "fits", True) and self.device != "cpu":
+                # Refuse loudly instead of OOMing after the first prefill chunk. The
+                # streaming skeleton alone (ring + workspace + tables) does not fit.
+                raise RuntimeError(
+                    f"not enough VRAM for this checkpoint: {self.hw_plan.reason}. "
+                    "The engine needs a card that can hold at least the streaming ring "
+                    "plus the tilelang workspace; see docs/PERFORMANCE.md.")
         if expert_store is None and self.tier.level >= OptLevel.BALANCED:
             # production tiers own their ExpertStore (RAM cache + VRAM slots)
             try:
