@@ -41,3 +41,6 @@ invariant to compare across runs is the ratio to the IO floor (docs/lower_bounds
 - Each additional resident layer removes 166MB/token (=6ms at PCIe rate).
 - Expert cache hit rate depends on the workload: 3-20% on fresh text, up to 90% when the
   same tokens recur with a warm cache.
+| 1.8-1.9s | disk 1.5GB/s | serve batch sweep: 1 -> 1.84s, 2 -> 1.83s, 3 -> 1.82s (one
+  outlier at 3.8s was a disk dip, not the batch size), 6 -> 1.89s. The serve term is
+  the same either way, so the batching strategy is not what limits decode. |
