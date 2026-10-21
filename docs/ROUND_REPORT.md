@@ -70,3 +70,17 @@ the next real prefill speedup (8x) once the compressed path is made position-exa
 - CUDA graphs: capture is keyed on `start_pos`, which advances every decode step, so the
   captured graph never replays. A real decode graph needs device-side positions.
 - The 24GB compute floor is an estimate from the 8GB measurements, not a run.
+## Open items left to the next round
+
+1. **Slot-pool race** (reproducibility): two identical forwards differ by 0.63-0.78 with
+   the pool on, 0.000000 with `TI_NO_SLOTS=1`. Four fixes failed and were reverted; the
+   switch is the interim answer (~40% slower decode).
+2. **Session prefill drift**: a second `forward(t, 0)` of the same prompt drifts by ~20
+   logits; reset is a no-op for it (18.6 with, 19.8 without) and only one chunk's worth of
+   layers is dumped for a 24-token prompt that should run three. Layer 0 already differs,
+   so it is a multi-chunk state handoff problem, specific to prefill.
+3. **Chunked prefill** is blocked by (2): with the noise removed, chunk=1 and
+   token-by-token agree exactly, so chunking itself may be closer to correct than the old
+   measurements suggested -- but (2) has to be understood first.
+4. **Compressed-layer parity** 0.87% (unchanged).
+5. **Tensor parallel** verified numerically, never run on real multi-GPU hardware.
