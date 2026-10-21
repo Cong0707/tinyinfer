@@ -460,3 +460,21 @@ the compressed attention consumes the freshly published groups for several posit
 once -- the remaining suspect is the group-visibility bookkeeping at the chunk boundary,
 not a matmul or a kernel.
 
+
+### The exact shape of the chunk difference at layer 20
+
+`TI_DEBUG_ATTN=1` prints the compressed layer's bookkeeping:
+
+    chunk=1: pos0 cl=1 idxs=(1,1,1) | pos1 cl=2 idxs=(1,1,2) | ...
+    chunk=2: pos0 cl=2 idxs=(1,2,2) | pos2 cl=4 idxs=(1,2,4)
+
+So a chunked pass calls the indexer with a wider `topk` (min(top_k, t) where t is the
+chunk's end group) and the invisible slots are marked -1 (line 306: `torch.where(valid,
+idxs + offset, -1)`). The values a query can actually see are the same; what differs is
+the width of the gather list and therefore how the sparse kernel tiles its softmax. That
+is consistent with the 0.0033 kernel-vs-reference difference measured earlier at s=24 and
+with the reference swap not removing it (the reference still consumes the wider index
+list). Closing this needs the *index list itself* to be chunk-invariant (e.g. always
+top_k wide with -1 padding on both paths, which is what the compressed padding commit
+started), not a different attention formulation.
+
