@@ -298,7 +298,7 @@ class MLACompressedAttention:
                 compress_idxs = self.rt.topk_idxs
 
         if __import__("os").environ.get("TI_DEBUG_ATTN") and \
-                getattr(self, "_active_layer", -1) == 20:
+                getattr(self, "layer_id", -1) == 20:
             print(f"[attn20] start={start_pos} s={s} ratio={ratio_now} "
                   f"compress_len={compress_len} "
                   f"kv={None if compress_kv is None else tuple(compress_kv.shape)} "
