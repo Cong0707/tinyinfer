@@ -106,6 +106,9 @@ else:  # pragma: no cover
 
 def sparse_attn_tl(q, kv, attn_sink, topk_idxs, scale: float, h_chunk: int = 16, block: int = 32):
     """tilelang sm120 sparse attention (head-chunked; 99KB shared-mem limit)."""
+    import os as _os
+    h_chunk = int(_os.environ.get("TI_SA_HCHUNK", h_chunk))
+    block = int(_os.environ.get("TI_SA_BLOCK", block))
     b, s, h, d = q.shape
     if h % h_chunk:
         h_chunk = h
