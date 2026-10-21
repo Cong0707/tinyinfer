@@ -124,7 +124,7 @@ def hc_pre_kernel(D: int, hc: int):
 
 
 @tilelang.jit(pass_configs=PASS)
-def hc_post_kernel(D: int, hc: int):
+def hc_post_kernel_v2(D: int, hc: int):
     """expand: OUT[m,h,d] = POST[m,h]*X[m,d] + sum_h2 COMB[m,h,h2]*RES[m,h2,d]."""
     M = T.symbolic("M")
 
@@ -195,6 +195,6 @@ def fused_hc_post(x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, c
     x2 = x.reshape(-1, d).contiguous()
     r3 = residual.reshape(-1, hc, d).contiguous()
     out = torch.empty(r3.shape[0], hc, d, device=x.device, dtype=torch.bfloat16)
-    hc_post_kernel(d, hc)(x2, r3, post.reshape(-1, hc).float().contiguous(),
+    hc_post_kernel_v2(d, hc)(x2, r3, post.reshape(-1, hc).float().contiguous(),
                           comb.reshape(-1, hc, hc).float().contiguous(), out)
     return out.view(*shape, hc, d)
