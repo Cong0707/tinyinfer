@@ -77,3 +77,11 @@ picks resident layers, ring size, cache size and chunking itself.
 - docs/ENV.md          - every environment switch
 - docs/ROADMAP.md      - next steps ordered by measured value, with measured non-goals
 - docs/faq.md          - the questions this design invites
+## What the model can and cannot do
+
+Measured: it answers some factual questions ('Paris', '3.14', Paris population ~2,000,000)
+but fails simple arithmetic ('2+2' -> '2') and trivia ('largest planet' -> '8'). That is
+the base checkpoint's capability; the engine reproduces its distribution bit-comparably.
+English question-shaped prompts work best; Chinese prompts land in its exercise/answer-key
+style. See docs/faq.md.
+
