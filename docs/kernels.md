@@ -675,3 +675,23 @@ V4.1 的 non-expert 权重只有 17.7 GB（fp8 + e8m0 scale），expert 296 GB�
 | 12 | `ggml/src/ggml-cuda/fattn.cu` 等 | GQA flash attention、量化 KV cache、paged 访问 | O4：paged/量化 KV 的 attention 参考 |
 
 **不要照抄的点**：llama.cpp 的 MoE 专家是**全驻留**模型（无 NVMe 流式），O7 的专家流式仍应参考 ds4/flash-moe 与 Strata；llama.cpp 的 CUDA 侧没有多项式 fast-math（这印证了第 2.9 节的负结果）。
+
+---
+
+## 9. MTP / DSpark（参考映射与状态）
+
+> 源码 `src/tinyinfer/mtp.py`（文件头有完整映射）；设计文档 `docs/mtp_design.md`。
+
+| tinyinfer | DeepInfer 参考 | 备注 |
+|---|---|---|
+| `MTPBlock.__init__` | `mtp/dflash.py:DFlash.__init__` | 3 stage；stage0 带 main_proj/main_norm；last 带 norm/markov/confidence |
+| `MTPBlock.main_hiddens` | `DFlash.update_main_cache`（projection+project_norm）| target 层 hidden 拼接 → [1,T,dim] |
+| `MTPBlock.forward_embed` | `DFlash._embed_draft_init_tokens` | noise(128799) 填充 + golden 首 token |
+| `MTPBlock.forward` | `decoder_layer.py:DFlashDecoderLayer.forward_drafts` | HC + attention + MoE |
+| `MTPAttention.forward_with_main` | `v4_modules/attn.py:DFlashAttention` | main KV 滑窗（官方 swa cache 语义）+ draft KV（单步）|
+| `MTPBlock.forward_head` | `DFlash.sample_drafts` | post_norm → 主 head logits → markov_w1/w2 修正 → confidence（sigmoid）|
+
+实测（cache/weights 40 层）：
+- 全链跑通：`e2e_mtp.py` 输出 logits [1,5,129280] + confidence [0.263,0.084,0.034]。
+- 投机解码：`e2e_spec.py` draft_len=2 跑通但 **accept_rate=0%**、比常规 decode 慢——**draft 分布未对齐**，需按官方 dflash 数值逐项校验。当前投机默认不启用。
+- VRAM：3 stage 权重常驻 + verify 会使峰值到 10.7GB（>8GB）；投机路径需要 stage 权重按需加载。
