@@ -252,6 +252,10 @@ class Engine:
         if cache is None:
             self._stream_buffer_cache = cache = {}
         ent = cache.get(sig)
+        if ent is None and len(cache) >= 2:
+            # VRAM guard: at most 2 signature groups x 2 buffers (4 x 190MB = 760MB).
+            # Later groups fall back to the synchronous per-layer copy.
+            return None, None
         if ent is None:
             layout = []
             off = 0
@@ -360,14 +364,14 @@ class Engine:
         self._last_hidden = None  # filled after the final layer (MTP stage-0 input)
         self._target_layers = set(self.cfg.dspark_target_layer_ids)
         self._target_hidden: dict[int, torch.Tensor] = {}
-        # v5 streamed-layer double buffering (signature-grouped flat buffers, pinned H2D).
-        # DISABLED by default: two 190MB flat buffers per weight signature (~6 groups on
-        # this checkpoint) needs 2.3GB VRAM on top of the 7GB budget -> WDDM paging on an
-        # 8GB card. Keep the code for >=16GB cards / future unified pool experiments.
-        self._v5_enabled = False
-        self._v5_stream = None
-        self._v5_pending: dict[int, object] = {}
-        self._v5_prefetched: set[int] = set()
+        # v5 streamed-layer double buffering state (lazily initialised; at most two
+        # signature groups get flat buffers, the rest fall back to the sync copy).
+        if not hasattr(self, "_v5_enabled"):
+            # 8GB card: even two signature groups of flat buffers push VRAM past the
+            # physical limit (measured 9330MB peak -> WDDM paging), so keep it off.
+            self._v5_enabled = False
+            self._v5_stream = None
+            self._v5_pending: dict[int, object] = {}
         if self.layer_ids is not None:
             layer_seq = self.layer_ids
             if self.allow_missing_layers:
@@ -415,6 +419,8 @@ class Engine:
                         if ev is not None:
                             torch.cuda.current_stream().wait_event(ev)
                         else:
+                            if self._ensure_stream_buffers(i)[0] is None:
+                                raise RuntimeError("buffer budget exceeded")  # sync fallback
                             self._stream_copy_sync(i)
                         # prefetch the next streamed layer into the other parity buffer
                         if i in streamed_seq:
