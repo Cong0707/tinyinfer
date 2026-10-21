@@ -157,3 +157,10 @@ continuation style differs.
   engine is computing the checkpoint's distribution correctly; producing Chinese answers
   needs a chat-aligned checkpoint, not a prompt trick.
 
+
+- Follow-up measurement: `gemv_fp4_m8` vs `gemv_fp4_pq` on **real** expert-34 weights is
+  rel 0.000000 for w1 (2304x5120), w2 (5120x2304) and w3 (2304x5120). So the multi-row
+  kernel is exact after the flat-grid fix; the remaining one-shot-vs-stepwise MoE
+  difference (22.9% on that synthetic batch) therefore does not come from the GEMV
+  kernels, and the default stays row-at-a-time until the actual source is found.
+
