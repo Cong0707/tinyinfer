@@ -112,8 +112,11 @@ def fp4_linear(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor, act_
         try:
             from .gemv_fp4 import gemv_fp4_m8, gemv_fp4_pq, quantize_act
             aq, asc = quantize_act(x, x.size(-1))
-            if aq.size(0) > 1:
+            if aq.size(0) > 1 and __import__("os").environ.get("TI_MULTIROW_GEMV") == "1":
                 return gemv_fp4_m8(aq, asc, w_fp4, w_scale)
+            if aq.size(0) > 1:
+                out = [gemv_fp4_pq(aq[i], asc[i], w_fp4, w_scale) for i in range(aq.size(0))]
+                return torch.cat(out, 0)
             return gemv_fp4_pq(aq[0], asc[0], w_fp4, w_scale)
         except Exception:
             try:
