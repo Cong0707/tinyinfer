@@ -56,3 +56,19 @@
 
 本轮 40+ 次提交（全部可查），`scripts/check.ps1` 全绿；新增 5 个测试文件/脚本、
 7 篇文档（HARDWARE / ROUND_REPORT / ROUND_OUTCOME / PERFORMANCE / analysis 增补等）。
+
+## 一之补：prefill 加速（本轮重点）
+
+| 场景 | 时间 | 相对逐 token |
+| --- | --- | --- |
+| 12 token，chunk=1（精确路径） | 18.3s | 1.00x |
+| 12 token，chunk=4 | 11.6s | **1.58x** |
+| 63 token，默认 chunk（8） | 79.7s | **1.7x**（对比 136s） |
+
+- generate() 默认就走分块路径，短问答（France/pi）输出正确（Paris）。
+- 误差性质：**逐层累积**（逐位置对比：pos0 0.95% -> pos3 57%，40 层复合），不是某个环节坏掉；
+  组件各自都在噪声级（压缩器 1.6e-7、MoE 0.000000、attn 0.0033）。
+- 结论：短提示可用 chunk=4 提速 1.58x；长提示要精确请用 TI_PREFILL_CHUNK=1。
+- 定位过程顺带修了两个真实缺陷：候选块选择没按 query 可见长度裁剪、索引列表宽度随分块
+  变化（已改为 32 对齐，chunk=1 恢复 rel 0）。
+
