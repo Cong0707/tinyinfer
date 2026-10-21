@@ -155,8 +155,13 @@ class Block(HCBlockMixin):
                     return t
 
             self._cpu_refs = [_pin(t) for (_, _, t) in paths]
+        from .cpu_kernels import stage_tensor_to_device
+
         for (owner, name, _), cpu in zip(paths, self._cpu_refs):
-            setattr(owner, name, cpu.to(device, non_blocking=True))
+            # pinned staging: Windows refuses a large cudaHostRegister pool, so a
+            # per-tensor pin_memory() downgrades to pageable (~8.9GB/s). Feeding the
+            # H2D from the process-wide pinned slab uses ~26GB/s instead.
+            setattr(owner, name, stage_tensor_to_device(cpu, device))
         self._device = device
         return self
 
