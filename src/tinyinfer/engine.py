@@ -105,9 +105,12 @@ class Engine:
             # hardware-derived plan (resources.py): adaptive VRAM/RAM budgeting for any
             # card size (8GB laptop .. 80GB desktop .. unified-memory boxes), no manual flags.
             hw = self.hw_plan
-            self.gpu_layers = hw.gpu_layers
-            self.head_gpu = not hw.head_on_cpu
-            self.prefill_chunk = hw.prefill_chunk
+            import os as _os
+            # overrides for experiments: residency 0 makes every layer stream through
+            # the flat pair, which is more H2D but frees the VRAM the pair needs
+            self.gpu_layers = max(0, int(_os.environ.get("TI_GPU_LAYERS", hw.gpu_layers)))
+            self.head_gpu = (not hw.head_on_cpu) and self.gpu_layers > 20
+            self.prefill_chunk = int(_os.environ.get("TI_CHUNK", hw.prefill_chunk))
             # placement: while most layers stream, small activations round-trip every
             # op; keep HC-style tiny ops on the host (big-VRAM boxes stay all-GPU).
             from .placement import small_op_on_cpu
@@ -404,7 +407,11 @@ class Engine:
         # pair: still async, still one H2D per layer, no extra host memory.
         keep: list[int] = []
         mx = max(sizes.values())
-        bufs = [torch.empty(mx, dtype=torch.uint8, device=self.device) for _ in range(2)]
+        # Three rotating buffers. With two, the H2D for layer k+1 starts only when
+        # layer k begins, and a 719MB transfer (27ms) is slower than one layer of
+        # compute (~15ms), so it can never hide. Three let layer k compute while
+        # k+1 and k+2 stream in.
+        bufs = [torch.empty(mx, dtype=torch.uint8, device=self.device) for _ in range(3)]
         pinned_gb = 0.0
         for i in streamed:
             b = self.block(i)
@@ -423,7 +430,7 @@ class Engine:
         self._flat_state = (lay, bufs, None)
         self._flat_ev = {}
         self._copy_stream = torch.cuda.Stream(device=self.device)
-        print(f"[tinyinfer] flat streaming: {len(keep)} layers, {mx/2**20:.0f}MBx2 VRAM, "
+        print(f"[tinyinfer] flat streaming: {len(keep)} layers, {mx/2**20:.0f}MBx3 VRAM, "
               f"{pinned_gb:.1f}GB pinned source (no extra host copy)", flush=True)
 
     def _flat_apply(self, layer: int, buf_idx: int) -> None:
@@ -452,14 +459,19 @@ class Engine:
         self._flat_ev[layer] = ev
 
     def _flat_wait(self, layer: int, buf_idx: int) -> None:
-        if layer not in self._flat_state[0]:
-            self.block(layer).to(self.device)
-            return
-        ev = self._flat_ev.pop(layer, None)
-        if ev is not None:
-            torch.cuda.current_stream().wait_event(ev)
-        else:
-            self._flat_apply(layer, buf_idx)
+        import time as _t
+        t0 = _t.perf_counter()
+        try:
+            if layer not in self._flat_state[0]:
+                self.block(layer).to(self.device)
+                return
+            ev = self._flat_ev.pop(layer, None)
+            if ev is not None:
+                torch.cuda.current_stream().wait_event(ev)
+            else:
+                self._flat_apply(layer, buf_idx)
+        finally:
+            self._h2d_wait_ms = getattr(self, "_h2d_wait_ms", 0.0) + (_t.perf_counter() - t0) * 1e3
 
     def _stream_layers(self):
         """Layers that are re-copied every token (the tail beyond the resident set)."""
@@ -608,11 +620,12 @@ class Engine:
             if streamed and self.device != "cpu":
                 if use_flat:
                     k = flat_pos[i]
-                    self._flat_wait(i, k % 2)
-                    if k + 1 < len(flat_seq):
-                        nxt = flat_seq[k + 1]
-                        if nxt not in self._flat_ev:
-                            self._flat_prefetch(nxt, (k + 1) % 2)
+                    self._flat_wait(i, k % 3)
+                    for d in (1, 2):
+                        if k + d < len(flat_seq):
+                            nxt = flat_seq[k + d]
+                            if nxt not in self._flat_ev:
+                                self._flat_prefetch(nxt, (k + d) % 3)
                     if k + 2 < len(flat_seq) and self.enable_prefetch:
                         # RAM prefetch two layers ahead: the read has ~2 layers of compute
                         # time to land, and it never touches the VRAM slot pool

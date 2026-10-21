@@ -217,12 +217,17 @@ class MoE:
                 served.append(i)
         to_fetch = [i for i in active if i not in served]
 
-        # 2) batch-fetch the rest in one store transaction (lock/copy ceremony once)
+        # 2) fetch the rest in two halves: the second half starts its disk read while
+        # the GPU is still busy with the first. Routing is only known after the gate,
+        # so this intra-layer split is the one overlap that exists without predicting
+        # the next token (prediction measured 14% hit rate and lost time).
         if self._expert_store is not None:
             if to_fetch:
-                with self._expert_store.experts(self.layer_id, to_fetch) as recs:
+                store = self._expert_store
+
+                def serve(ids_batch, recs):
                     rec_by_id = {rec.key[1]: rec for rec in recs}
-                    for i in to_fetch:
+                    for i in ids_batch:
                         idx, top = sel_of(i)
                         rec = rec_by_id[i]
                         if use_fp4_kernel:
@@ -245,6 +250,22 @@ class MoE:
                             if len(self._expert_cache) >= limit:
                                 self._expert_cache.pop(next(iter(self._expert_cache)))
                             self._expert_cache[i] = e
+
+                # One async read per expert, so all six hit the disk at once; the GPU
+                # consumes the first three while the last three are still landing.
+                futs = {i: store.fetch_async(self.layer_id, [i]) for i in to_fetch}
+                keys = list(to_fetch)
+                import time as _t
+                for batch in (keys[:3], keys[3:]):
+                    if not batch:
+                        continue
+                    _w0 = _t.perf_counter()
+                    recs = [futs[i].result()[0] for i in batch]
+                    self._disk_wait_ms = getattr(self, "_disk_wait_ms", 0.0) + (_t.perf_counter() - _w0) * 1e3
+                    try:
+                        serve(batch, recs)
+                    finally:
+                        store.release(recs)
         else:
             for i in active:
                 idx, top = sel_of(i)
