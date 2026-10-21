@@ -23,12 +23,14 @@ from .weights import ShardStore
 
 
 class Gate:
-    def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig):
+    def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, topk: int = 0):
         p = f"layers.{layer_id}.ffn.gate."
         self.weight = store.get(p + "weight").float()
         self.bias = store.get(p + "bias").float()
         self.bias_vl = store.get(p + "bias_vl").float() if cfg.vision_enabled else None
-        self.topk = cfg.n_activated_experts
+        # 0 = checkpoint top-k; aggressive tiers pass a smaller k (fewer expert reads,
+        # same fp4 format — quality traded, generation still coherent).
+        self.topk = int(topk) if topk and 0 < topk < cfg.n_activated_experts else cfg.n_activated_experts
         self.score_func = cfg.scoring_func
         self.norm_topk_prob = cfg.norm_topk_prob
         self.route_scale = cfg.route_scale
@@ -116,13 +118,13 @@ class Expert:
 
 class MoE:
     def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, expert_store=None,
-                 max_bf16_experts: int = 8):
+                 max_bf16_experts: int = 8, topk: int = 0):
         self.cfg = cfg
         self.layer_id = layer_id
         self._expert_store = expert_store  # optional tinyinfer.loading.ExpertStore
         # 0 = never keep bf16 copies (production/GPU path); N>0 = bounded reference cache
         self._max_bf16 = int(max_bf16_experts)
-        self.gate = Gate(store, layer_id, cfg)
+        self.gate = Gate(store, layer_id, cfg, topk=topk)
         p = f"layers.{layer_id}.ffn."
         # shared expert stays fp8 on the device (halves its VRAM; official fp8 GEMM path)
         from .linear import QuantLinear

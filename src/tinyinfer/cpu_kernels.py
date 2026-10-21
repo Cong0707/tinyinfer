@@ -54,5 +54,7 @@ def stage_tensor_to_device(cpu: "torch.Tensor", device: str) -> "torch.Tensor":
     else:
         view = cpu.reshape(-1)
     stage[:n].copy_(view, non_blocking=False)
-    out = stage[:n].to(device, non_blocking=True)
+    # synchronous: the process-wide slab is reused by the next tensor, so the H2D must
+    # finish before we hand the view out (async here caused NaN: next copy overwrote it)
+    out = stage[:n].to(device, non_blocking=False)
     return out.view(cpu.dtype).view(cpu.shape)
