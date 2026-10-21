@@ -254,9 +254,9 @@ class Engine:
         if cache is None:
             self._stream_buffer_cache = cache = {}
         ent = cache.get(sig)
-        if ent is None and len(cache) >= 2:
-            # VRAM guard: at most 2 signature groups x 2 buffers (4 x 190MB = 760MB).
-            # Later groups fall back to the synchronous per-layer copy.
+        if ent is None and len(cache) >= 1:
+            # VRAM guard: one signature group x 2 buffers (2 x 190MB = 380MB); later
+            # groups fall back to the synchronous per-layer copy.
             return None, None
         if ent is None:
             layout = []
