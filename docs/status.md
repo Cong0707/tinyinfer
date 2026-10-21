@@ -40,8 +40,8 @@ not code changes. The IO arithmetic in docs/lower_bounds.md is the invariant.
 
 ## Known open items
 
-1. **One-shot T>1 forward vs token-by-token** differs (a synthetic MoE batch of 8 rows
-   vs eight single-row calls: ~26% on layer 0). Routing, activation quantisation and the
+1. **One-shot T>1 forward vs token-by-token** differs by 26-36% depending on the serve
+   vs eight single-row calls, uniform across rows on layer 0). Routing, activation quantisation and the
    per-expert kernels each verify exact in isolation, so the accumulation is suspect.
    `generate()` only reads the last position of a causal prefill, so answers are
    unaffected; the speculative verify pass and chunked prefill are.
