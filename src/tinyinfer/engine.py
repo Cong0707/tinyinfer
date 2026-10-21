@@ -344,6 +344,8 @@ class Engine:
     # -- forward -----------------------------------------------------------
     def _forward_chunk(self, ids: torch.Tensor, start_pos: int):
         self._last_hidden = None  # filled after the final layer (MTP stage-0 input)
+        self._target_layers = set(self.cfg.dspark_target_layer_ids)
+        self._target_hidden: dict[int, torch.Tensor] = {}
         if self.layer_ids is not None:
             layer_seq = self.layer_ids
             if self.allow_missing_layers:
@@ -389,6 +391,10 @@ class Engine:
             if b.engram is not None and hash_ids is not None:
                 h = b.engram.forward(h, hash_ids[b.engram.hash_index])
             h, pre_mix = b.forward(h, start_pos, pre_mix)
+            if i in self._target_layers:
+                # MTP stage-0 main_proj expects the concatenated collapsed hiddens of
+                # the dspark target layers ([37,38,39] -> [1, T, 3*dim]).
+                self._target_hidden[i] = b.hc_pre(h, pre_mix).detach()
             if self.profile:
                 ev1 = torch.cuda.Event(enable_timing=True)
                 ev1.record()
@@ -445,6 +451,8 @@ class Engine:
         if stages is None:
             return False
         for st in stages:
+            st.embed = getattr(self, "embed", None)  # drafts reuse the main embedding
+            st.head = getattr(self, "head", None) if not self.head_on_cpu else None
             st.to(self.device)
         self.mtp = stages
         return True

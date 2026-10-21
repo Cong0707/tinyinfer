@@ -22,6 +22,24 @@
 
 ---
 
+## 0.1 加载入口（HF 仓库直载）
+
+生产约定：模型仓库放在 **`E:\Models\<repo-name>\`**，按 HF 仓库平铺布局（config.json +
+model.safetensors.index.json + model-*.safetensors + tokenizer 文件），不转 gguf、不拷贝副本。
+
+```python
+from tinyinfer.engine import Engine
+eng = Engine.from_hf("E:/Models/DeepSeek-V4.1-Flash-1017", device="cuda", tokenizer=tok)
+# 也接受 HF repo id（"deepseek-ai/DeepSeek-V4.1-Flash-1017"，从本地 hub 缓存定位快照）
+# 或任意含 index.json 的目录（旧平铺 / hub snapshot 均可）。
+```
+
+`adapters.resolve_hf_snapshot` 依次尝试：平铺目录 → `snapshot_download(local_files_only=True)`
+→ 本地 hub `models--*/snapshots/*` 兜底；找不到时报清晰 FileNotFoundError（不联网）。
+engine 侧 `open_adapter` 对 `deepseek_v41` 架构自动挂 HFDeepSeekV41Adapter，其余架构需注册。
+
+end-to-end 验证脚本：`scripts/e2e_models.py <model_dir> [n_tokens]`。
+
 ## 1. 事实与实测基线
 
 ### 1.1 模型布局（解析 48 个 safetensors header，非估算）
