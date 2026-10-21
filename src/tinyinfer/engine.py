@@ -51,7 +51,7 @@ class Engine:
                 try:
                     import psutil
                     avail = psutil.virtual_memory().available
-                    cache_budget = int(avail * 0.35)
+                    cache_budget = int(avail * 0.5)  # larger RAM cache = fewer disk misses in fetch
                 except Exception:
                     cache_budget = int(self.tier.expert_cache_gb * (1 << 30))
                 self.expert_store = ExpertStore.from_store(
