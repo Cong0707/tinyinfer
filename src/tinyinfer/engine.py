@@ -452,7 +452,7 @@ class Engine:
             return False
         for st in stages:
             st.embed = getattr(self, "embed", None)  # drafts reuse the main embedding
-            st.head = getattr(self, "head", None) if not self.head_on_cpu else None
+            st.head = getattr(self, "head", None)    # drafts reuse the main output head
             st.to(self.device)
         self.mtp = stages
         return True

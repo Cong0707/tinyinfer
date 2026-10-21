@@ -247,27 +247,45 @@ class MTPBlock:
         return x, ffn_pre
 
     # -- official DFlash.sample_drafts (post_norm -> head -> markov -> confidence)
-    def forward_head(self, x, pre_mix):
+    def forward_head(self, x, pre_mix, draft_ids=None):
         """Last stage: collapse HC, post_norm, main-head logits, markov correction, confidence.
 
-        Returns (logits [1, block, vocab], confidence [1, block]) where confidence is the
-        acceptance-rate prediction (sigmoid of the projected hidden; official temperature
-        normalization is applied by the caller in the reference implementation).
+        Mirrors DFlash.sample_drafts:
+          hidden = post_norm(hc_collapse(x)); logits = lm_head(hidden)
+          markov_emb = markov_w1(draft_ids); logits += markov_w2(markov_emb)
+          confidence = sigmoid(confidence_proj([hidden, markov_emb]) / temperature)
+
+        Returns (logits [1, block, vocab] or None, confidence [1, block] or None).
+        The main head must be injected by Engine.load_mtp (checkpoint has no mtp.*.head).
         """
         if self.norm is None:
             return None, None
         h = self.hc_pre(x, pre_mix)  # collapse HC -> [1, block, dim]
         h = rms_norm(h, self.norm, self.eps)
-        logits = F.linear(h, self.head) if self.head is not None else None
-        if logits is None:
-            return None, None
+        logits = None
+        if self.head is not None:
+            # main output head may live on CPU (8GB card); move just the activation
+            logits = F.linear(h, self.head.to(h.device) if self.head.device != h.device else self.head)
+        markov_emb = None
         if self.markov_embed is not None and self.markov_head is not None:
-            # official markov correction: logits += markov_w2(markov_w1[draft_ids])
-            pass
+            if draft_ids is None:
+                # first draft round: the block is the noise fill + the golden token
+                draft_ids = torch.full((x.size(0), self.block_size), self.cfg.dspark_noise_token_id,
+                                       dtype=torch.long, device=x.device)
+            if draft_ids.size(1) != self.block_size:
+                pad = torch.full((draft_ids.size(0), self.block_size - draft_ids.size(1)),
+                                 self.cfg.dspark_noise_token_id, dtype=torch.long, device=x.device)
+                draft_ids = torch.cat([draft_ids, pad], dim=1)
+            markov_emb = F.embedding(draft_ids, self.markov_embed)      # official markov_w1
+            logits = logits + F.linear(markov_emb, self.markov_head)    # official markov_w2
+        confidence = None
         if self.confidence_proj is not None:
-            # official: proj([hidden, markov_emb]) -> sigmoid -> acceptance rate
-            pass
-        return logits, None
+            feat = torch.cat([h, markov_emb], dim=-1) if markov_emb is not None else h
+            temperature = 1.0  # official envs.DEEPINFER_DFLASH_CONFIDENCE_HEAD_TEMPERATURE
+            confidence = torch.sigmoid(
+                F.linear(feat.to(self.confidence_proj.dtype), self.confidence_proj) / temperature
+            ).squeeze(-1)
+        return logits, confidence
 
     def to(self, device):
         for name in ("attn_norm", "ffn_norm", "hc_attn_fn", "hc_attn_base", "hc_attn_scale",
