@@ -441,9 +441,10 @@ class Engine:
                 h = b.engram.forward(h, hash_ids[b.engram.hash_index])
             h, pre_mix = b.forward(h, start_pos, pre_mix)
             if i in self._target_layers:
-                # MTP stage-0 main_proj expects the concatenated collapsed hiddens of
-                # the dspark target layers ([37,38,39] -> [1, T, 3*dim]).
-                self._target_hidden[i] = b.hc_pre(h, pre_mix).detach()
+                # MTP stage-0 main_proj expects the concat of the dspark target layers'
+                # attn_norm outputs (official dflash_input), [1, T, 3*dim].
+                cap = getattr(b, "_last_attn_norm", None)
+                self._target_hidden[i] = (cap if cap is not None else b.hc_pre(h, pre_mix)).detach()
             if self.profile:
                 ev1 = torch.cuda.Event(enable_timing=True)
                 ev1.record()
