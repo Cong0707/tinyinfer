@@ -16,22 +16,40 @@ from .weights import ShardStore
 
 
 class SharedAttentionRuntime:
-    """Inter-layer handoff slots (one model per process, layers run in order)."""
+    """Inter-layer handoff slots.
+
+    Default instance is a process-wide singleton for chunk-major execution (layers run
+    in order). Layer-major prefill needs per-kv-source instances so that a layer's
+    followers in different chunks do not observe a stale neighbour's state.
+    """
 
     compress_kv: torch.Tensor | None = None
     index_k: torch.Tensor | None = None
     topk_idxs: torch.Tensor | None = None
     candidates: torch.Tensor | None = None
     src_ratio: int = 0  # compress ratio of the kv_source layer that produced compress_kv
-    src_ratio: int = 0  # compress ratio of the kv_source layer that produced compress_kv
+    # layer-major order interleaves chunks across layers, so candidates must be kept
+    # per chunk instead of a single slot (chunk-major reuses one slot safely).
+    candidates_by_chunk: dict = {}
+
+    def reset(self) -> None:
+        self.compress_kv = None
+        self.index_k = None
+        self.topk_idxs = None
+        self.candidates = None
+        self.src_ratio = 0
 
 
 shared_attn = SharedAttentionRuntime()
 
 
 class Compressor:
-    def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, *, quant: bool = False):
+    def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, *, quant: bool = False,
+                 rt: SharedAttentionRuntime | None = None):
         p = f"layers.{layer_id}.attn.compressor."
+        # per-instance handoff slots: layer-major prefill keeps separate instances per
+        # kv_source; chunk-major keeps the process singleton.
+        self.rt = rt if rt is not None else shared_attn
         self.ratio = cfg.compress_ratios[layer_id]
         self.head_dim = cfg.head_dim
         self.eps = cfg.rms_norm_eps
@@ -84,7 +102,7 @@ class Compressor:
         b, s, _ = x.shape
         xf = x.float()
         if self.ratio == 1:
-            shared_attn.src_ratio = 1  # ratio-1 sources publish without pooling
+            self.rt.src_ratio = 1  # ratio-1 sources publish without pooling
             return rms_norm(F.linear(xf, self.wkv), self.norm_w, self.eps).to(x.dtype)
         kv = F.linear(xf, self.wkv)
         score = F.linear(xf, self.wgate)
@@ -96,7 +114,7 @@ class Compressor:
         all_kv = torch.cat([pkv, kv], dim=1)
         all_sc = torch.cat([psc, score], dim=1)
         total = all_kv.size(1)
-        shared_attn.src_ratio = self.ratio
+        self.rt.src_ratio = self.ratio
         n_groups = total // self.ratio
         if n_groups == 0:
             self._pending_kv, self._pending_score = all_kv, all_sc
@@ -133,9 +151,13 @@ def select_candidate_blocks(logits, compress_lens, topk_blocks: int, block_size:
 class Indexer:
     """Sparse top-k selector over compressed positions; supports chunked prefill."""
 
-    def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, freqs_cis: torch.Tensor):
+    def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, freqs_cis: torch.Tensor,
+                 rt: "SharedAttentionRuntime | None" = None):
         p = f"layers.{layer_id}.attn.indexer."
         self.layer_id = layer_id
+        # per-instance handoff slots (see SharedAttentionRuntime); default is the
+        # chunk-major process singleton.
+        self.rt = rt if rt is not None else shared_attn
         self.ratio = cfg.compress_ratios[layer_id]
         self.n_heads = cfg.index_n_heads
         self.head_dim = cfg.index_head_dim
@@ -196,7 +218,7 @@ class Indexer:
 
     def forward(self, x, qr, latent, start_pos: int, offset: int):
         b, s, _ = x.shape
-        ratio = self.ratio if self.owns_k else (shared_attn.src_ratio or self.ratio)
+        ratio = self.ratio if self.owns_k else (self.rt.src_ratio or self.ratio)
         rd, end_pos = self.rope_dim, start_pos + s
         groups_so_far = start_pos // ratio
 
@@ -211,11 +233,11 @@ class Indexer:
             cache[:, groups_so_far : groups_so_far + n_new] = k
             self._k_cache = cache
         if self.owns_k:
-            shared_attn.index_k = self._k_cache
+            self.rt.index_k = self._k_cache
         import os as _os
         if _os.environ.get("TI_DEBUG_IDX"):
             print(f"[idx] start={start_pos} s={s} owns_k={self.owns_k} latent={None if latent is None else tuple(latent.shape)} "
-                  f"kcache={None if self._k_cache is None else tuple(self._k_cache.shape)} shared={None if shared_attn.index_k is None else tuple(shared_attn.index_k.shape)}", flush=True)
+                  f"kcache={None if self._k_cache is None else tuple(self._k_cache.shape)} shared={None if self.rt.index_k is None else tuple(shared_attn.index_k.shape)}", flush=True)
 
         q = F.linear(qr.float(), self.wq_b).view(b, s, self.n_heads, self.head_dim)
         apply_rope(q[..., -rd:], self.freqs_cis[start_pos:end_pos])
@@ -223,7 +245,7 @@ class Indexer:
         t = end_pos // ratio
         if t <= 0:
             return torch.empty(b, s, 0, dtype=torch.int32, device=x.device)
-        index_k = shared_attn.index_k[:, :t]
+        index_k = self.rt.index_k[:, :t]
         weights = F.linear(x.float(), self.weights_proj) * (self.softmax_scale * self.n_heads ** -0.5)
         score = torch.einsum("bshd,btd->bsht", q, index_k.float())
         score = (score.relu() * weights.unsqueeze(-1)).sum(dim=2)
@@ -237,11 +259,17 @@ class Indexer:
         compress_lens = per_query_lens.squeeze(-1)  # [s]
 
         if self.is_candidate_source:
-            shared_attn.candidates = select_candidate_blocks(
+            self.rt.candidates = select_candidate_blocks(
                 score, compress_lens, self.candidate_topk_blocks, self.candidate_block_size
             )
+            self.rt.candidates_by_chunk[start_pos // max(s, 1)] = self.rt.candidates
         elif self.uses_candidates:
-            score = score.masked_fill(~shared_attn.candidates, -torch.inf)
+            cand = self.rt.candidates_by_chunk.get(start_pos // max(x.size(1), 1))
+            if cand is None:
+                cand = self.rt.candidates
+            if cand is None:
+                raise RuntimeError("candidate block missing for this chunk")
+            score = score.masked_fill(~cand, -torch.inf)
 
         topk = min(self.index_topk, t)
         idxs = score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
