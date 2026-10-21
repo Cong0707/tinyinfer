@@ -116,3 +116,11 @@ after hours of repeated sweeps, so late measurements are disk-bound, not code-bo
   (server up, request, well-formed `choices`/`usage` response). One request at a time,
   since the engine keeps a single KV session.
 
+
+- Additional measurement: a hand-written reproduction of the routed sum (same gate, same
+  pre-quantised activation, same per-expert kernels, plain `y[rows] += val`) differs from
+  `MoE.forward` by 12.6% on the same 8-row batch. Since the components verify equal, the
+  remaining suspects are the serve loop's 3-expert batching (`_val_acc`/`_idx_acc`
+  accumulation order) and the slot/record sharing. The single-row path (decode) is
+  unaffected.
+
