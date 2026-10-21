@@ -73,6 +73,7 @@ picks resident layers, ring size, cache size and chunking itself.
 - docs/flare_analysis.md - NVIDIA Flare (b12x) mechanisms, ported and rejected ones
 - docs/benchmarks.md   - benchmark history (the disk rate is part of every row)
 - docs/PERFORMANCE.md  - one-page performance summary and how to measure it
+- docs/analysis.md     - the numbers behind every decision (§13: prefill chunk trade-off)
 - docs/analysis.md     - routing predictability, speculative ceiling, batch-vs-row probe
 - docs/architecture.md - module map, streaming model, expert path, sessions
 - docs/ENV.md          - every environment switch
