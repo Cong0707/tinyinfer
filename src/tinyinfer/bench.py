@@ -38,7 +38,8 @@ def _disk_rate(model_dir: str, mb: int = 512) -> float:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
-    ap.add_argument("--prompt", default="<|begin_of_sentence|><|User|>The capital of France is<|Assistant|>")
+    # question-shaped: the base model answers these sensibly (docs/faq.md)
+    ap.add_argument("--prompt", default="Question: What is the capital of France?\nAnswer:")
     ap.add_argument("--new-tokens", type=int, default=8)
     ap.add_argument("--json", default=None)
     args = ap.parse_args()
