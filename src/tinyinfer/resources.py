@@ -92,9 +92,19 @@ def plan(hw: Hardware | None = None, n_layers: int = 40) -> Plan:
     hw = hw or detect()
     budget = hw.vram_budget_gb
     # one expert slot costs EXPERT_MB; allow enough slots for ~2 tokens of top-6
+    # v6 flat streaming reserves one extra streamed-layer buffer pair, so the VRAM
+    # expert staging pool is smaller than it used to be (still 1-2 layers of top-6).
     slot_budget = min(0.9, max(0.0, budget * 0.12))
     slots = max(0, int(slot_budget * 1024 / EXPERT_MB / 6) * 6)  # multiple of 6
-    resident = budget - EMBED_GB - slot_budget
+    # TI_FLAT=1 reserves a device buffer pair for v6 flat streaming (two buffers sized
+    # to the largest layer, 719MB each here) instead of per-layer allocations.
+    flat_gb = 1.45 if os.environ.get("TI_FLAT", "0") == "1" else 0.0
+    # tilelang keeps a workspace for the prompt-length kernel set (~1.6GB measured for
+    # a 21-token prefill on this box). Without reserving it the allocator has to page
+    # once the decode kernels get their own workspace (reserved went past 11.9GB on an
+    # 8GB card -> 0.10 tok/s). Small cards reserve it, big ones do not need to.
+    ws_gb = 1.6 if budget < 12 else 0.0
+    resident = budget - EMBED_GB - slot_budget - flat_gb - ws_gb
     head_gpu = resident - HEAD_GB >= 20 * LAYER_GB
     if not head_gpu:
         resident -= 0.0  # head stays on CPU
@@ -104,9 +114,10 @@ def plan(hw: Hardware | None = None, n_layers: int = 40) -> Plan:
     cache_gb = min(16.0, max(0.5, host * 0.35))
     # prefill chunk: weights (resident+streamed) + activations per token; chunk 64 on
     # a 47GB box OOM'd, so bound it by the host budget with a safety margin.
-    per_tok_gb = 0.08  # 40-layer activation+KVs per token (bf16, compressed)
-    chunk = int(max(8, min(2048, (host - 20.0) / max(per_tok_gb, 1e-3) / 8)))
-    chunk = max(8, min(chunk, 512))
+    # fixed chunk: tilelang compiles per (M, ...) shape, so a chunk that floats with
+    # the free-RAM estimate recompiles the whole kernel set on every start (measured
+    #: 60-100s of the first prefill). 64 is the measured sweet spot on this box.
+    chunk = 64
     reason = (
         f"{hw.name} vram={hw.vram_gb:.1f}GB ram={hw.ram_gb:.1f}GB(avail {hw.ram_avail_gb:.1f}) "
         f"-> gpu_layers={gpu_layers} slots={slots} cache={cache_gb:.1f}GB chunk={chunk}"

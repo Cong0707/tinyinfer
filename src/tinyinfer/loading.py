@@ -900,9 +900,12 @@ class _WindowsDirect:
         self._k32.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_uint32]
         self._k32.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32]
         self._k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        self._k32.GetFileSizeEx.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_longlong)]
+        self._k32.GetFileSizeEx.restype = ctypes.c_int
         self._scratch = self._k32.VirtualAlloc(None, max_scratch, 0x1000 | 0x2000, 0x04)
         self._scratch_size = max_scratch
         self._handles: dict[str, int] = {}
+        self._sizes: dict[str, int] = {}
         self.bytes_read = 0
 
     def _handle(self, path: str) -> int:
@@ -915,9 +918,29 @@ class _WindowsDirect:
             self._handles[path] = h
         return h
 
+    def _file_size(self, path: str) -> int:
+        size = self._sizes.get(path)
+        if size is None:
+            v = ctypes.c_longlong(0)
+            self._k32.GetFileSizeEx(self._handle(path), ctypes.byref(v))
+            size = int(v.value)
+            self._sizes[path] = size
+        return size
+
     def read(self, path: str, offset: int, nbytes: int, dest: memoryview) -> None:
         start = offset & ~(PAGE_BYTES - 1)
         end = (offset + nbytes + PAGE_BYTES - 1) & ~(PAGE_BYTES - 1)
+        # NO_BUFFERING requires a whole number of sectors AND the requested range has to
+        # stay inside the file; the last page of a shard cannot be read this way, so that
+        # tail falls back to a cached read (only ever the final tensor of a shard).
+        size = self._file_size(path)
+        end = min(end, size) & ~(PAGE_BYTES - 1)
+        if end < offset + nbytes:
+            with open(path, "rb") as f:
+                f.seek(offset)
+                dest[:nbytes] = f.read(nbytes)
+            self.bytes_read += nbytes
+            return
         span = end - start
         if span > self._scratch_size:
             raise ValueError(f"direct read of {span} exceeds scratch {self._scratch_size}")
@@ -1922,13 +1945,23 @@ class ExpertStore:
         if len(experts) > 1:
             misses = [e for e in experts if not self.ram.contains(layer, e)]
             if misses:
+                # a prefetch for this very expert may already be in flight: wait for it
+                # instead of issuing a second read of the same blob on this thread
+                misses = [e for (_, e) in self._settle_pending([(layer, e) for e in misses])]
+            if misses:
                 blobs = [self.index.expert_blob(layer, e) for e in misses]
                 try:
                     # pinned reads: 7.4GB/s vs 3.2 pageable, and the bytes stay pinned
                     # for the H2D-to-slot copy (13.3GB/s vs 8.3)
                     datas = self._reader.read_many_pinned(blobs)
                     for b, d in zip(blobs, datas):
-                        self.ram.admit(layer, b.key[1], d.numpy().view(d.numpy().dtype))
+                        # Admit a PAGEABLE copy. Keeping the pinned block alive in the
+                        # cache meant ~600 live cudaHostAlloc blocks (11GB), so every
+                        # fetch had to allocate fresh pinned memory for each 18.8MB
+                        # blob -- that allocation, not the device, was what capped
+                        # reads at 1.2GB/s on an 11GB/s SSD.
+                        arr = d.numpy().copy()
+                        self.ram.admit(layer, b.key[1], arr)
                 except Exception:
                     pass  # fall back to per-expert reads inside _materialize
         # batch the slot reservations under one lock (decode fetches 6 experts/layer)
@@ -1957,21 +1990,25 @@ class ExpertStore:
         experts = [int(e) for e in experts]
         if getattr(self, "_vram_executor", None) is None:
             import concurrent.futures
-            self._vram_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1,
+            # one worker serialised every blob behind a single thread: 186 blobs/token
+            # at ~1.2GB/s could never keep up with the compute thread. Six matches the
+            # reader's measured scaling (8 threads = 10.9GB/s on cached blobs).
+            self._vram_executor = concurrent.futures.ThreadPoolExecutor(max_workers=6,
                                                                         thread_name_prefix="vram-prefetch")
 
-        def work():
-            staged = 0
-            for expert in experts:
-                if self.slots.is_staged(layer, expert):
-                    continue
-                blob = self.index.expert_blob(layer, expert)
-                data = self.ram.get(layer, expert, admit=cache)
-                if self.slots.preload(layer, expert, data):
-                    staged += 1
-            return staged
+        def one(expert: int) -> int:
+            if self.slots.is_staged(layer, expert):
+                return 0
+            data = self.ram.get(layer, expert, admit=cache)
+            return 1 if self.slots.preload(layer, expert, data) else 0
 
-        self._vram_executor.submit(work)
+        if getattr(self, "_pending", None) is None:
+            self._pending = {}
+        # one future per blob: the compute thread can wait for the read it needs
+        # instead of issuing a second read of the same 18.8MB (fetch -> _settle_pending)
+        for expert in experts:
+            fut = self._vram_executor.submit(one, expert)
+            self._pending[(int(layer), int(expert))] = fut
         return 0
 
     def release(self, records: Iterable[ExpertRecord]) -> None:
@@ -1995,7 +2032,40 @@ class ExpertStore:
                 self.release(records)
 
     def prefetch(self, layer: int, experts: Iterable[int]) -> Future:
-        return self.ram.prefetch(layer, experts)
+        """Issue RAM reads ahead of use and remember them so fetch() never reads twice."""
+        fut = self.ram.prefetch(layer, experts)
+        if getattr(self, "_pending", None) is None:
+            self._pending = {}
+        for e in experts:
+            self._pending[(int(layer), int(e))] = fut
+        return fut
+
+    def _settle_pending(self, misses: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        """Wait for in-flight prefetches of these experts; return the ones still missing.
+
+        Without this, the predict-then-fetch pair reads the same 18.8MB blob twice: the
+        prefetch thread has not finished, fetch() sees a cache miss and re-reads it on
+        the calling thread -- measured 1.5x the ideal disk bytes per token.
+        """
+        pending = getattr(self, "_pending", None)
+        if not pending:
+            return misses
+        still: list[tuple[int, int]] = []
+        for key in misses:
+            fut = pending.pop(key, None)
+            if fut is None:
+                still.append(key)
+                continue
+            try:
+                # a queued-but-not-started prefetch must not stall the compute thread:
+                # past this budget we just read the blob ourselves
+                fut.result(timeout=0.5)
+            except Exception:
+                still.append(key)
+                continue
+            if not self.ram.contains(*key):
+                still.append(key)
+        return still
 
     def pin(self, layer: int, expert: int) -> bool:
         return self.ram.pin(layer, expert)
