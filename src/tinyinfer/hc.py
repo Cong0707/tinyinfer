@@ -88,8 +88,6 @@ class HCBlockMixin:
         availability is latched once per process rather than re-raised per call.
         """
         global _FUSED_POST_OK
-        if x.is_cuda and getattr(self, "hc_post_on_cpu", False) and x.numel() <= (1 << 22):
-            return self._hc_post_cpu(x, residual, post, comb)
         import os as _os
         if x.is_cuda and _FUSED_POST_OK and _os.environ.get("TI_HC_NOFUSE") != "1":
             try:

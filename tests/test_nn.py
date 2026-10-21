@@ -43,6 +43,12 @@ def test_rope_matches_official():
     for dim, seqlen, orig, base in [(64, 128, 0, 10000.0), (64, 256, 65536, 160000.0)]:
         f1 = precompute_freqs_cis(dim, seqlen, orig, base, 16, 32, 1)
         f2 = official_precompute(dim, seqlen, orig, base, 16, 32, 1)
+        # DeepInfer's YaRNScalingRotaryEmbedding scales cos/sin by
+        # yarn_get_mscale(factor) = 0.1*ln(factor)+1 (mscale defaults to True); the
+        # plain reference table does not. This engine follows the vendor stack.
+        if orig > 0:  # YaRN (and its mscale) only applies with an original context length
+            import math
+            f2 = f2 * (0.1 * math.log(16) + 1.0)
         assert torch.allclose(f1, f2, atol=1e-5), (dim, orig)
         x = torch.randn(2, seqlen, 8, dim, dtype=torch.bfloat16)
         a, b = x.clone(), x.clone()

@@ -103,7 +103,9 @@ class Compressor:
         xf = x.float()
         if self.ratio == 1:
             self.rt.src_ratio = 1  # ratio-1 sources publish without pooling
-            return rms_norm(F.linear(xf, self.wkv), self.norm_w, self.eps).to(x.dtype)
+            # reference: self.norm(kv.to(dtype)) -- the fp32 result is rounded to bf16
+            # BEFORE the normalisation, not after
+            return rms_norm(F.linear(xf, self.wkv).to(x.dtype), self.norm_w, self.eps)
         kv = F.linear(xf, self.wkv)
         score = F.linear(xf, self.wgate)
         pkv = self._pending_kv
@@ -123,12 +125,22 @@ class Compressor:
         bsc = all_sc[:, : n_groups * self.ratio]
         groups = body.unflatten(1, (-1, self.ratio))
         gscore = bsc.unflatten(1, (-1, self.ratio))
-        pooled = (groups * gscore.softmax(dim=2)).sum(dim=2)
+        # DeepSeek's own TileLang pooling kernel (deepseek_kernels.compress_pool);
+        # the torch expression below is the reference it implements
+        pooled = None
+        if body.is_cuda and body.size(0) == 1:
+            from .deepseek_kernels import compress_pool
+            pooled = compress_pool(gscore.reshape(-1, gscore.size(-1)),
+                                   groups.reshape(-1, groups.size(-1)), self.ratio)
+            if pooled is not None:
+                pooled = pooled.reshape(groups.size(0), -1, groups.size(-1))
+        if pooled is None:
+            pooled = (groups * gscore.softmax(dim=2)).sum(dim=2)
         rest = total - n_groups * self.ratio
         self._pending_kv = all_kv[:, n_groups * self.ratio :].clone()
         self._pending_score = all_sc[:, n_groups * self.ratio :].clone()
         assert self._pending_kv.size(1) == rest
-        return rms_norm(pooled, self.norm_w, self.eps).to(x.dtype)
+        return rms_norm(pooled.to(x.dtype), self.norm_w, self.eps)
 
 
 def select_candidate_blocks(logits, compress_lens, topk_blocks: int, block_size: int) -> torch.Tensor:
@@ -250,13 +262,20 @@ class Indexer:
         score = torch.einsum("bshd,btd->bsht", q, index_k.float())
         score = (score.relu() * weights.unsqueeze(-1)).sum(dim=2)
 
-        # a query at global p can see compressed positions < (p+1)//ratio
-        qpos = torch.arange(start_pos, end_pos, device=x.device).unsqueeze(-1)  # [s,1]
-        per_query_lens = (qpos + 1) // ratio  # [s,1]
-        ar = torch.arange(t, device=x.device).view(1, t)  # [1, t]
-        mask = (ar >= per_query_lens).unsqueeze(0)  # [1, s, t]
+        # a query at global p can see compressed positions < (p+1)//ratio.
+        # The mask depends only on (start_pos, s, t), and every compressed layer in one
+        # forward builds it again: cache it on the handoff slot.
+        key = (start_pos, s, t, ratio)
+        cached = None if __import__("os").environ.get("TI_NO_MASK_CACHE") else getattr(self.rt, "_mask_cache", None)
+        if cached is None or cached[0] != key:
+            qpos = torch.arange(start_pos, end_pos, device=x.device).unsqueeze(-1)  # [s,1]
+            per_query_lens = (qpos + 1) // ratio  # [s,1]
+            ar = torch.arange(t, device=x.device).view(1, t)  # [1, t]
+            cached = (key, (ar >= per_query_lens).unsqueeze(0), per_query_lens.squeeze(-1))
+            self.rt._mask_cache = cached
+        mask = cached[1]
         score = score.masked_fill(mask, -torch.inf)
-        compress_lens = per_query_lens.squeeze(-1)  # [s]
+        compress_lens = cached[2]  # [s]
 
         if self.is_candidate_source:
             self.rt.candidates = select_candidate_blocks(
@@ -273,5 +292,5 @@ class Indexer:
 
         topk = min(self.index_topk, t)
         idxs = score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
-        valid = idxs < per_query_lens.view(per_query_lens.size(0), 1).unsqueeze(0)
+        valid = idxs < compress_lens.reshape(-1, 1).unsqueeze(0)
         return torch.where(valid, idxs + offset, -1).int()

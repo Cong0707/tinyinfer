@@ -16,6 +16,7 @@ class Block(HCBlockMixin):
     """One decoder layer: Hyper-Connection collapse -> norm -> attention -> HC expand -> ... FFN."""
 
     def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, expert_store=None, quant: bool = False,
+                 tp=None,
                  hashes=None, cache_wo_a: bool = False, expert_topk: int = 0, rt=None):
         self.layer_id = layer_id
         self.cfg = cfg
@@ -38,10 +39,17 @@ class Block(HCBlockMixin):
         self.hc_sinkhorn_iters = cfg.hc_sinkhorn_iters
         self.hc_eps = cfg.hc_eps
         if cfg.compress_ratios[layer_id] == 0:
-            self.attn = MLAWindowAttention(store, layer_id, cfg, quant=quant, cache_wo_a=cache_wo_a)
+            self.attn = MLAWindowAttention(store, layer_id, cfg, quant=quant,
+                                           cache_wo_a=cache_wo_a, tp=tp)
         else:
-            self.attn = MLACompressedAttention(store, layer_id, cfg, quant=quant, rt=rt)
-        self.ffn = MoE(store, layer_id, cfg, expert_store=expert_store, topk=expert_topk)
+            self.attn = MLACompressedAttention(store, layer_id, cfg, quant=quant, rt=rt, tp=tp)
+        # the bf16 expert cache exists for the dequantised (reference) path; when the
+        # block keeps fp8/fp4 the fp4 serve path reads the blob views directly, so eight
+        # bf16 copies per layer only cost VRAM (40 x 8 x 30MB = 9.6GB, which is what made
+        # a 63-token prefill run the allocator past physical memory)
+        self.ffn = MoE(store, layer_id, cfg, expert_store=expert_store, topk=expert_topk,
+                       max_bf16_experts=(0 if quant and not __import__("os").environ.get("TI_BF16_CACHE")
+                                          else 8))
         p = f"layers.{layer_id}."
         self.attn_norm = store.get(p + "attn_norm.weight")
         self.ffn_norm = store.get(p + "ffn_norm.weight")
@@ -59,8 +67,12 @@ class Block(HCBlockMixin):
                      "hc_ffn_fn", "hc_ffn_base", "hc_ffn_scale"):
             out.append((self, name, getattr(self, name)))
         a = self.attn
-        for name in ("q_norm", "kv_norm", "sink", "freqs_cis"):
+        # freqs_cis is a shared model constant (rope_cache), not a per-layer weight:
+        # streaming it cost 256MB x 36 layers = 9.2GB per token of duplication
+        for name in ("q_norm", "kv_norm", "sink"):
             out.append((a, name, getattr(a, name)))
+        if getattr(a, "freqs_cis", None) is not None and a.freqs_cis.device.type != "cpu":
+            pass  # already resident on the device
         for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
             ql = getattr(a, name)
             if hasattr(ql, "weight"):
@@ -94,6 +106,16 @@ class Block(HCBlockMixin):
                 out.append((f.shared, name, t))
         return out
 
+    @staticmethod
+    def _wkey(owner, name):
+        """Stable identity for a weight slot: the owner object plus the attribute name.
+
+        The reference list used to be positional, which broke silently as soon as
+        _weight_paths gained or lost an entry (dropping the shared RoPE table shifted
+        every later slot by one and the per-tensor copies landed on the wrong tensors).
+        """
+        return (id(owner), name)
+
     def _ensure_flat(self, device):
         """Pack all weights into one aligned pinned flat buffer + one device flat buffer."""
         if getattr(self, "_stream_flat", None) is not None:
@@ -120,7 +142,7 @@ class Block(HCBlockMixin):
         self._stream_flat = (cpu_flat, gpu_flat)
         self._flat_offsets = offsets
         self._flat_order = order
-        self._cpu_refs = [t for (_, _, t) in paths]
+        self._cpu_refs = {self._wkey(o, n): t for (o, n, t) in paths}
 
     def to(self, device):
         """Move/preload this block's weights.
@@ -133,11 +155,14 @@ class Block(HCBlockMixin):
             return self
         paths = self._weight_paths()
         if device == "cpu":
-            if getattr(self, "_cpu_refs", None) is None:
+            refs = getattr(self, "_cpu_refs", None)
+            if refs is None:
                 self._device = "cpu"
                 return self
-            for (owner, name, _), ref in zip(paths, self._cpu_refs):
-                setattr(owner, name, ref)
+            for (owner, name, _) in paths:
+                ref = refs.get(self._wkey(owner, name))
+                if ref is not None:
+                    setattr(owner, name, ref)
             self._device = "cpu"
             return self
         # per-tensor copies: a packed flat buffer cannot be freed per layer (views pin
@@ -154,7 +179,7 @@ class Block(HCBlockMixin):
                 except Exception:
                     return t
 
-            self._cpu_refs = [_pin(t) for (_, _, t) in paths]
+            self._cpu_refs = {self._wkey(o, n): _pin(t) for (o, n, t) in paths}
         import os as _os
         from .cpu_kernels import slab
 
@@ -171,17 +196,20 @@ class Block(HCBlockMixin):
                 off += n
             total = (off + 255) // 256 * 256
             if total <= st.numel():
-                for (owner, name, t), cpu, o, n in zip(paths, self._cpu_refs, offsets, nbytes):
+                for (owner, name, t), o, n in zip(paths, offsets, nbytes):
+                    cpu = self._cpu_refs[self._wkey(owner, name)]
                     st[o:o + n].copy_(cpu.reshape(-1).view(torch.uint8), non_blocking=False)
                 gpu = st[:total].to(device, non_blocking=False)  # single pinned H2D
                 for (owner, name, t), o, n in zip(paths, offsets, nbytes):
                     setattr(owner, name, gpu[o:o + n].view(t.dtype).view(t.shape))
             else:
-                for (owner, name, _), cpu in zip(paths, self._cpu_refs):
-                    setattr(owner, name, cpu.to(device, non_blocking=True))
+                for (owner, name, _) in paths:
+                    setattr(owner, name,
+                            self._cpu_refs[self._wkey(owner, name)].to(device, non_blocking=True))
         else:
-            for (owner, name, _), cpu in zip(paths, self._cpu_refs):
-                setattr(owner, name, cpu.to(device, non_blocking=True))
+            for (owner, name, _) in paths:
+                setattr(owner, name,
+                        self._cpu_refs[self._wkey(owner, name)].to(device, non_blocking=True))
         if getattr(self, "engram", None) is not None:
             # engram tables stay on disk (row reads) but its small projection weights
             # (q/k/wkv, cached bf16) must follow the block.

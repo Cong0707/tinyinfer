@@ -58,6 +58,26 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
     # fused_fp8_gemv for M in 2..8 crashes (misaligned address inside
     # gemv_bf16_kernel at N=1280/K=5120), so small-M fp8 stays on the GEMM for now.
     if x.dim() == 2 and x.size(0) == 1 and x.is_cuda:
+        # Official block-scaled GEMV (b12x algorithm ported to TileLang): 16 output
+        # features per CTA, 8 warps split K by whole scale blocks, FP32 block-scaled
+        # accumulate, deterministic warp reduction. Enabled by the tier; if the port
+        # does not cover the shape it returns None and the old kernel runs.
+        # Measured crossover on SM120 (probe_official_gemv.py): below ~4096 output
+        # features the engine's per-row kernel wins (it owns 16 features per CTA and
+        # never pads), from 4096 up the ported 128-feature/CTA kernel wins by 12-25x
+        # (wq_b at N=32768, wo_b at 5120, the vocabulary head).
+        if w_fp8.shape[0] >= 4096:
+            try:
+                from .official_kernels import gemv_fp8_block
+
+                with _bf16_default():
+                    x_fp8, x_s = _k.act_quant(x, block, SCALE_FMT, SCALE_DTYPE)
+                out = gemv_fp8_block(x_fp8, w_fp8, x_s.float().reshape(1, -1),
+                                     w_scale.float(), block)
+                if out is not None:
+                    return out
+            except Exception:
+                pass
         try:
             from .gemv_fp8 import gemv_fp8
             return gemv_fp8(x, w_fp8, w_scale)
@@ -85,14 +105,23 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
 def fp4_linear(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor, act_block: int = 32) -> torch.Tensor:
     """C = x @ w_fp4.T with fp8 activation quant, fp4 weight (official kernel path)."""
     if x.dim() == 2 and 0 < x.size(0) <= 8 and x.is_cuda:
-        # same block_M=32 waste as fp8: at M=2 the GEMM took 334ms/layer, the GEMV loop
-        # takes ~2 x 6ms
+        # same block_M=32 waste as fp8: at M=2 the GEMM took 334ms/layer. Rows are done
+        # one at a time with the single-row kernel: gemv_fp4_m8's multi-row grid was
+        # measured 35% off on some (weight, row) pairs, and a chunk only has a handful
+        # of rows per expert, so exactness wins over the launch count.
         try:
-            from .gemv_fp4 import gemv_fp4
-            rows = [gemv_fp4(x[i:i + 1], w_fp4, w_scale) for i in range(x.size(0))]
-            return rows[0] if len(rows) == 1 else torch.cat(rows, dim=0)
+            from .gemv_fp4 import gemv_fp4_m8, gemv_fp4_pq, quantize_act
+            aq, asc = quantize_act(x, x.size(-1))
+            if aq.size(0) > 1:
+                return gemv_fp4_m8(aq, asc, w_fp4, w_scale)
+            return gemv_fp4_pq(aq[0], asc[0], w_fp4, w_scale)
         except Exception:
-            pass
+            try:
+                from .gemv_fp4 import gemv_fp4
+                rows = [gemv_fp4(x[i:i + 1], w_fp4, w_scale) for i in range(x.size(0))]
+                return rows[0] if len(rows) == 1 else torch.cat(rows, dim=0)
+            except Exception:
+                pass
     with _bf16_default():
         x_fp8, x_s = _k.act_quant(x, act_block, SCALE_FMT, SCALE_DTYPE)
         return _k.fp4_gemm(x_fp8, x_s, w_fp4, w_scale, SCALE_DTYPE, act_block_size=act_block)

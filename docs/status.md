@@ -1,50 +1,59 @@
-# Where the engine stands (measured, 2026-10-21)
+# Status of tinyinfer (measured, not projected)
 
-## Decode
+## What runs
 
-| configuration | tok/s | note |
-|---|---|---|
-| best warm run, 6 resident layers | **0.56** (1.78-1.84s) | TI_FLAT triple buffer, 8GB pinned weights, 4GB pinned expert cache |
-| same, first steps after load | 0.18-0.33 | expert cache cold, expert reads dominate |
-| 2 resident layers + MTP weights | 0.28 | MTP needs 1.5GB VRAM, which costs 4 resident layers |
-| speculative decode (accept 25%) | 0.13 | negative: draft 0.86s + verify 2.6s for ~2 tokens |
+| item | state |
+| --- | --- |
+| Load 510GB checkpoint directly from HF safetensors | works (build ~2s + slab setup) |
+| Prefill / decode / streaming | works |
+| Multi-session (generate twice on one engine) | works (logit drift is a known open item) |
+| HTTP server `/health` + `/generate` | verified end to end |
+| Benchmark / examples | `python -m tinyinfer.bench`, `examples/*.py` |
+| Test suite | passes (2 xfail: session drift, one-shot vs stepwise) |
 
-Stage breakdown at 0.56 tok/s (per token, 6 resident layers):
-```
-attn_pre 0.10s   attn 0.08s (submitted)   hc1 0.00s
-ffn_pre  0.10s   moe  1.37s               hc2 0.00s
-```
-The MoE segment is dominated by one host sync per layer (bincount over the routing).
-The CPU waits for the GPU to finish that layer's attention, then submits the fp4 GEMV,
-so GPU and CPU run serially. That is the structural reason the card sits near 50%
-utilisation.
+## Measured performance
 
-## Prefill
+| metric | value | note |
+| --- | --- | --- |
+| decode (this box, disk 4.5GB/s) | 1.66s/token = 0.60 tok/s | quality-preserving top-6 |
+| decode (this box, disk 1.5-3.6GB/s after long sweeps) | 4.5-7s/token | fetch-bound |
+| IO floor | 1.23s/token = 0.81 tok/s | arithmetic in docs/lower_bounds.md |
+| prefill, 8 tokens, warm | ~4s (disk-dependent) | |
+| prefill, 63 tokens | 136s (chunk=1 path, correct) | chunk>5 has a numeric bug |
+| process start | ~13s (13GB pinned slab) | one-off |
 
-chunk=8: 165s / 21 tokens (safe, peak 7.7GB). chunk=16: 63s (peak 9.5GB, brief
-paging). chunk=32: 64s (peak 10.9GB, decodes slower afterwards). Default stays 8.
+The disk volume measured 4.5GB/s at the start of this work and 1.5-3.6GB/s after
+hours of repeated checkpoint sweeps, so absolute tok/s tracks the current disk rate,
+not code changes. The IO arithmetic in docs/lower_bounds.md is the invariant.
 
-## IO
+## Numerics (authority: DeepInfer, the model author's stack)
 
-Disk reads are at the device ceiling: 18.8MB blobs measure 7.3GB/s at QD=8 (the
-device saturates at eight outstanding 9.4MB requests; QD=32 is slower). Contiguous
-18.8MB blocks measure no faster than the real scattered 1.1MB+17.7MB pairs (6.85 vs
-7.16GB/s), so re-laying-out the checkpoint would buy nothing.
+| component | max relative difference |
+| --- | --- |
+| window-layer attention | 0.000000 |
+| fp4 expert FFN | 0.000000 |
+| gate (weights + indices) | 0.000000 |
+| hyper-connection ops | 0.000000 |
+| RoPE vs DeepInfer | 9.7e-06 |
+| compressed layers | 0.87% / 1.42% |
+| fused rope+quant kernel | 0.000000 (bit-exact) |
 
-Layer H2D (15GB/token at 34 streamed layers) is fully hidden: 7-23ms of wait per
-token with the triple buffer.
+## Known open items
 
-## Open items, in order of expected gain
+1. **One-shot T>1 forward vs token-by-token** differs (a synthetic MoE batch of 8 rows
+   vs eight single-row calls: ~26% on layer 0). Routing, activation quantisation and the
+   per-expert kernels each verify exact in isolation, so the accumulation is suspect.
+   `generate()` only reads the last position of a causal prefill, so answers are
+   unaffected; the speculative verify pass and chunked prefill are.
+2. **Session drift**: a second prefill in the same session moves logits by >1. Some
+   state survives reset; the caches checked so far are not it.
+3. **MTP** loads and seeds, acceptance 0.12, but output degenerates because item 1
+   breaks its verify pass.
+4. **Compressed-layer parity** (0.87%) is the largest numeric residual and the leading
+   candidate for item 1.
 
-1. **The per-layer routing sync.** Every layer must tell the host which experts to
-   read, which is a hard sync. Only a batch (or an all-GPU expert set) removes it.
-2. **Speculative decode.** Draft top-1 now matches the main argmax 60-75% of the
-   time, but accept is 25% at draft_len=4. Official DFlash reports 60-80%. With 2
-   resident layers the economics do not close.
-3. **MTP with 6 resident layers** needs 1.5GB of VRAM that is not there. Dropping the
-   third flat buffer or the expert slots would free it, at a measured cost of
-   +0.5-0.8s/token.
-4. **Official kernels.** DeepGEMM targets SM90/SM100 and is batch-shaped (one CTA per
-   token, split-K across SMs); at T=1 its fused mHC collapses to a single CTA and
-   loses to the torch path (0.04ms). The reference/official tilelang kernels we
-   already call are the official ones for this shape.
+## What the output looks like
+
+The checkpoint is a **base (pre-SFT) model** with no chat template: its own top-1 for
+'The capital of France is' is '#' (13.25) over 'Paris' (12.5), so templated
+continuations are its behaviour, not an engine defect (docs/analysis.md).

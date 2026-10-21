@@ -62,6 +62,9 @@ def test_compressor_prefill():
     groups = kv.unflatten(1, (-1, 2))
     gsc = sc.unflatten(1, (-1, 2))
     ref = (groups * gsc.softmax(dim=2)).sum(dim=2)
+    # the reference implementation rounds the pooled latent to the model dtype before
+    # the norm (self.norm(kv.to(dtype))); the compressor does the same
+    ref = ref.to(torch.bfloat16).float()
     ref = ref * torch.rsqrt(ref.pow(2).mean(-1, keepdim=True) + cfg.rms_norm_eps) * comp.norm_w
     assert torch.allclose(out.float(), ref, atol=1e-2)
     print("compressor prefill ok")

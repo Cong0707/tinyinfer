@@ -98,14 +98,22 @@ class MTPAttention(MLAWindowAttention):
         win = self.window
         rd = self.rope_dim
         n_main = main_x.size(1)
-        main_pos0 = start_pos - n_main  # main tokens occupy [start_pos-n_main, start_pos)
+        # main_x carries the target-layer hiddens of the previous token(s); the draft
+        # block's own positions start at start_pos, so the main window ends right before
+        # it. At prefill (start_pos == 0) the main tokens ARE positions 0..n_main-1.
+        if start_pos == 0:
+            main_pos0 = 0
+            main_end = n_main
+        else:
+            main_pos0 = max(0, start_pos - n_main)
+            main_end = start_pos
 
         def _lin(w, x_):
             return w.forward(x_) if hasattr(w, "forward") else F.linear(x_, w)
 
         # official update_main_cache: main_k = main_kv_proj(main_hiddens) then kv_norm + rope
         main_kv = rms_norm(_lin(self.wkv, main_x), self.kv_norm, self.eps)  # [1, n_main, head_dim]
-        apply_rope(main_kv[..., -rd:], self.freqs_cis[main_pos0:start_pos])
+        apply_rope(main_kv[..., -rd:], self.freqs_cis[main_pos0:main_end])
         hist = self._kv_window
         if hist is None or hist.shape[0] != b or hist.device != main_kv.device:
             hist = main_kv.new_empty(b, 0, self.head_dim)
@@ -231,10 +239,17 @@ class MTPBlock:
         """
         if self.embed is None:
             raise RuntimeError("MTPBlock.embed is not set; Engine.load_mtp must inject the main embedding")
-        draft_ids = golden_tokens.new_full([golden_tokens.size(0), self.block_size],
-                                           self.cfg.dspark_noise_token_id)
-        draft_ids[:, 0] = golden_tokens
+        # The embedding table may live on the host (embed_on_cpu on a small card); the
+        # token ids arrive on the device, so gather where the table is and move the
+        # single row back. The draft blocks themselves always run on the device.
+        out_device = golden_tokens.device
+        table_device = self.embed.device if isinstance(self.embed, torch.Tensor) else out_device
+        ids = golden_tokens if golden_tokens.device == table_device else golden_tokens.to(table_device)
+        draft_ids = ids.new_full([ids.size(0), self.block_size], self.cfg.dspark_noise_token_id)
+        draft_ids[:, 0] = ids[:, 0]
         emb = F.embedding(draft_ids, self.embed)
+        if emb.device != out_device:
+            emb = emb.to(out_device)
         return emb.unsqueeze(2).repeat(1, 1, self.cfg.hc_mult, 1)
 
     # -- official DFlashDecoderLayer.forward_drafts (+ HC part of DFlash.forward_drafts)

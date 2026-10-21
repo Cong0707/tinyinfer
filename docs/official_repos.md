@@ -68,3 +68,45 @@ prompt instead of guessing.
 
 Already the porting source for the model math (attention, compressor, indexer, MoE,
 MTP/DFlash).
+
+## TileKernels (deepseek-ai/TileKernels) — official TileLang kernel library
+
+Cloned to `repositories/TileKernels`. This is the closest thing to "our" kernel
+library: every kernel is written in TileLang, the same DSL tinyinfer already uses for
+`sparse_attn`, `act_quant`, `fp4_gemm` and the fp8/fp4 GEMVs, and it covers exactly the
+segments this model is made of.
+
+| module | kernels | tinyinfer mapping |
+| --- | --- | --- |
+| `mhc/` | `pre_big_fuse` (reduce split-K partials -> RMSNorm -> sigmoid mixes -> Sinkhorn -> apply mix, ONE kernel), `post`, `pre_split_mixes`, `sinkhorn`, `norm_fn`, `head_compute_mix`, `multilayer_recompute`, `expand` | `hc.py` (torch ops today), `reference/official/kernel.py::hc_split_sinkhorn` |
+| `moe/` | `moe_topk_gate_forward` (sqrt-softplus + bias + top-k + normalize + shared-expert splice, one kernel), `topk_gate`, `normalize_weight` | `moe.Gate.forward` (7 torch ops + a host sync) |
+| `quant/` | `per_token_cast`, `per_block_cast` (fp4 e2m1, 32x32), `per_channel_cast`, `cast_back`, `swiglu_forward_and_per_token_cast`, `norm_forward_and_per_token_cast` | `gemm.act_quant`, `gemm.fp4_act_quant`, `moe` SwiGLU |
+| `transform/` | RoPE | `nn.apply_rope` |
+| `engram/` | `engram_hash`, `engram_gate_fwd/bwd`, `engram_fused_weight`, `engram_sinkhorn` | `engram.py` |
+
+**Vendored subset** (copied into `tinyinfer/src/tile_kernels/`, not installed from PyPI,
+per the "port it into the engine" rule): `config.py`, `utils.py`, `moe/{topk_gate,
+moe_topk_gate_forward, normalize_weight, sqrt_softplus}`, `mhc/{post, pre_big_fuse}`,
+`quant/{per_block_cast, swiglu_forward, common, types, rstd}`. The package `__init__`
+is trimmed, because the upstream one imports a `torch.compile` reference library that
+this venv cannot build (no `functorch`).
+
+**SM120 status (measured on the RTX 5060, tilelang 0.1.15, torch 2.9):**
+
+* `topk_gate`, `mhc_post_fwd` — compile and match the torch reference.
+  `mhc_post_fwd` semantic: `out[j] = post[j]*x + sum_i comb[i,j]*residual[i]`
+  (the comb matrix is used transposed) — 41us/call at T=1.
+* `T.gemm` **works** for bf16 (rel err 3.4e-3 on 8x2304x5120) — this is the route to
+  real tensor-core prefill kernels on SM120.
+* `T.gemm` with `float8_e4m3fn` compiles but the *call* fails in torch's DLPack bridge
+  (`Unsupported code 10`): that is a torch 2.9/tvm-ffi dtype gap, not an SM120 limit.
+  Workaround to try next: pass the tensor as `uint8` and reinterpret inside the kernel.
+* `per_block_cast` insists on `num_tokens % 128 == 0`, i.e. it is shaped for
+  prefill/training; decode (T=1) would have to pad.
+
+Also cloned/read: **FlashMLA** (`v41_h64/h128` decode+prefill sparse kernels, CUTLASS
+SM100 only — algorithms readable, not portable), **DeepSelect** (TopK selection for the
+DSA indexer + sampler, CUDA SM90/SM100), **DeepJIT** (header-only C++20 JIT runtime:
+source/include hashing, atomic-rename disk cache, shared multi-user cache roots — good
+*cache-key discipline* to copy, but it is C++/Linux and we compile with tilelang
+instead), **deepseek-harness** (this agent shell).

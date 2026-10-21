@@ -765,15 +765,90 @@ class ShardIndex:
 
     INDEX_FILE = "model.safetensors.index.json"
 
-    def __init__(self, model_dir: str | Path):
-        self.model_dir = Path(model_dir)
-        index = json.loads((self.model_dir / self.INDEX_FILE).read_text(encoding="utf-8"))
-        self.weight_map: dict[str, str] = index["weight_map"]
-        self.total_bytes: int = int(index.get("metadata", {}).get("total_size", 0))
+    def __init__(self, model_dir, *, require_identical: bool = True):
+        """Index one checkpoint that may be SPLIT ACROSS SEVERAL DIRECTORIES/DISKS.
+
+        Passing a list (or a ';'/',' separated string) lets the same model live as
+        shards spread over multiple drives, which multiplies streaming bandwidth. The
+        sources are required to describe the same model: every directory that carries
+        an index must agree tensor-for-tensor on the weight_map, and a shard present in
+        more than one place must have the same size. A mismatch raises instead of
+        silently mixing two checkpoints.
+        """
+        raw = ([model_dir] if isinstance(model_dir, (str, Path))
+               else [p for chunk in model_dir for p in str(chunk).split(";")])
+        dirs: list[Path] = []
+        for entry in raw:
+            for part in str(entry).split(","):
+                part = part.strip().strip('"')
+                if not part:
+                    continue
+                p = Path(part)
+                if p.exists() and p not in dirs:
+                    dirs.append(p)
+        if not dirs:
+            raise FileNotFoundError(f"no model directory exists among {raw!r}")
+        self.model_dirs = dirs
+        self.model_dir = dirs[0]          # primary: config/tokenizer live here
+        indexes: list[tuple[Path, dict[str, str]]] = []
+        for d in dirs:
+            p = d / self.INDEX_FILE
+            if p.is_file():
+                indexes.append((d, json.loads(p.read_text(encoding="utf-8"))["weight_map"]))
+        if not indexes:
+            raise FileNotFoundError(f"{self.INDEX_FILE} not found under any of {[str(d) for d in dirs]}")
+        base_dir, base_map = indexes[0]
+        for d, m in indexes[1:]:
+            if m == base_map:
+                continue
+            diff = sorted(k for k in set(base_map) | set(m) if base_map.get(k) != m.get(k))
+            if require_identical:
+                sample = diff[0] if diff else "<unknown>"
+                raise ValueError(
+                    "model sources are not the same checkpoint: "
+                    f"{len(diff)} tensors differ, e.g. {sample} -> "
+                    f"{base_map.get(sample)} in {base_dir} vs {m.get(sample)} in {d}"
+                )
+        self.weight_map: dict[str, str] = base_map
+        self.total_bytes = int(indexes[0][1].get("metadata", {}).get("total_size", 0)) if False else 0
+        # resolve every shard to the first directory that has it, and refuse when two
+        # copies of the same shard disagree in size (same name, different bytes)
+        self._shard_dir: dict[str, Path] = {}
+        shards = sorted(set(base_map.values()))
+        for shard in shards:
+            found: list[tuple[Path, int]] = []
+            for d in dirs:
+                f = d / shard
+                if f.is_file():
+                    found.append((d, f.stat().st_size))
+            if not found:
+                raise FileNotFoundError(f"shard {shard} is missing from every source {[str(d) for d in dirs]}")
+            sizes = {sz for _d, sz in found}
+            if len(sizes) > 1 and require_identical:
+                where = ", ".join(f"{d}={sz}" for d, sz in found)
+                raise ValueError(f"shard {shard} differs between sources ({where}): "
+                                 "refusing to mix two checkpoints")
+            self._shard_dir[shard] = found[0][0]
+        # Every directory given must actually contribute shards. A stray path (a typo,
+        # or the wrong drive) would otherwise be accepted silently and the user would
+        # believe the model is striped across disks when it is not.
+        contributed = {d for d in self._shard_dir.values()}
+        idle = [d for d in dirs if d not in contributed]
+        if idle and len(dirs) > 1 and require_identical:
+            raise ValueError(
+                "these model directories supplied no shards: "
+                + ", ".join(str(d) for d in idle)
+                + " (a source must either provide an index that matches the others "
+                  "or hold shards the others do not have)"
+            )
         self._headers: dict[str, dict[str, Any]] = {}
         self._data_start: dict[str, int] = {}
         self._blob_cache: dict[tuple[int, int], ExpertBlob] = {}
         self._lock = threading.Lock()
+
+    def shard_path(self, shard: str) -> Path:
+        d = self._shard_dir.get(shard)
+        return (d / shard) if d is not None else (self.model_dir / shard)
 
     def _header(self, shard: str) -> dict[str, Any]:
         header = self._headers.get(shard)
@@ -783,7 +858,7 @@ class ShardIndex:
             header = self._headers.get(shard)
             if header is not None:
                 return header
-            with (self.model_dir / shard).open("rb") as f:
+            with self.shard_path(shard).open("rb") as f:
                 prefix = f.read(8)
                 if len(prefix) != 8:
                     raise ValueError(f"truncated safetensors header: {shard}")
@@ -993,7 +1068,7 @@ class ShardReader:
             files = self._local.files = {}
         f = files.get(shard)
         if f is None:
-            f = files[shard] = (self.index.model_dir / shard).open("rb", buffering=0)
+            f = files[shard] = self.index.shard_path(shard).open("rb", buffering=0)
         return f
 
     def _direct_reader(self) -> _WindowsDirect:
@@ -1017,7 +1092,7 @@ class ShardReader:
                 continue
             d = seg.dest_offset + offset
             if self.direct and os.name == "nt":
-                self._direct_reader().read(str(self.index.model_dir / seg.shard),
+                self._direct_reader().read(str(self.index.shard_path(seg.shard)),
                                            seg.file_offset, n, view[d:d + n])
             else:
                 f = self._file(seg.shard)
@@ -1055,19 +1130,30 @@ class ShardReader:
         if not blobs:
             return []
 
-        def one(blob: ExpertBlob) -> "torch.Tensor":
+        def one(blob: ExpertBlob, ex: ThreadPoolExecutor | None) -> "torch.Tensor":
             buf = torch.empty(blob.total_bytes, dtype=torch.uint8, pin_memory=True)
-            self.read_into(blob.segments, buf.numpy())
+            segs = list(blob.segments)
+            if ex is None or len(segs) <= 1:
+                self.read_into(segs, buf.numpy())
+                return buf
+            # One task per segment. An expert blob is a small scale span plus the big
+            # weight span, hundreds of MB to GB apart in the shard; reading them in a
+            # row keeps QD at (#experts) instead of (#segments), which measured
+            # 3.1GB/s against 7.4GB/s for the fully parallel form.
+            view = buf.numpy()
+            futures = [ex.submit(self.read_into, [seg], view) for seg in segs]
+            for f in futures:
+                f.result()
             return buf
 
         workers = max_workers or min(self.threads, len(blobs))
         if workers <= 1 or len(blobs) == 1:
-            return [one(b) for b in blobs]
+            return [one(b, None) for b in blobs]
         executor = self._executor
         if executor is None:
-            executor = self._executor = ThreadPoolExecutor(max_workers=self.threads,
+            executor = self._executor = ThreadPoolExecutor(max_workers=max(self.threads, 2 * len(blobs)),
                                                            thread_name_prefix="tinyinfer-io")
-        return [f.result() for f in [executor.submit(one, b) for b in blobs]]
+        return [f.result() for f in [executor.submit(one, b, executor) for b in blobs]]
 
     def read_many(self, blobs: Sequence[ExpertBlob], max_workers: int | None = None) -> list[bytearray]:
         if not blobs:
@@ -1204,7 +1290,9 @@ class ARCPolicy(_Policy):
         else:
             self.t1[key] = None
         while len(self.t1) + len(self.t2) > self.capacity:
-            victim = self.evict_one(lambda k: False)
+            # keep the same layer affinity here: this is the other eviction site ARC
+            # uses on insert, and leaving it global re-introduced cross-layer flushing
+            victim = self.evict_one(lambda k: False, prefer_layer=key[0])
             if victim is None:
                 break
 
@@ -1212,7 +1300,20 @@ class ARCPolicy(_Policy):
         self.t1.pop(key, None)
         self.t2.pop(key, None)
 
-    def evict_one(self, is_pinned):
+    def evict_one(self, is_pinned, prefer_layer=None):
+        # Layer-affine victim first: the routing working set is per layer (each layer has
+        # its own ~384 experts), so a global LRU turns every layer into a scan that
+        # flushes the others. Measured 21.5% hit rate globally vs 48% for a per-layer
+        # cache of the same size, which is the difference between 1.1s and 0.5s of disk
+        # per token. The global ARC order still decides which layer-agnostic key goes.
+        if prefer_layer is not None:
+            for src, ghost in ((self.t1, self.b1), (self.t2, self.b2)):
+                victim = next((k for k in src if k[0] == prefer_layer and not is_pinned(k)), None)
+                if victim is not None:
+                    src.pop(victim)
+                    ghost[victim] = None
+                    self._trim_ghost()
+                    return victim
         # linear scan for the first un-pinned key; no full-dict copies (O(n) lists)
         # inside the cache lock -- misses hit this path on every insert
         if self.t1 and len(self.t1) > self.p:
@@ -1380,6 +1481,7 @@ class ExpertCache:
         *,
         max_pinned_bytes: int | None = None,
         executor_threads: int | None = None,
+        pin_budget_bytes: int | None = None,
     ):
         self.index = index
         self.reader = reader
@@ -1394,6 +1496,22 @@ class ExpertCache:
         self._freq: dict[tuple[int, int], int] = defaultdict(int)
         self._lock = threading.RLock()
         self._stats = CacheStats()
+        # Pinned host budget for cached blobs. Every cached expert that is pinned can be
+        # fed to the GPU as a direct async DMA; pageable ones serialise through the one
+        # staging buffer. Pinning the whole cache (12GB) plus the layer slab (16GB) took
+        # the box past its free RAM and crashed, so the budget is explicit.
+        self.pin_budget = int(pin_budget_bytes) if pin_budget_bytes else 0
+        self._pinned_bytes = 0
+        # Pre-touch a pool of pinned blobs. Reading into a freshly cudaHostAlloc'd
+        # 18.8MB block pays first-touch page faults (14ms in-engine vs 3.2ms for an
+        # already-touched block); the pool is filled once, up front, so steady-state
+        # misses reuse warm memory instead of faulting.
+        self._pin_pool_size = 0
+        # Recycled pinned buffers. Reading into a freshly cudaHostAlloc'd 18.8MB buffer
+        # pays page faults on first touch: measured 14ms per expert in-engine against
+        # 3.2ms for the identical read into an already-touched buffer (5.95GB/s). A
+        # free list of evicted pinned blobs removes that cost entirely.
+        self._pin_free: list[Any] = []
         self._executor = ThreadPoolExecutor(max_workers=executor_threads or reader.threads,
                                             thread_name_prefix="tinyinfer-prefetch")
         self._closed = False
@@ -1408,14 +1526,25 @@ class ExpertCache:
     def _is_pinned(self, key: tuple[int, int]) -> bool:
         return key in self._pinned
 
-    def _evict_locked(self) -> bool:
-        victim = self.policy.evict_one(self._is_pinned)
+    def _evict_locked(self, prefer_layer: int | None = None) -> bool:
+        if prefer_layer is not None and getattr(self.policy, "name", "") == "arc":
+            victim = self.policy.evict_one(self._is_pinned, prefer_layer)
+        else:
+            victim = self.policy.evict_one(self._is_pinned)
         if victim is None:
             return False
-        self._entries.pop(victim, None)
+        data = self._entries.pop(victim, None)
         self._refs.pop(victim, None)
         self._freq.pop(victim, None)
         self._stats.evictions += 1
+        if data is not None:
+            try:
+                if getattr(data, "is_pinned", None) and data.is_pinned():
+                    self._pinned_bytes = max(0, self._pinned_bytes - self.blob_bytes)
+                    if len(self._pin_free) < max(8, self.capacity_entries // 4):
+                        self._pin_free.append(data)
+            except Exception:
+                pass
         return True
 
     def _insert_locked(self, key: tuple[int, int], data: bytearray, *,
@@ -1428,13 +1557,77 @@ class ExpertCache:
         if not admit:
             return  # prefill streaming: read once, keep the cache for decode/hot experts
         while len(self._entries) >= self.capacity_entries:
-            if not self._evict_locked():
+            if not self._evict_locked(prefer_layer=key[0]):
                 break
         self._entries[key] = data
+        try:
+            if getattr(data, "is_pinned", None) and data.is_pinned():
+                self._pinned_bytes += self.blob_bytes
+        except Exception:
+            pass
         self.policy.on_insert(key)
         if pinned:
             self.pin(key)
         self._stats.loads += 1
+
+    def _can_pin(self, nbytes: int) -> bool:
+        return self.pin_budget <= 0 or (self._pinned_bytes + nbytes) <= self.pin_budget
+
+    def _fill_pin_pool(self) -> None:
+        """Allocate the reusable pinned pool once (bounded by the pinned budget)."""
+        if self._pin_pool_size:
+            return
+        target = min(max(8, self.capacity_entries // 2), 256)
+        self._pin_pool_size = 1
+        try:
+            import torch
+
+            for _ in range(target):
+                if self.pin_budget and (self._pinned_bytes + self.blob_bytes) > self.pin_budget:
+                    break
+                self._pin_free.append(torch.empty(self.blob_bytes, dtype=torch.uint8,
+                                                  pin_memory=True))
+                self._pinned_bytes += self.blob_bytes
+        except Exception:
+            pass
+
+    def _take_pinned(self, nbytes: int):
+        """A recycled pinned buffer of at least nbytes, or None."""
+        if not self._pin_pool_size:
+            self._fill_pin_pool()
+        while self._pin_free:
+            buf = self._pin_free.pop()
+            try:
+                if int(buf.numel()) >= int(nbytes):
+                    return buf[:nbytes]
+            except Exception:
+                continue
+        return None
+
+    def _read_pinned(self, blob: ExpertBlob):
+        """Read a blob straight into pinned host memory.
+
+        Pageable bytes serialise every H2D through the single 18.8MB staging buffer
+        (one synchronous 18.8MB memcpy per expert under a lock: measured ~11ms per
+        layer of pure stall). A pinned source is a direct async DMA at 26.5GB/s.
+        Falls back to a pageable bytearray if the pinned pool refuses the allocation.
+        """
+        if not self._can_pin(blob.total_bytes):
+            return self.reader.read_blob(blob)
+        buf = self._take_pinned(blob.total_bytes)
+        reuse = buf is not None
+        try:
+            if buf is None:
+                import torch
+
+                buf = torch.empty(blob.total_bytes, dtype=torch.uint8, pin_memory=True)
+                self._pinned_bytes += int(blob.total_bytes)
+            self.reader.read_into(blob.segments, buf.numpy())
+            return buf
+        except Exception:
+            if reuse:
+                self._pin_free.append(buf)
+            return self.reader.read_blob(blob)
 
     def get(self, layer: int, expert: int, *, blocking: bool = True,
             admit: bool = True) -> bytearray | None:
@@ -1450,7 +1643,7 @@ class ExpertCache:
             return None
         blob = self.index.expert_blob(layer, expert)
         started = time.perf_counter()
-        data = self.reader.read_blob(blob)
+        data = self._read_pinned(blob)
         with self._lock:
             self._stats.misses += 1
             self._stats.disk_reads += 1
@@ -1471,7 +1664,7 @@ class ExpertCache:
                     if key in self._entries:
                         continue
                 blob = self.index.expert_blob(layer, expert)
-                data = self.reader.read_blob(blob)
+                data = self._read_pinned(blob)
                 with self._lock:
                     if key not in self._entries:
                         self._stats.disk_reads += 1
@@ -1567,7 +1760,8 @@ class VramSlotCache:
     _NAMES = {0: "free", 1: "reserved", 2: "copying", 3: "staged", 4: "in_use"}
 
     def __init__(self, slots: int, blob_bytes: int, device: str = "cuda",
-                 dtype: Any = None, pin_staging: bool = True):
+                 dtype: Any = None, pin_staging: bool = True, slot_arena: bool = False):
+        self.slot_arena = bool(slot_arena)
         self.slots = max(0, int(slots))
         self.blob_bytes = int(blob_bytes)
         self.device = device
@@ -1601,7 +1795,23 @@ class VramSlotCache:
         self._torch = torch
         dtype = self._dtype or torch.uint8
         dev = torch.device(self.device)
-        self._buffers = [torch.empty(self.blob_bytes, dtype=dtype, device=dev) for _ in range(self.slots)]
+        try:
+            if self.slot_arena:
+                # One arena, sliced into slots: a single CUDA allocation instead of one
+                # per slot, and contiguous addresses so a batch of experts can later be
+                # run by one kernel (Flare's grouped MoE relies on the same contiguity).
+                self._arena = torch.empty((self.slots, self.blob_bytes), dtype=dtype, device=dev)
+                self._buffers = [self._arena[i] for i in range(self.slots)]
+            else:
+                self._arena = None
+                self._buffers = [torch.empty(self.blob_bytes, dtype=dtype, device=dev)
+                                 for _ in range(self.slots)]
+        except Exception:
+            # never let the staging pool be the allocation that takes the run down:
+            # without it experts are served straight from host memory (slower, correct)
+            self._buffers = []
+            self.slots = 0
+            return
         if self.pin_staging and dev.type == "cuda":
             self._staging = torch.empty(self.blob_bytes, dtype=dtype, pin_memory=True)
             self._staging_b = torch.empty(self.blob_bytes, dtype=dtype, pin_memory=True)
@@ -1629,8 +1839,17 @@ class VramSlotCache:
         # them through one 18.8MB host memcpy (measured 18ms/layer). Pageable sources
         # cannot be async, so they copy synchronously.
         if cpu.is_pinned():
-            buf.copy_(cpu, non_blocking=True)
-            return None
+            if self._copy_stream is None:
+                buf.copy_(cpu, non_blocking=True)
+                return None
+            # Copy on the dedicated copy stream. A pinned H2D queued on the compute
+            # stream makes every later host sync (the per-layer routing bincount) wait
+            # for the whole 18.8MB transfer: measured 12.7ms/layer of pure stall.
+            ev = event if event is not None else torch.cuda.Event()
+            with torch.cuda.stream(self._copy_stream):
+                buf.copy_(cpu, non_blocking=True)
+                ev.record(self._copy_stream)
+            return ev
         if staging is None or self._copy_stream is None:
             buf.copy_(cpu, non_blocking=False)
             return None
@@ -1782,6 +2001,10 @@ class VramSlotCache:
                 self._state[slot] = self.STAGED
             self._cond.notify_all()
 
+    def event(self, slot: int):
+        """The DMA event for a slot (None once its data is resident)."""
+        return self._event[slot]
+
     def wait_event(self, slot: int) -> None:
         ev = self._event[slot]
         if ev is not None:
@@ -1843,13 +2066,18 @@ _DTYPES = {"I8": "int8", "U8": "uint8", "F8_E4M3": "float8_e4m3fn",
 class ExpertRecord:
     """One materialized expert; tensor(name) returns a zero-copy view."""
 
-    __slots__ = ("key", "buffer", "tensors", "device")
+    __slots__ = ("key", "buffer", "tensors", "device", "event")
 
-    def __init__(self, key: tuple[int, int], buffer: Any, tensors: Mapping[str, TensorSlot], device: str):
+    def __init__(self, key: tuple[int, int], buffer: Any, tensors: Mapping[str, TensorSlot],
+                 device: str, event: Any = None):
         self.key = key
         self.buffer = buffer  # torch.uint8 tensor (CPU or CUDA) or bytearray
         self.tensors = tensors
         self.device = device
+        # Pending H2D for this slot, to be waited on right before the tiles are read.
+        # fetch() never waits itself: a wait queued on the compute stream here made the
+        # next routing bincount stall on the whole transfer (12.7ms per layer).
+        self.event = event
 
     def tensor(self, name: str):
         import torch
@@ -1896,12 +2124,29 @@ class ExpertStore:
         direct: bool = False,
         max_pinned_bytes: int | None = None,
         index: ShardIndex | None = None,
+        slot_arena: bool = False,
     ):
         self.index = index or ShardIndex(model_dir)
         self.reader = ShardReader(self.index, threads=reader_threads, direct=direct)
+        # per-expert access counts: a chat workload revisits a small set of experts and
+        # pinning them (hot_prefetch) turns later reads into RAM hits
+        import collections as _collections
+        self._freq: _collections.Counter = _collections.Counter()
+        # PIN_FRACTION of the expert cache stays pinned: pinned blobs are the only ones
+        # that become a direct async DMA instead of a serialised staging memcpy, but the
+        # layer slab already holds ~16GB on an 8GB/V47GB box, so pinning all of a 12GB
+        # cache pushed the machine over its free RAM and crashed.
+        if max_pinned_bytes is None:
+            from .budget import budget as _hb
+            # Pinned blobs skip the staging memcpy; they also take RAM the layer slab
+            # wants. Take whatever the host budget allows (0 = all pageable, still
+            # correct, just slower), never a per-machine constant.
+            max_pinned_bytes = _hb().grant(int(cache_bytes * 0.5))
         self.ram = ExpertCache(self.index, self.reader, cache_bytes, policy,
-                               max_pinned_bytes=max_pinned_bytes)
-        self.slots = VramSlotCache(vram_slots, self.index.expert_blob_bytes(), device=device) if vram_slots else None
+                               max_pinned_bytes=max_pinned_bytes,
+                               pin_budget_bytes=max_pinned_bytes)
+        self.slots = (VramSlotCache(vram_slots, self.index.expert_blob_bytes(), device=device,
+                                    slot_arena=slot_arena) if vram_slots else None)
         self.device = device
         self._open: dict[tuple[int, int], int] = defaultdict(int)
         self._stream_reads = 0
@@ -1921,9 +2166,15 @@ class ExpertStore:
         return cls(model_dir, index=index, **kwargs)
 
     def _materialize(self, layer: int, expert: int, *, cache: bool = True,
-                     slot: int | None = None, ready: bool = False) -> ExpertRecord:
+                     slot: int | None = None, ready: bool = False,
+                     data: Any = None) -> ExpertRecord:
         blob = self.index.expert_blob(layer, expert)
-        if cache:
+        if data is not None:
+            # the batch read already produced these bytes; looking them up in the RAM
+            # cache again used to miss after the ARC eviction that the admit itself
+            # caused, so the same 18.8MB blob was read twice (81 read_blob/step)
+            pass
+        elif cache:
             data = self.ram.get(layer, expert)
         else:
             # prefill streams each expert once per layer; do not evict the
@@ -1939,14 +2190,15 @@ class ExpertStore:
         if slot < 0:  # no VRAM slot available: serve straight from the RAM cache
             return ExpertRecord((layer, expert), data, blob.tensors, "cpu")
         if ready:
-            self.slots.wait_event(slot)  # compute stream waits for the prefetch DMA
-        else:
-            ev = self.slots.copy_in(slot, data)
-            self.slots.publish(slot, ev)
-            # copy_in is a non_blocking H2D on the copy stream; the compute stream must
-            # wait for it or the first expert tiles read garbage
-            self.slots.wait_event(slot)
-        return ExpertRecord((layer, expert), self.slots.buffer(slot), blob.tensors, self.device)
+            # a prefetch already owns this slot: hand its event to the caller
+            return ExpertRecord((layer, expert), self.slots.buffer(slot), blob.tensors,
+                                self.device, self.slots.event(slot))
+        ev = self.slots.copy_in(slot, data)
+        self.slots.publish(slot, ev)
+        # copy_in is a non_blocking DMA on the copy stream. The compute stream has to
+        # wait for it before reading the tiles, but only right before the read: doing it
+        # here serialised the next layer's routing sync behind the transfer.
+        return ExpertRecord((layer, expert), self.slots.buffer(slot), blob.tensors, self.device, ev)
 
     def _iocp_reader(self):
         if getattr(self, "_iocp", None) is None:
@@ -1981,6 +2233,42 @@ class ExpertStore:
             out.append(buf)
         return out
 
+    def _pin_cap(self) -> int:
+        """Pinned bytes admitted to the RAM cache (TI_PIN_CACHE_GB overrides)."""
+        cap = getattr(self, "_pin_cap_bytes", None)
+        if cap is None:
+            env = __import__("os").environ.get("TI_PIN_CACHE_GB")
+            if env:
+                cap = int(float(env) * (1 << 30))
+            else:
+                cap = int(self.ram.capacity_entries * self.ram.blob_bytes * 0.8)
+            self._pin_cap_bytes = cap
+        return cap
+
+    def hot_experts(self, n: int = 256) -> list[tuple[int, int]]:
+        """Most requested (layer, expert) pairs so far -- the ones worth pinning."""
+        return [k for k, _ in self._freq.most_common(n)]
+
+    def hot_prefetch(self, n: int = 256) -> int:
+        """Read the hottest experts into RAM ahead of the next token.
+
+        Called between requests (never inside a decode step, where the extra IO would
+        only compete with the current fetch). Returns the number of distinct pairs read.
+        """
+        hot = self.hot_experts(n)
+        by_layer: dict[int, list[int]] = {}
+        for layer, expert in hot:
+            by_layer.setdefault(layer, []).append(expert)
+        read = 0
+        for layer, experts in by_layer.items():
+            try:
+                recs = self.fetch(layer, experts, cache=True)
+            except Exception:
+                continue
+            self.release(recs)
+            read += len(recs)
+        return read
+
     def fetch(self, layer: int, experts: Iterable[int], *, cache: bool = True) -> list[ExpertRecord]:
         import time as _t
         _t0 = _t.perf_counter()
@@ -1992,6 +2280,10 @@ class ExpertStore:
 
     def _fetch_inner(self, layer: int, experts: Iterable[int], *, cache: bool = True) -> list[ExpertRecord]:
         experts = [int(e) for e in experts]
+        for _e in experts:
+            self._freq[(int(layer), _e)] += 1
+        blobs: list[Any] = []
+        datas: list[Any] | None = None
         # batch the disk misses through read_many (parallel pread, lock-free), then
         # materialise sequentially so the slot state machine stays single-threaded
         if len(experts) > 1:
@@ -2030,7 +2322,10 @@ class ExpertStore:
                         pin_cache = __import__("os").environ.get("TI_PIN_CACHE", "1") == "1"
                         if pin_cache:
                             self._pinned_cache_bytes = getattr(self, "_pinned_cache_bytes", 0)
-                            if self._pinned_cache_bytes < (4 << 30):
+                            # keep most of the RAM cache pinned: only a pinned source can be
+                            # an async DMA (26.5GB/s); pageable blobs serialise through the
+                            # single 18.8MB staging buffer and cap H2D at ~8.9GB/s
+                            if self._pinned_cache_bytes < self._pin_cap():
                                 self._pinned_cache_bytes += int(d.numel())
                                 self.ram.admit(layer, b.key[1], d)
                                 continue
@@ -2042,13 +2337,16 @@ class ExpertStore:
         acquired = None
         if self.slots is not None and self.slots.slots > 0 and len(experts) > 1 and cache:
             acquired = self.slots.acquire_many(layer, experts)
+        by_expert = {b.key[1]: d for b, d in zip(blobs, datas)} if blobs and datas else {}
         records = []
         for i, expert in enumerate(experts):
+            have = by_expert.get(expert)
             if acquired is not None and acquired[i] is not None:
                 slot, ready = acquired[i]
-                records.append(self._materialize(layer, expert, cache=cache, slot=slot, ready=ready))
+                records.append(self._materialize(layer, expert, cache=cache, slot=slot,
+                                                 ready=ready, data=have))
             else:
-                records.append(self._materialize(layer, expert, cache=cache))
+                records.append(self._materialize(layer, expert, cache=cache, data=have))
             with self._lock:
                 self._open[(layer, expert)] += 1
         return records

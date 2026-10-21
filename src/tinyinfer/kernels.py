@@ -119,8 +119,23 @@ def sparse_attn_tl(q, kv, attn_sink, topk_idxs, scale: float, h_chunk: int = 16,
 
 
 def sparse_attn_dispatch(q, kv, attn_sink, topk_idxs, scale: float, prefer_tilelang: bool = True):
-    """Try the tilelang kernel once, fall back to the reference implementation on any failure."""
+    """Official sparse_attn first (tilelang kernel.py), then our kernel, then torch.
+
+    Levels 0-2 must produce the same numbers as the reference implementation, so the
+    official kernel -- the one the checkpoint was validated against -- is the default
+    path. Our own kernel and the pure-torch reference remain as fallbacks.
+    """
     global _TL_STATE
+    try:
+        from .official_kernel_ref import sparse_attn as _official_sparse_attn
+
+        # the official window helper hands back CPU int64 indices; its kernel wants CUDA int32
+        return _official_sparse_attn(q, kv, attn_sink,
+                                     topk_idxs.to(q.device).int(), float(scale))
+    except Exception as _exc:
+        import os as _os2
+        if _os2.environ.get("TI_TL_DEBUG"):
+            print(f"[sparse_attn] official kernel failed: {_exc!r}", flush=True)
     if prefer_tilelang and _TL_STATE is not False and _TL is not None:
         try:
             out = sparse_attn_tl(q, kv, attn_sink, topk_idxs, scale)
