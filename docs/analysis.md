@@ -236,3 +236,20 @@ stable across runs), but the logits are not reproducible.
 Open item for the roadmap: find and fix the slot race, then re-run the batch/prefix
 comparisons (they may well be exact, which would unlock chunked prefill).
 
+
+### The session-prefill drift: what was tried and what is left
+
+A second prefill of the same prompt in one session drifts by ~20 logits (`forward(t, 0)`
+twice with a `reset()` between). Three hypotheses were tested and each fix reverted, all
+without effect:
+
+1. `CompressedAttention._compress_kv` / `_kv_buf` / `_kv_window` surviving reset:
+2. `MLAWindowAttention`'s instance staging buffers surviving reset:
+3. `shared_attn.compress_kv` / `index_k` / `topk_idxs` surviving reset.
+
+The tell is that the drift is the same with and without the reset (18.6 vs 19.8), so the
+residual state is not in any of those places: the two forwards of the same 24-token
+prompt differ on their own. With single-token forwards the engine is exactly reproducible
+(`rel 0.000000`), so the difference is specific to the multi-chunk path and is separate
+from the slot-pool race. It stays open, and the regression test keeps its xfail.
+
