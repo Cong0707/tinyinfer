@@ -158,6 +158,9 @@ class Block(HCBlockMixin):
         attn_pre, attn_post, attn_comb = self.hc_mixes(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         h = self.hc_pre(x, pre_mix)
         h = rms_norm(h, self.attn_norm, self.cfg.rms_norm_eps)
+        # official DFlash dflash_input: the target layer's attn_norm output (attention
+        # input, collapsed to [T, dim]); captured here for MTP stage-0 projection.
+        self._last_attn_norm = h
         if self.profile:
             ev[1].record()
         h = self.attn.forward(h, start_pos)
