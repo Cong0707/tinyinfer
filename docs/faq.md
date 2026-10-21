@@ -46,3 +46,10 @@ Yes: `python -m tinyinfer.serve` exposes `/v1/completions` and `/v1/chat/complet
 
 difference (does not affect decode), MTP verify, and the compressed-layer 0.87% residual.
 difference (does not affect decode), MTP verify, and the compressed-layer 0.87% residual.
+## Do Chinese prompts work?
+
+Not as answers: every Chinese shape tested lands in the checkpoint's exercise/key
+distribution ('问题：...\n答案：' -> 'A\n\n解析：...', '请用一句话回答：...' -> 'A 点\n\n解析：由题意').
+English question prompts answer correctly ('Paris', '3.14'). The engine reproduces the
+checkpoint; Chinese answers need a chat-aligned checkpoint.
+
