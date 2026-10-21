@@ -1426,6 +1426,16 @@ class ExpertCache:
         with self._lock:
             return (layer, expert) in self._entries
 
+    def admit(self, layer: int, expert: int, data: bytearray) -> bytearray:
+        """Insert a pre-read expert (locked insert only; the disk read happened outside)."""
+        key = (layer, expert)
+        with self._lock:
+            if key not in self._entries:
+                self._stats.disk_reads += 1
+                self._stats.disk_bytes += len(data)
+                self._insert_locked(key, data)
+        return data
+
     def pin(self, layer: int, expert: int) -> bool:
         key = (layer, expert)
         with self._lock:
@@ -1833,12 +1843,21 @@ class ExpertStore:
         return ExpertRecord((layer, expert), self.slots.buffer(slot), blob.tensors, self.device)
 
     def fetch(self, layer: int, experts: Iterable[int], *, cache: bool = True) -> list[ExpertRecord]:
-        # sequential materialisation: the VRAM slot state machine and the cache share
-        # locks that deadlock under a thread pool, so fetch stays single-threaded
-        # (cache-miss disk reads are already overlapped by the RAM prefetcher threads)
+        experts = [int(e) for e in experts]
+        # batch the disk misses through read_many (parallel pread, lock-free), then
+        # materialise sequentially so the slot state machine stays single-threaded
+        if len(experts) > 1:
+            misses = [e for e in experts if not self.ram.contains(layer, e)]
+            if misses:
+                blobs = [self.index.expert_blob(layer, e) for e in misses]
+                try:
+                    datas = self._reader.read_many(blobs)
+                    for b, d in zip(blobs, datas):
+                        self.ram.admit(layer, b.key[1], d)
+                except Exception:
+                    pass  # fall back to per-expert reads inside _materialize
         records = []
         for expert in experts:
-            expert = int(expert)
             records.append(self._materialize(layer, expert, cache=cache))
             with self._lock:
                 self._open[(layer, expert)] += 1

@@ -178,6 +178,15 @@ class MoE:
         use_fp4_kernel = target.type == "cuda"
         limit = self._max_bf16
 
+        # per-expert (token, slot) selection computed once and reused by both passes
+        sels: dict[int, tuple] = {}
+
+        def sel_of(i: int):
+            s = sels.get(i)
+            if s is None:
+                s = sels[i] = torch.where(indices == i)
+            return s
+
         # 1) serve cached experts (bf16 or fp4) without touching the stores
         served = []
         if limit > 0:
@@ -185,7 +194,7 @@ class MoE:
                 e = self._expert_cache.get(i)
                 if e is None:
                     continue
-                idx, top = torch.where(indices == i)
+                idx, top = sel_of(i)
                 if e.fp4 is not None:
                     y[idx] += e.forward_fp4(xf[idx], weights[idx, top, None]).float()
                 else:
@@ -199,7 +208,7 @@ class MoE:
                 with self._expert_store.experts(self.layer_id, to_fetch) as recs:
                     rec_by_id = {rec.key[1]: rec for rec in recs}
                     for i in to_fetch:
-                        idx, top = torch.where(indices == i)
+                        idx, top = sel_of(i)
                         rec = rec_by_id[i]
                         if use_fp4_kernel:
                             e = Expert(None, None, None, self.swiglu_limit)
@@ -223,7 +232,7 @@ class MoE:
                             self._expert_cache[i] = e
         else:
             for i in active:
-                idx, top = torch.where(indices == i)
+                idx, top = sel_of(i)
                 e = self._expert(i)
                 if limit > 0 and len(self._expert_cache) > limit:
                     self._expert_cache.pop(next(iter(self._expert_cache)))
