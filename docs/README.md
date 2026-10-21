@@ -6,6 +6,7 @@
 | lower_bounds.md | the hardware IO floor computed from measured constants |
 | analysis.md | routing predictability, speculative-decoding ceiling, top-k floor |
 | decode_speed.md | every optimisation and what it changed, with before/after numbers |
+| benchmarks.md | benchmark history and rules of thumb (disk rate is part of every row) |
 | parity.md | numeric parity per component against DeepInfer |
 | kernels_provenance.md | every kernel: official port / re-implementation / why |
 | level2_mechanisms.md | the level 1/2 mechanisms and their upstream references |

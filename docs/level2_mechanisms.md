@@ -65,3 +65,20 @@ step 0 4.41s   step 1 8.30s   (fetch 2.37s / 3.17s, reader 3.65-3.74 GB/s)
 The disk side is noisy on this box (the same configuration has measured 1.5s and 3.2s of
 `fetch` in consecutive runs, with `reader` between 3.6 and 4.7GB/s); the mechanism-level
 numbers (bincount 0.30s, serve 0.15s) are stable.
+
+## Added after this document was written
+
+| mechanism | where | reference |
+| --- | --- | --- |
+| fused rope + fp8 KV round trip | `deepseek_kernels.rope_quant_tl` | DeepInfer `fused_transform.py`; verified bit-exact, opt-in `TI_FUSED_KV=1` |
+| batched small-M fp4 GEMV | `gemv_fp4.gemv_fp4_m8` | our own; flat grid; exact on synthetic weights, opt-in for real ones |
+| grouped expert GEMV | `gemv_fp4.gemv_fp4_grouped` | our own; exact but loses to the row loop once the plane gather is counted |
+| one activation quantisation per expert batch | `MoE.forward` + `Expert.forward_fp4_pq` | ours; the quantiser is expert-independent |
+| indexer visibility-mask cache | `Indexer.forward` | ours; the mask depends only on (start_pos, s, t, ratio) |
+| expert hot tracking | `ExpertStore.hot_experts/hot_prefetch` | ours; explicit, never inline (256 experts = 4.7GB) |
+| dynamic prefill chunk for long prompts | `Engine._forward_impl` | ours; long prompts step down to chunk=1, which is the exact path |
+| HTTP + OpenAI-compatible endpoints | `tinyinfer/serve.py` | ours; stdlib only |
+| reproducible benchmark | `tinyinfer/bench.py` | ours; JSON with disk measured in the same run |
+
+Each of these is behind a tier flag or an env switch (docs/ENV.md); the tier-2 defaults
+are the ones that passed their numeric checks.
