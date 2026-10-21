@@ -63,6 +63,31 @@ question; templated continuations come from the model's own distribution.
 The checkpoint is a **base (pre-SFT) model** with no chat template: its own top-1 for
 'The capital of France is' is '#' (13.25) over 'Paris' (12.5), so templated
 continuations are its behaviour, not an engine defect (docs/analysis.md).
+## Portability to other machines (this round)
+
+The planner is the portability layer; it is now checked against nine hypothetical boxes
+by `tests/test_planner_hardware.py` and printed by `tools/plan_matrix.py`:
+
+| machine | resident | slots | decode floor | note |
+| --- | --- | --- | --- | --- |
+| 8GB / 47GB (this box) | 4 | 12 | 0.8 tok/s | disk-bound |
+| 12GB / 32GB | 15 | 15 | 0.8 tok/s | disk-bound |
+| 24GB / 64GB | 40 | 298 | 83 tok/s | every routable expert resident |
+| 32GB+ | 40 | 240+ | 83 tok/s | compute-bound |
+| 4GB | - | - | - | refused with the minimum size |
+| CPU only | 0 | 0 | - | host path, minutes/token |
+
+Fixes that came out of this: CPU-only boxes no longer plan a GPU head; unified memory no
+longer double-books one pool (a 48GB Mac planned 46GB VRAM + 36GB cache); a card too small
+for the streaming skeleton is refused instead of OOMing; and the planner now trades the
+1.32GB embedding table for expert slots when that reaches full coverage of the 240 experts
+a token can route to.
+
+Tensor-parallel sharding was also fixed: shards are aligned to 128 so a rank never owns
+half a quantisation block, and the block/per-row scale layouts are sliced by the right
+stride. It is numerically verified (`tests/test_tp.py`) but has not run on real multi-GPU
+hardware.
+
 ## Suggested next steps (in value order)
 
 1. Find the batch-vs-row MoE difference (item 1): it is the only blocker for MTP and
