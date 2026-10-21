@@ -1,41 +1,61 @@
-# MTP / DSpark 投机解码集成设计（等 model-00044..46 分片）
+# MTP / DSpark 投机解码集成设计（生产版）
 
-## 权重命名（官方）
-mtp.{0,1,2}.attn.{wq_a,wq_b,wkv,wo_a,wo_b,q_norm,kv_norm,attn_sink}
-mtp.{stage}.ffn.{gate,shared_experts,experts.*}（n_routed_experts=128, top-6）
-mtp.0.main_proj / main_norm（stage 0）
-mtp.2.norm / markov_head.embed / markov_head.head / confidence_head.proj（最后 stage）
-mtp.{stage}.attn_norm / ffn_norm / hc_*（与主 block 同名）
+> 状态：权重加载 ✅；stage0/1/2 前向链（attention+MoE+HC）已实现；forward_head（markov/confidence）待完成。
+> 源码：`src/tinyinfer/mtp.py`（文件头有完整参考映射与 checkpoint 张量名）。
 
-## 结构（reference/official/model.py）
-- DSparkAttention(Attention)：window-only；forward(x, start_pos, main_x)：
-  - main_kv = kv_norm(wkv(main_x)) + rope -> 写 window_kv_cache
-  - start_pos==0：只 seed，返回 x（prefill）
-  - else：q=wq_b(q_norm(wq_a(x)))·rope；kv=kv_norm(wkv(x))·rope；
-    topk_idxs = [0..min(win,start_pos)] + [win, win+block)；
-    sparse_attn(q, cat[cache, kv], sink, topk_idxs) -> o；inverse rope；wo_a einsum；wo_b。
-- DSparkBlock(Block)：forward_embed(main_hidden, ids) -> (x, main_x)；
-  forward_head(x, pre_mix, ids) -> (output_ids, logits, confidence)
-  - markov_head: embed(ids) -> logits 修正；confidence_head: cat(hidden, markov_embed) -> 1。
-- Transformer.forward_spec：draft 各 stage -> 主模型 verify（并行 attention + rejection sampling）。
+## 参考实现（修复时先读这些）
 
-## tinyinfer 实现方案
-1. mtp.py：
-   - _PrefixStore(store, "mtp.{stage}")：把 layers.0.attn.* 映射到 mtp.{stage}.attn.*
-   - MTPAttention(MLAWindowAttention)：加 forward_with_main（官方语义）
-   - MTPBlock：attn + MoE(128 experts) + HC（复用 hc_mixes/hc_pre/post）+ 可选 main_proj/markov/confidence
-2. Engine.speculative_generate(prompt, n, draft_len)：
-   - 主模型 forward 得 logits -> 采样 t0
-   - MTP stage0: main_hidden -> forward_embed -> draft tokens
-   - 主模型 verify：对 draft tokens 做一次并行 forward + rejection sampling
-   - 接受前缀，回滚 KV（快照/恢复已有 snapshot/restore）
-3. 风险：
-   - 专家 IO 不减少（每 token 40 层 x 6 专家）——投机只省 launch/步数，预计 +10-30%
-   - markov head 1.84ms/5-token（需融合/量化）
-   - 验证需 chunk prefill（attention 已支持 start_pos/s）
+| tinyinfer | DeepInfer 参考 | 说明 |
+|---|---|---|
+| `MTPBlock.__init__` | `mtp/dflash.py:DFlash.__init__` | 3 stage 权重加载；stage0 带 main_proj/main_norm |
+| `MTPBlock.main_hiddens` | `DFlash.update_main_cache`（projection+project_norm）| target 层 hidden 拼接 → main_x |
+| `MTPBlock.forward_embed` | `DFlash._embed_draft_init_tokens` | noise(128799) 填充 + golden 首 token |
+| `MTPBlock.forward` | `DFlashDecoderLayer.forward_drafts` | HC + attention + MoE |
+| `MTPAttention.forward_with_main` | `v4_modules/attn.py:DFlashAttention` | main KV 滑窗 + draft KV |
+| `MTPBlock.forward_head` | `DFlash.sample_drafts` | post_norm → head → markov → confidence（TODO）|
+| 字段 `main_proj/main_norm` | `projection/project_norm` | checkpoint 名与官方模块名对照 |
+| 字段 `markov_embed/markov_head` | `shared_head.markov_w1/markov_w2` | |
+| 字段 `confidence_proj` | `confidence_head.proj` | |
+| `normalize` | `ConfidenceHead.temperature` | 置信度温度归一（参考实现按 num_steps 配置）|
 
-## 分片到位后的步骤
-1. 验证 mtp.* 加载（safe_open header）。
-2. 单 token 前向数值 vs 参考。
-3. 投机循环 + 接受率测量。
-4. 与 40 层全模型联调。
+其它框架对照：vLLM 的 nextn/MTP 层（`num_nextn_predict_layers=3`）与 HF transformers 的 MTP 实现同构；draft block_size=5、markov_rank=256。
+
+## 权重命名（checkpoint 精确名）
+
+```
+mtp.{S}.attn.{wq_a,wq_b,wkv,wo_a,wo_b}.weight/.scale     fp8 注意力
+mtp.{S}.attn.{q_norm,kv_norm}.weight, attn_sink
+mtp.{S}.attn_norm.weight / ffn_norm.weight
+mtp.{S}.hc_attn_fn / hc_attn_scale / hc_attn_base / hc_ffn_*
+mtp.{S}.ffn.gate.{weight,bias,bias_vl} / shared_experts.* / experts.{i}.{w1,w2,w3}.{weight,scale}
+mtp.0.main_proj.weight/.scale [dim, n_target*dim]   （官方 projection）
+mtp.0.main_norm.weight [dim]                         （官方 project_norm）
+mtp.2.norm.weight [dim]                              （官方 post_norm）
+mtp.2.markov_head.embed.weight [vocab, 256]          （官方 markov_w1）
+mtp.2.markov_head.head.weight  [256, vocab]          （官方 markov_w2）
+mtp.2.confidence_head.proj.weight [1, dim+256]       （官方 confidence_head.proj）
+```
+
+## 关键契约
+
+- **main_x** = `projection_norm(main_proj(cat(h_L37, h_L38, h_L39)))`，每层 hidden 是 **HC collapse 后**的 `[1,T,dim]`（`Engine._target_hidden`）。
+- **main KV**：`main_kv = kv_norm(wkv(main_x))`（每 stage 自己的 wkv），rope 后进 **main 滑窗**（官方 swa cache），窗口 128。
+- **draft 输入**：主 embedding 的 noise 填充块（`noise_token_id=128799`，位置 0 = golden token）。
+- **draft KV**：每 stage 的 wkv(x)，rope 后**仅本次 block 有效**。
+- **attention**：`[main 窗口, draft kv]` 拼接后 sparse attention（sink + window 索引）。
+- **head**：`post_norm(hc_pre(x))` → 主 head logits → markov 修正（embed(ids) @ markov_head）→ confidence（`sigmoid(proj([hidden, markov_emb]))`）。
+- **掩码/位置**：draft 位置 = start_pos..start_pos+4；main 位置 = start_pos-1（当前 token）。
+
+## 投机解码流程（Engine.speculative_generate）
+
+1. 主模型 forward 得到 logits，贪心采样 t0，并捕获 target 层 hidden（`_target_hidden`）。
+2. `main_x = stage0.main_hiddens(target_hiddens)`；`x0 = stage0.forward_embed(t0)`。
+3. stage0→1→2：`x, pre = st.forward(x, pos, pre, main_x)`；最终 stage 的 `forward_head` 得到 draft tokens + 置信度。
+4. 主模型 verify（一次并行 forward），贪心匹配接受前缀；不匹配则回滚 KV（snapshot/restore）。
+5. 接受率与加速比记录到 benchmarks。
+
+## 已知限制
+
+- 专家 IO 不减少（每 token 40 层×6 专家）——投机省 launch/步数，预计 +10-30%，实测为准。
+- markov head 与 confidence 需在 GPU 上融合（1.84ms/5-token 量级）。
+- 当前 forward_head 的 markov/confidence 分支为 TODO（logits 部分已接主 head）。

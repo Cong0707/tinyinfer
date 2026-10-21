@@ -58,6 +58,7 @@ class TinyConfig:
     n_mtp_layers: int
     dspark_block_size: int
     dspark_target_layer_ids: tuple[int, ...]
+    dspark_noise_token_id: int
     dspark_markov_rank: int
     dspark_n_routed_experts: int
     dspark_n_activated_experts: int
@@ -126,6 +127,7 @@ class TinyConfig:
             n_mtp_layers=int(tc.get("num_nextn_predict_layers", 0)),
             dspark_block_size=int(tc.get("dspark_block_size", 0)),
             dspark_target_layer_ids=tuple(tc.get("dspark_target_layer_ids", ())),
+            dspark_noise_token_id=int(tc.get("dspark_noise_token_id", 0)),
             dspark_markov_rank=int(tc.get("dspark_markov_rank", 256)),
             dspark_n_routed_experts=int(tc.get("dspark_n_routed_experts", 0)),
             dspark_n_activated_experts=int(tc.get("dspark_num_experts_per_tok", 0)),
