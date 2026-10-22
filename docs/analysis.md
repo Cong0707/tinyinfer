@@ -588,3 +588,19 @@ Both decisions are made by the planner from measured geometry (VRAM, top-k, cove
 not by a tier name, so a 24GB card still turns the pool on (298 slots cover all 240
 experts) and turns speculation on.
 
+
+## 17. Final numbers with the new default plan
+
+Benchmark of the 8GB box with the new default (no expert pool, no MTP, 10 resident layers,
+slot-free so every run is reproducible):
+
+| metric | value |
+| --- | --- |
+| first forward | 29.6s |
+| warm prefill (8 tokens) | 12.6s |
+| decode | 0.482 tok/s (disk 1.86GB/s) |
+| expert cache hit | 16.3% |
+
+Decode is the same as with the pool (0.485 at 1.58GB/s disk, 0.482 at 1.86), so dropping it
+costs nothing measurable while making the output repeatable -- and prefill got faster.
+
