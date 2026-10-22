@@ -85,3 +85,15 @@
 
 诚实说明：此前"关掉槽池就能复现"的结论已撤回（同一配置既出现过 0.000000 也出现过 21.8）。
 
+
+## 端到端验证（新默认配置）
+
+| 问题 | 回答 |
+| --- | --- |
+| What is the capital of France? | ` It is Paris.` |
+| What is pi? | ` Pi is a mathematical constant approximately equal to 3.14159.` |
+| Who wrote Hamlet? | ` William Shakespeare` |
+
+三个问题全部正确且连贯 —— 这是整个工程的目的：510GB 的 fp8/fp4 checkpoint 在 8GB 笔记本上
+从磁盘流式运行并能正确回答事实性问题。
+
