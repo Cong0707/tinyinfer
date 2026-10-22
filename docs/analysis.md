@@ -746,3 +746,11 @@ not the cache size but sizing it without accounting for the slab.
   (`Paris`, `Pi is the ratio of a circle's circumference to its diameter`, `William
   Shakespeare`), so the 7.7% decode gain cost no quality.
 
+
+- Cache policy A/B (normalising decode by the measured disk rate, since the volume keeps
+  drifting): LRU 0.372-0.391 tok/s per GB/s against ARC 0.282, i.e. LRU looks ~30% better
+  per byte of disk, but its hit rate is *lower* (19.7-21.9% vs 25.5%). That combination is
+  not conclusive: ARC's bookkeeping may simply cost CPU per fetch. The default stays ARC
+  (higher hit = less disk pressure); `TI_CACHE_POLICY=lru` is there for a box with CPU to
+  spare and a disk that does not mind the extra reads.
+
