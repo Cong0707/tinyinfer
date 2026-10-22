@@ -110,10 +110,14 @@ class HostBudget:
                 return False
             if real:
                 try:
-                    if not self._commit(nbytes):
-                        return False
+                    got = self._commit(nbytes)
                 except MemoryError:
+                    got = 0
+                if not got:
                     return False
+                # book what was really taken, not what was asked for: the caches are
+                # then sized from the pages we actually own
+                nbytes = int(got)
             self.granted += nbytes
             self._claimed = True
             return True
@@ -133,27 +137,33 @@ class HostBudget:
             k32.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
                                          ctypes.c_ulong, ctypes.c_ulong]
             k32.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong]
-            ptr = k32.VirtualAlloc(None, int(nbytes), 0x1000 | 0x2000, 0x04)
-            if not ptr:
-                return False
-            # VirtualAlloc alone only charges the commit limit; the physical pages are
-            # still unowned until written, which is why Task Manager showed a slow climb
-            # and the box could still page. Touch one byte per 4KB page, single-threaded:
-            # 14GB measures ~1.0s, which is fine -- this runs once at start-up and being
-            # simple and correct matters more here than being fast.
+            # VirtualAlloc alone only charges the commit limit; the physical pages stay
+            # unowned until written, which is why Task Manager showed a slow climb and the
+            # box could still page. Touch one byte per 4KB page, in 2GB batches, so a huge
+            # single allocation cannot be cut short under memory pressure; whatever was
+            # really taken is what we book. Single-threaded on purpose: this runs once at
+            # start-up and correctness matters more than shaving a second.
             n = int(nbytes)
-            try:
-                import ctypes as _ct
-
-                buf = (_ct.c_char * n).from_address(ptr)
-                for off in range(0, n, 4096):
-                    buf[off] = b"\x01"
-            except Exception:
-                pass
-            if not hasattr(self, "_held"):
-                self._held = []
-            self._held.append((k32, ptr))
-            return True
+            batch = 2 * (1 << 30)
+            taken = 0
+            held = getattr(self, "_held", None)
+            if held is None:
+                held = self._held = []
+            while taken < n:
+                chunk = min(batch, n - taken)
+                sub = k32.VirtualAlloc(None, chunk, 0x1000 | 0x2000, 0x04)
+                if not sub:
+                    break
+                try:
+                    buf = (ctypes.c_char * chunk).from_address(sub)
+                    for off in range(0, chunk, 4096):
+                        buf[off] = b"\x01"
+                except Exception:
+                    k32.VirtualFree(sub, 0, 0x8000)
+                    break
+                held.append((k32, sub))
+                taken += chunk
+            return taken
         except Exception:
             return False
 

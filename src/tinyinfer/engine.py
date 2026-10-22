@@ -131,7 +131,12 @@ class Engine:
                 # box). TI_CACHE_GB overrides for A/B.
                 _slab_need = (self.cfg.n_layers - (hw.gpu_layers if hw is not None else 0)) * 178e6
                 _cache_room = max(192 << 20, int(_hb_room - _slab_need - 3 * (1 << 30)))
-                _cache_bytes = max(192 << 20, min(_plan_cache, _cache_room))
+                # Speed-first sizing: take the whole room our share of physical RAM leaves
+                # after the slab, not the planner's (avail-derived) number. Other programs
+                # may be pushed out of RAM -- that is the accepted trade -- but the model
+                # itself must never page, because a paged expert read costs 10x a hit.
+                # TI_CACHE_GB still overrides for A/B.
+                _cache_bytes = max(192 << 20, int(_cache_room))
                 # One measurement, one decision: book the whole planned footprint now
                 # (slab + expert cache) instead of letting every later allocation
                 # re-read live available() and drift as other processes claim memory.
