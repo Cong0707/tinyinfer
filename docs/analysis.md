@@ -900,3 +900,16 @@ withdrawn. The likely cause is the disk being cold on the first request after lo
 the volume's 1.4-1.9GB/s drift; settling it needs a warm-cache A/B, which needs the server
 to keep one model across several requests (it does) and a repeat run.
 
+
+### Warm-cache repeat (same server process, same request twice)
+
+    request 1 (cold disk): 73.8s
+    request 2 (warm disk): 64.6s
+
+Cold disk explains only ~9s, so the remaining gap is structural. Decomposing by token
+(12 prefill x ~1.1s + 4 decode x ~2.5s = ~23s) leaves **~40s of fixed per-request cost**
+that is not attributed yet. The next place to look is `TinyModelBackend.load()`: it is
+called at the top of every request, and if it does not short-circuit when the model is
+already resident it would re-run the whole load path (the same shape of bug as the tier
+default). That is the concrete next step, recorded here rather than guessed at.
+
