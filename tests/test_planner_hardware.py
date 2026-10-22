@@ -41,7 +41,10 @@ def test_this_box_shape():
     assert p.fits
     assert 1 <= p.gpu_layers <= 6          # measured 4 here
     assert p.stream_layers == N - p.gpu_layers
-    assert p.expert_slots >= 2
+    # A small pool (a few percent of the 240 routable experts) costs more in DMAs and event
+    # waits than it saves, so the planner drops it and reinvests in residency (docs/
+    # analysis.md 16). Either an absent pool or one that covers a real fraction is fine.
+    assert p.expert_slots == 0 or p.expert_slots >= 0.15 * 240
     assert p.cache_bytes > 1 * GB
 
 
@@ -69,8 +72,6 @@ def test_small_card_is_refused_not_oomed():
     p = _plan([4.0], 16.0, 8.0)
     assert not p.fits
     assert "INSUFFICIENT" in p.reason
-    # and the fallback still keeps a usable expert slot count
-    assert p.expert_slots >= 2
 
 
 def test_six_gb_card_still_works():
