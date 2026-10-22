@@ -120,7 +120,9 @@ class HostBudget:
                 nbytes = int(got)
             self.granted += nbytes
             self._claimed = True
-            return True
+            # Return the bytes we really own (callers size their buffers from this and
+            # copy into the claimed range; a bare True silently became 1 byte).
+            return nbytes
 
     def _commit(self, nbytes: int) -> bool:
         """Commit nbytes of address space so no other process can take it.
@@ -143,27 +145,61 @@ class HostBudget:
             # single allocation cannot be cut short under memory pressure; whatever was
             # really taken is what we book. Single-threaded on purpose: this runs once at
             # start-up and correctness matters more than shaving a second.
+            # One contiguous block, retried at half size: the cache slices its entries
+            # out of this single range, so it must not be a chain of separate mappings.
             n = int(nbytes)
-            batch = 2 * (1 << 30)
-            taken = 0
             held = getattr(self, "_held", None)
             if held is None:
                 held = self._held = []
-            while taken < n:
-                chunk = min(batch, n - taken)
-                sub = k32.VirtualAlloc(None, chunk, 0x1000 | 0x2000, 0x04)
-                if not sub:
-                    break
+            while n >= (256 << 20):
+                # Prefer large pages: their pages cannot be trimmed by the memory
+                # manager, which is the only way to keep the cache resident for the
+                # whole run (normal pages were observed leaving the working set mid-run
+                # even after VirtualLock). Needs SeLockMemoryPrivilege (admin) and a
+                # size that is a multiple of the 2MB large-page granularity; fall back
+                # to ordinary committed pages when the privilege is absent.
                 try:
-                    buf = (ctypes.c_char * chunk).from_address(sub)
-                    for off in range(0, chunk, 4096):
-                        buf[off] = b"\x01"
+                    k32.GetLargePageMinimum.restype = ctypes.c_size_t
+                    gran = int(k32.GetLargePageMinimum() or 0)
                 except Exception:
-                    k32.VirtualFree(sub, 0, 0x8000)
-                    break
-                held.append((k32, sub))
-                taken += chunk
-            return taken
+                    gran = 0
+                ptr = 0
+                if gran:
+                    big = (n // gran) * gran
+                    if big >= gran:
+                        ptr = k32.VirtualAlloc(None, big,
+                                               0x20000000 | 0x1000 | 0x2000, 0x04)
+                if not ptr:
+                    ptr = k32.VirtualAlloc(None, n, 0x1000 | 0x2000, 0x04)
+                if ptr:
+                    try:
+                        buf = (ctypes.c_char * n).from_address(ptr)
+                        for off in range(0, n, 4096):
+                            buf[off] = b"\x01"
+                    except Exception:
+                        k32.VirtualFree(ptr, 0, 0x8000)
+                        ptr = None
+                if ptr:
+                    # hold the array OBJECT, not just the pointer: after a pointer is
+                    # stored the underlying pages can be reclaimed (observed as the working
+                    # set falling from 22.7GB to 11.1GB mid-run)
+                    # Lock the pages in the working set as well: touching alone makes
+                    # them resident, but the OS may still trim them under pressure, which
+                    # showed up as the working set falling 22.6GB -> 10.5GB mid-run. A
+                    # locked page cannot be trimmed, which is what "claimed" has to mean
+                    # for the cache to stay in RAM.
+                    try:
+                        k32.VirtualLock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+                        k32.VirtualLock.restype = ctypes.c_int
+                        k32.VirtualLock(ptr, n)
+                    except Exception:
+                        pass
+                    held.append((k32, ptr, n, buf))
+                    self._claim_buf = buf
+                    self._claim_bytes = n
+                    return n
+                n //= 2
+            return 0
         except Exception:
             return False
 

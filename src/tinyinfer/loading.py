@@ -1465,6 +1465,44 @@ class CacheStats:
         }
 
 
+class BlobPool:
+    """A pre-committed slab of host memory that cached expert blobs are copied into.
+
+    The planner/engine claims this memory once at start-up (so it is really owned and
+    cannot be paged out); the cache then slices its entries out of it instead of
+    allocating a second copy of the same size.
+    """
+
+    def __init__(self, buffer, nbytes: int):
+        # ctypes buffers expose a '<c' format that memoryview cannot slice; cast to bytes
+        view = memoryview(buffer)
+        try:
+            view = view.cast("B")
+        except (TypeError, ValueError):
+            pass
+        self._view = view[: int(nbytes)]
+        self._cap = int(nbytes)
+        self._off = 0
+        self._lock = threading.Lock()
+
+    @property
+    def capacity(self) -> int:
+        return self._cap
+
+    def take(self, n: int) -> memoryview | None:
+        n = int(n)
+        with self._lock:
+            if self._off + n > self._cap:
+                return None
+            slot = self._view[self._off:self._off + n]
+            self._off += n
+            return slot
+
+    def reset(self) -> None:
+        with self._lock:
+            self._off = 0
+
+
 class ExpertCache:
     """RAM cache of raw fp4 expert blobs (18.8 MB each), shared by all sessions.
 
@@ -1482,8 +1520,10 @@ class ExpertCache:
         max_pinned_bytes: int | None = None,
         executor_threads: int | None = None,
         pin_budget_bytes: int | None = None,
+        pool=None,
     ):
         self.index = index
+        self._pool = pool
         self.reader = reader
         self.blob_bytes = index.expert_blob_bytes()
         self.capacity_entries = max(1, int(capacity_bytes) // max(1, self.blob_bytes))
@@ -1559,6 +1599,15 @@ class ExpertCache:
         while len(self._entries) >= self.capacity_entries:
             if not self._evict_locked(prefer_layer=key[0]):
                 break
+        # Copy into the pre-committed slab when we have one: the cache must live inside
+        # the memory claimed at start-up, not in a second allocation of the same size
+        # (that would defeat the claim and put the box back on the page file).
+        pool = getattr(self, "_pool", None)
+        if pool is not None and isinstance(data, (bytearray, bytes, memoryview)):
+            slot = pool.take(len(data))
+            if slot is not None:
+                slot[:] = data
+                data = slot
         self._entries[key] = data
         try:
             if getattr(data, "is_pinned", None) and data.is_pinned():
@@ -2123,6 +2172,7 @@ class ExpertStore:
         reader_threads: int = 6,  # measured optimum: 4-8 threads ~5.3GB/s (buffered IO ceiling)
         direct: bool = False,
         max_pinned_bytes: int | None = None,
+        pool=None,
         index: ShardIndex | None = None,
         slot_arena: bool = False,
     ):
@@ -2144,7 +2194,8 @@ class ExpertStore:
             max_pinned_bytes = _hb().grant(int(cache_bytes * 0.5))
         self.ram = ExpertCache(self.index, self.reader, cache_bytes, policy,
                                max_pinned_bytes=max_pinned_bytes,
-                               pin_budget_bytes=max_pinned_bytes)
+                               pin_budget_bytes=max_pinned_bytes,
+                               pool=pool)
         self.slots = (VramSlotCache(vram_slots, self.index.expert_blob_bytes(), device=device,
                                     slot_arena=slot_arena) if vram_slots else None)
         self.device = device
