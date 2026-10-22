@@ -540,3 +540,12 @@ the source layer published for the same block, and both paths write the same val
 the result differs. That is where the next investigation should start (and it is also
 where the slot-pool race lives, which may or may not be the same root cause).
 
+
+- Every compressor, at every source layer (ratio 2: layers 2/8/14; ratio 1: layer 20),
+  matches between s=1 and s=2 to 1.8-2.7e-7. The `rt.compress_kv` sums I first compared
+  differed only because the number of groups written differs by construction (that is what
+  a chunk does), not because a value changed. So the published tensors are right and the
+  consumers of them are right in isolation; the per-layer gap appears only when a whole
+  40-layer pass runs chord-wise. That is consistent with an accumulation effect that no
+  single component owns, and it is where I would put the next pair of eyes.
+
