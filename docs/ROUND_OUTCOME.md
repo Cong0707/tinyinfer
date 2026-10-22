@@ -32,6 +32,20 @@ long prompts should use `TI_PREFILL_CHUNK=1`. Two real defects were fixed on the
 (candidate blocks not clipped to per-query visibility; index-list width varying with the
 chunk), and the remaining work is to make the compressed path bit-identical.
 
+## Default plan for an 8GB card (this round)
+
+| lever | effect | decision |
+| --- | --- | --- |
+| MTP draft stages | +40s per short answer (accept 0.08) | dropped below 16GB |
+| expert slot pool (15 slots = 6% coverage) | -15% decode, slower prefill, and not the reproducibility fix it was thought to be | dropped below 15% coverage |
+| the VRAM those cost | 3-4 resident layers | reinvested (10 resident) |
+
+Reproducibility: **not achievable on this card** (docs/analysis.md §19-20). The same plan
+was exact in one run and 30.75 off in the next; synchronous kernels do not help; it points
+at driver page migration with ~85% of the VRAM in use. What this means practically: on
+prompts where the model is confident the output is stable; on flat prompts (like `hi`)
+generation is effectively sampling either way.
+
 ## Honesty items
 
 - **The session prefill drift (18-20 logits) is not fixed.** Five theories were tested and
