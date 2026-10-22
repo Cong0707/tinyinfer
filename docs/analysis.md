@@ -819,3 +819,13 @@ shared-state coverage in `snapshot`/`restore`.
   "chunk=4 is 1.58x better" was a 12-token effect (small enough that the per-block layer
   re-streaming dominates). chunk=2 is 26% slower and is never the right choice.
 
+
+### Full three-turn conversation, verified
+
+    Q: What is the capital of France?   ->  Paris            (43s prefill, checkpoint saved)
+    Q: What is its population?          ->  1,200,000        (restored, new text only)
+    Q: Who wrote Hamlet?                ->  William Shakespeare (restored)
+
+All three correct, and turns 2-3 pay only the new text's prefill. That is the multi-turn
+path a chat UI would use on this box.
+
