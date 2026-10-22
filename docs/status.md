@@ -16,7 +16,7 @@
 | metric | value | note |
 | --- | --- | --- |
 | decode (this box, disk 4.5GB/s) | 1.66s/token = 0.60 tok/s | quality-preserving top-6 |
-| decode (this box, disk 1.4-1.9GB/s after long sweeps) | 2.5-4.5s/token | fetch-bound |
+| decode (this box, 1.84GB/s, cache after-slab sizing) | **0.519 tok/s** (1.93s/token) | fetch-bound |
 | IO floor | 1.23s/token = 0.81 tok/s | arithmetic in docs/lower_bounds.md |
 | prefill, 8 tokens, warm | 11-21s at 1.4-1.9GB/s disk (4s at 4.5GB/s) | fetch-bound |
 | prefill, 63 tokens | 136s (chunk=1 path, correct) | chunk>5 has a numeric bug |
