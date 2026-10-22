@@ -80,6 +80,10 @@ class Engine:
                 from .loading import ShardIndex
 
                 _prof = _model_profile(ShardIndex(self.store.model_dir))
+                if _prof is not None:
+                    # routing width decides whether the expert pool can cover the experts
+                    # a token may route to (planner's coverage/slot decision)
+                    _prof["topk"] = int(getattr(self.cfg, "n_activated_experts", 0) or 0) or None
             except Exception:
                 _prof = None
             # speculation reserves its draft stages up front (tier 2 is the default)

@@ -197,7 +197,16 @@ def model_profile(index: Any) -> dict:
             # this checkpoint: avg 162MB, worst 719MB, real streaming slab 468MB/layer).
             prof["layer_bytes"] = max(avg, 1.0 * mx)
             prof["max_layer_bytes"] = mx
-            prof["topk"] = int(model.get("num_experts_per_tok") or 0) or None
+            # routing width: needed to size the expert pool / decide on coverage
+            try:
+                import json as _json
+                import pathlib as _path
+                _cfg = _path.Path(getattr(index, "model_dir", "")) / "config.json"
+                if _cfg.exists():
+                    prof["topk"] = int(_json.loads(_cfg.read_text(encoding="utf-8"))
+                                       .get("num_experts_per_tok") or 0) or None
+            except Exception:
+                prof["topk"] = None
         for key, name in (("embed_bytes", "embed.weight"), ("head_bytes", "head.weight")):
             try:
                 h = header(wm[name])
@@ -439,6 +448,12 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
         return ((embed_b if eg else 0.0) + (head_b if hg else 0.0)
                 + r * layer_b * LAYER_SLACK + buffers * max_layer_b + ws0 + runtime_b)
 
+    if need_slots and has_gpu and slots < need_slots * 0.15:
+        # Below ~15% coverage the VRAM slot pool costs more than it saves: every expert
+        # that is not resident pays a DMA plus an event wait per use, and the pool is also
+        # the source of run-to-run logit noise. Measured on the 8GB card: disabling it made
+        # identical runs exactly reproducible and 8 tokens 53.0s -> 45.2s.
+        slots = 0
     if need_slots and has_gpu and slots < need_slots and (embed_gpu or head_gpu):
         for _eg, _hg in ((False, False), (False, True), (True, False)):
             _r2 = min(n_layers, layers_that_fit(_eg, _hg, buffers, ws0))

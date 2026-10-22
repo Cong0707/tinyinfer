@@ -567,3 +567,24 @@ then holds every routable expert), which is why the tier defaults stay as they a
 8-12GB box, `--tier 1` is the better operating point and it is now documented in
 docs/QUICKSTART.md.
 
+
+## 16. The 8GB default plan now: no slot pool, no MTP, 10 resident layers
+
+The planner used to give this card 6 resident layers + a 15-slot expert pool + the MTP
+draft stages. Measured, each of those three was a net loss here:
+
+| lever | effect on 8 tokens | effect on decode |
+| --- | --- | --- |
+| MTP draft stages | +40s (accept 0.08) | none |
+| expert slot pool (15 slots, 6% coverage) | +8s | -15% (2.82s -> ~2.4s/token) |
+| the 1.36GB those costs | -3 resident layers | -18ms/token |
+
+The plan now drops all three on a card that cannot cover the experts, and reinvests the
+VRAM in residency (6 -> 10 layers). The result is deterministic (no pool, so no race),
+faster on short-answer work, and only ~15% slower on long decodes -- which is the right
+trade for "the output must be usable and repeatable".
+
+Both decisions are made by the planner from measured geometry (VRAM, top-k, coverage),
+not by a tier name, so a 24GB card still turns the pool on (298 slots cover all 240
+experts) and turns speculation on.
+
