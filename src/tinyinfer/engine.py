@@ -1410,7 +1410,8 @@ class Engine:
                 if stop_ids and nid in stop_ids:
                     break
                 yield nid
-                logits = self.forward(torch.tensor([[nid]], device=self.device), start_pos=len(ids) + step)
+                logits = self.forward(torch.tensor([[nid]], device=self.device),
+                                      start_pos=start_pos + len(ids) + step)
 
     # -- speculative decoding (MTP/DSpark) ---------------------------------
     def _window_span(self) -> int:
@@ -1508,7 +1509,7 @@ class Engine:
         out: list[int] = []
         acc = drafted = 0
         with torch.inference_mode():
-            logits = self.forward(torch.tensor([ids], device=self.device), 0)
+            logits = self.forward(torch.tensor([ids], device=self.device), start_pos)
             if self.device != "cpu":
                 torch.cuda.empty_cache()
             pos = len(ids)
@@ -1562,11 +1563,12 @@ class Engine:
 
 
     def generate(self, prompt_ids, max_new_tokens: int = 16, temperature: float = 0.0, eos_token_id=None,
-                 top_p: float = 1.0, top_k: int = 0):
+                 top_p: float = 1.0, top_k: int = 0, start_pos: int = 0, keep_session: bool = False):
         """Greedy/sampled generation loop (prefill once, then decode step by step)."""
         # a generation starts from a clean session: leftover KV from a previous call
         # makes the first step read stale state (observed as a first-token failure)
-        self.reset()
+        if not keep_session:
+            self.reset()
         ids = list(prompt_ids)
         with torch.inference_mode():
             logits = self.forward(torch.tensor([ids], device=self.device), 0)
