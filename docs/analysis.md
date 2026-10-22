@@ -518,3 +518,13 @@ France/pi questions answer correctly) and grows with prompt length. `TI_PREFILL_
 is the exact path and remains the default choice for long prompts until the compressed
 path is made bit-identical to the token-wise one.
 
+
+- One more ruled out: the indexer's own score (`einsum` + relu + weights, the s=2 batch
+  versus two s=1 calls) matches to 0.00000000, so the remaining per-layer gap is not in
+  how the scores are formed. Component by component (compressor 1.6e-7, MoE 0, attn 0.0033,
+  indexer score 0), each stage is at or below its reference noise; what compounds is the
+  softmax reduction inside the sparse kernel over a longer, chunked gather list. Making
+  that bit-identical to the token-wise path is the concrete remaining task for chunked
+  prefill, and it needs a fixed reduction tree in the kernel rather than another masking
+  fix.
+
