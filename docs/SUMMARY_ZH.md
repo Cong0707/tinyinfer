@@ -122,3 +122,19 @@
 
 所以缓存分配修复带来的 +7.7% 是真实的；最终绝对数字偏低只是磁盘变慢。
 
+
+## serve 的真实加速（本轮）
+
+同一 12-token 提示、`max_tokens=3`，经 `tinyinfer server` 实测：
+
+| 配置 | 耗时 |
+| --- | --- |
+| `--tier conservative`（旧默认） | 97.1s |
+| `--tier balanced` | 85.3s |
+| balanced + prefill 后 empty_cache | 82.2s |
+| **`--tier aggressive`（新默认，flat 流式）** | **63.9s** |
+
+根因：服务端档位解析拒绝 aggressive（"not wired into the reference path yet"），导致 HTTP 路径
+永远走参考驱动（每层从 store 取权重），从不进入引擎的 flat 流式环。打开后 `TI_LAYER_TIME`
+显示 `streamed=True use_flat=True`，同一请求快 **34%**。
+
