@@ -877,3 +877,26 @@ Normalised by disk rate that is 0.328 tok/s per GB/s, up from the 0.282-0.315 me
 before the cache was sized from the room left after the slab (§22) -- the +7.7% decode gain
 is still there, the absolute number moved only because the volume slowed down again.
 
+
+## 26. CORRECTION: the server's slowness is mostly tier + disk, not the endpoint code
+
+Same 12-token prompt, same `max_tokens=4`, measured through `tinyinfer.server`:
+
+| configuration | time |
+| --- | --- |
+| `--tier conservative` (previous default) | 97.1s |
+| `--tier balanced` (new default) | 85.3s |
+| balanced + `empty_cache()` after prefill | **82.2s** |
+| `Engine.generate` in-process (for comparison) | ~51s |
+
+Two real fixes came out of this: the server defaulted to the **reference tier** (level 0),
+which is simply slower than level 1 (this was a wrong default, not a bug), and it never
+returned the prefill kernel workspace to the driver even though `Engine.generate` always
+has -- that is worth 3.6% here and keeps the two paths consistent.
+
+The remaining ~30s gap to the in-process number is **not** explained by the endpoint code:
+the earlier "HTTP is 2x the engine" claim was based on one cold measurement and is
+withdrawn. The likely cause is the disk being cold on the first request after load plus
+the volume's 1.4-1.9GB/s drift; settling it needs a warm-cache A/B, which needs the server
+to keep one model across several requests (it does) and a repeat run.
+
