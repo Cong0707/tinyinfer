@@ -741,3 +741,8 @@ not the cache size but sizing it without accounting for the slab.
   16 because the difference is within run-to-run spread and 32 threads oversubscribe a
   16-thread CPU, but `TI_READERS` is exposed for a box with more cores.
 
+
+- With the larger cache the three-question check still answers correctly
+  (`Paris`, `Pi is the ratio of a circle's circumference to its diameter`, `William
+  Shakespeare`), so the 7.7% decode gain cost no quality.
+
