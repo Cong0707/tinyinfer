@@ -1058,7 +1058,11 @@ class TinyModelBackend(BaseBackend):
         finally:
             self._stash_slot(slot_id)
             if __import__("os").environ.get("TI_SERVER_PREFIX") == "1":
-                full = tuple(prompt_ids + generated)
+                # Record the *rendered* prompt, not prompt+generated: the next request
+                # re-renders the assistant turn from the template, so appending the ids we
+                # generated makes the two sequences diverge before the new question and
+                # the prefix never matches (measured: turn2 was slower than turn1).
+                full = tuple(prompt_ids)
                 self._slot_prefix[slot_id] = (full, len(full))
             self._trim_expert_cache()
         yield TokenEvent(
