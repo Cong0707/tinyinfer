@@ -23,7 +23,7 @@ experts top-6, fp8 non-expert + fp4 experts) that runs **on an 8GB laptop GPU wi
 | metric | value |
 | --- | --- |
 | decode | **1.66s/token = 0.60 tok/s** at 4.5GB/s disk; 0.49 tok/s at the 1.58GB/s the volume currently reports |
-| reproducibility | logits are not bit-reproducible with the VRAM slot pool (default); set `TI_NO_SLOTS=1` for exact repeats at ~40% slower decode (docs/faq.md) |
+| reproducibility | reproducible by default on this card (the plan drops the expert slot pool when it cannot cover the experts a token routes to -- docs/analysis.md §16) |
 | theoretical floor | 1.23s/token = 0.81 tok/s (IO only) |
 | prefill, 8 tokens, warm | ~3s |
 | process start (pinned slab, 13GB) | ~13s, one-off |
