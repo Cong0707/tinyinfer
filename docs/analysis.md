@@ -954,3 +954,22 @@ next real task for the serve path and is recorded in docs/ROADMAP.md. Until then
 statement is: in-process generation uses the engine; HTTP serves the reference path and is
 ~50% slower for that reason.
 
+
+### Confirmation (two consecutive requests on the fixed server)
+
+    run 1 (cold disk): 66.7s
+    run 2 (warm disk): 45.5s
+
+With the streamed layers actually streaming, the HTTP path matches the in-process engine
+(45.5s here, ~51s through `Engine.generate` for the same work), and the whole 97.1 -> 45.5s
+story closes: the server was serving the reference path, not a slow endpoint.**
+
+Summary of what was wrong and what fixed it:
+
+| # | defect | fix | effect |
+| --- | --- | --- | --- |
+| 1 | default tier `conservative` (level 0) | default `aggressive` | 97.1 -> ~66.7s cold |
+| 2 | `aggressive` refused by the tier resolver | allow level 2 (the backend builds the same Engine) | flat streaming on: 82.2 -> 63.9s |
+| 3 | no `empty_cache()` after prefill | flush like `Engine.generate` does | small, consistency |
+| 4 | (already correct) `layers=range(40)` | -- | not a defect, same as the engine default |
+
