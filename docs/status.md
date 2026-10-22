@@ -137,3 +137,21 @@ of the whole transcript (a 23-token prefix costs 43.5s to prefill). Verified wit
 `examples/multi_turn.py`: population -> 1,000,000, Hamlet -> Shakespeare, no re-prefill.
 `generate(..., start_pos=, keep_session=)` are the two API additions it needs. The HTTP
 server does not wire this up yet (single request at a time).
+## Serve path (fixed this round)
+
+`tinyinfer server` was serving the *reference path*: the tier resolver refused `aggressive`
+(level 2) with "not wired into the reference path yet", so HTTP never reached the engine's
+flat streaming ring and every layer was loaded from the store per step. Fixed by allowing
+level 2 (the backend builds the same `Engine` the CLI does) and making it the default.
+Measured on the same 12-token prompt:
+
+| configuration | time |
+| --- | --- |
+| conservative (old default) | 97.1s |
+| balanced | 85.3s |
+| aggressive, cold disk | 66.7s |
+| aggressive, warm disk | **45.5s** |
+
+`TI_LAYER_TIME` now shows `streamed=True use_flat=True` on the streamed layers, and the HTTP
+path matches in-process generation (~51s for the same work). This was the largest
+user-visible speedup left for `serve` and it is done (docs/analysis.md §27-28).
