@@ -754,3 +754,18 @@ not the cache size but sizing it without accounting for the slab.
   (higher hit = less disk pressure); `TI_CACHE_POLICY=lru` is there for a box with CPU to
   spare and a disk that does not mind the extra reads.
 
+
+### Fair A/B (alternating runs, normalised by the disk rate measured in the same run)
+
+| policy | decode | disk | hit | normalised (tok/s per GB/s) |
+| --- | --- | --- | --- | --- |
+| ARC | 0.412 | 1.33 | 20.9% | 0.310 |
+| LRU | 0.451 | 1.49 | 22.1% | 0.303 |
+| ARC | 0.474 | 1.48 | 25.6% | 0.320 |
+| LRU | 0.519 | 1.46 | 22.7% | 0.355 |
+
+ARC averages 0.315, LRU 0.329 (within the spread), so the earlier "LRU looks 30% better"
+was the disk drift, not the policy. ARC stays the default because its hit rate is higher
+(less disk pressure); this also shows the normalisation method is what makes any of these
+comparisons meaningful on a volume whose rate wanders between 1.3 and 1.9GB/s.
+
