@@ -346,6 +346,12 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     # within 128MB of the card's limit, so the first large dequant OOM'd.
     runtime_b = (float(model.get("engram_bytes", 0.6 * GB)) * 0.5 + 0.15 * GB
                  + PREFILL_TEMP)
+    if speculation and V < 16 * GB:
+        # Drafting pays only when the acceptance rate is high; here it is 0.08 (docs/
+        # analysis.md section 2), so the draft stages just cost resident layers and the
+        # verify pass costs a full forward. Measured on the 8GB card: tier 2 with MTP
+        # took 91s for 8 tokens against 50s for tier 1, same answer.
+        speculation = False
     if speculation:
         # the draft stages and their windows are resident whenever speculation is on;
         # budget them instead of discovering them with an OOM after prefill
