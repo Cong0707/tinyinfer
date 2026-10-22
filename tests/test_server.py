@@ -770,8 +770,10 @@ def test_tier_resolution():
     assert conservative.level.name == "CONSERVATIVE"
     assert balanced.level.name == "BALANCED"
     assert balanced.expert_cache_gb > 0
-    with pytest.raises(ValueError):
-        resolve_tier("aggressive")
+    # aggressive (level 2) is wired: the backend builds the same Engine the CLI does, so
+    # flat streaming applies (analysis.md 27: 82.2s -> 63.9s on the same prompt)
+    aggressive = resolve_tier("aggressive")
+    assert aggressive.level.name == "AGGRESSIVE"
     with pytest.raises(ValueError):
         resolve_tier("warp")
     with pytest.raises(ValueError):

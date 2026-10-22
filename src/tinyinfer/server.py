@@ -500,11 +500,15 @@ def resolve_tier(tier: str):
     if key not in levels:
         raise ValueError(f"unknown tier {tier!r}; choose from {sorted(levels)}")
     level = levels[key]
-    if level not in (OptLevel.CONSERVATIVE, OptLevel.BALANCED):
+    if level == OptLevel.EXTREME:
         raise ValueError(
-            f"tier {key!r} is not wired into the reference path yet; "
-            "use 'conservative' or 'balanced'"
+            f"tier {key!r} is not implemented (no extreme kernels yet); "
+            "use 'conservative', 'balanced' or 'aggressive'"
         )
+    # aggressive (level 2) IS wired: the backend constructs the same Engine the CLI does,
+    # so flat streaming / the resident-vs-streamed split apply. It used to be refused here
+    # from when the server only drove the reference driver; that made the HTTP path ~50%
+    # slower than in-process for no reason (analysis.md 27).
     return plan(level)
 
 
@@ -2827,8 +2831,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tier",
-        default="balanced",
-        choices=("conservative", "balanced"),
+        default="aggressive",
+        choices=("conservative", "balanced", "aggressive"),
         help="optimization tier for the reference path (default: balanced, i.e. the first",
     )
     parser.add_argument(
