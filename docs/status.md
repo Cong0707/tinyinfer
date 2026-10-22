@@ -129,3 +129,11 @@ hardware.
    from the 1.66s/token measurement.
 4. If VRAM allows (>=16GB card), resident layers remove 6ms/token each and make the
    1.23s floor reachable in practice.
+## Multi-turn (verified this round)
+
+`Enginesave_checkpoint(path)` after a prefill captures the conversation prefix in 16.9MB;
+`load_checkpoint` restores it in ~0.01s, so later turns only prefill the new text instead
+of the whole transcript (a 23-token prefix costs 43.5s to prefill). Verified with
+`examples/multi_turn.py`: population -> 1,000,000, Hamlet -> Shakespeare, no re-prefill.
+`generate(..., start_pos=, keep_session=)` are the two API additions it needs. The HTTP
+server does not wire this up yet (single request at a time).
