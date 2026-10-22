@@ -674,3 +674,21 @@ CUDA_LAUNCH_BLOCKING run with residency 3, and is queued in docs/ROADMAP.md.
   cause sits below the engine (driver page migration under VRAM pressure), and it is why
   no configuration is advertised as reproducible.
 
+
+## 20. What the non-determinism means for output quality (quantified)
+
+Eight identical calls on the prompt `hi`: argmax = [356, 29468, 48253, 17638, 918, 60032,
+79005, 344] -- eight different answers. The same engine on `The capital of France is`
+answers `Paris` every time. Both are the same numeric noise: this checkpoint is a base
+model, and `hi` leaves the next-token distribution nearly flat, so a 1e-3 logit
+perturbation is enough to change the argmax; where the model is confident (France, pi)
+the perturbation cannot reach the second candidate.
+
+Practical reading:
+
+- on confident prompts the output is stable and usable,
+- on flat prompts (short/ambiguous context) generation is effectively sampling, whether
+  or not the engine is deterministic,
+- so "usable output" and "reproducible logits" are different questions, and only the
+  second one is blocked by the platform-level noise.
+
