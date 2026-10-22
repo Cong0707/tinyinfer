@@ -667,3 +667,10 @@ CUDA_LAUNCH_BLOCKING run with residency 3, and is queued in docs/ROADMAP.md.
   residency small enough that the driver never pages (measured exact at 3 of 40 layers,
   which costs most of the speed).
 
+
+- Confirming the randomness: the same plan (10 resident layers, no pool) was exact on one
+  tier and 30.75 off on the other in back-to-back runs, i.e. whether a given configuration
+  reproduces is a coin flip on this card. That is the strongest evidence yet that the
+  cause sits below the engine (driver page migration under VRAM pressure), and it is why
+  no configuration is advertised as reproducible.
+
