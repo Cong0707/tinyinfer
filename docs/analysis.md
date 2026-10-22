@@ -973,3 +973,20 @@ Summary of what was wrong and what fixed it:
 | 3 | no `empty_cache()` after prefill | flush like `Engine.generate` does | small, consistency |
 | 4 | (already correct) `layers=range(40)` | -- | not a defect, same as the engine default |
 
+
+### Multi-turn over HTTP (TI_SERVER_PREFIX=1, aggressive tier)
+
+    turn 1 (12 prompt tokens): 66.5s, answer ` The capital of`
+    turn 2 (27 prompt tokens): 74.2s, answer ` Paris`
+
+Turn 2 is *not* faster, so the slot prefix did not match. The reason is structural: the
+server records `prompt_ids + generated_ids` and compares token ids, but the chat template
+re-renders the assistant turn differently from the tokens the model actually generated, so
+the two sequences diverge before the new question. Fixing it means recording the *rendered*
+prefix (the exact token ids of the next request's prompt) instead of the generated ids -- a
+small but real change, and it is what the verification uncovered.
+
+Functionally the path is fine (both answers are sensible); it just does not save the
+prefill. The in-process mechanism (examples/multi_turn.py) does, because there the caller
+controls the exact token ids.
+
