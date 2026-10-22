@@ -729,3 +729,9 @@ That is the only lever left on a disk-bound box, and it also explains why earlie
 experiments looked like they went "negative past 15GB": what actually starves the slab is
 not the cache size but sizing it without accounting for the slab.
 
+
+- The cache plateaus at ~26% hit: 16GB (870 experts) gives 25.7% against 14GB (747)
+  25.5%, and its warm prefill is slower (16.3s vs 13.1s, likely page-cache pressure). So
+  the room-after-slab formula's 14GB is the sweet spot on this box, and the working set
+  of the decode loop is ~26% of the 240 routable experts per session.
+
