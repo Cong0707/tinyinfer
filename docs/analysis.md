@@ -692,3 +692,19 @@ Practical reading:
 - so "usable output" and "reproducible logits" are different questions, and only the
   second one is blocked by the platform-level noise.
 
+
+## 21. End-to-end check with the new default plan
+
+Three prompts through `generate()` (14 new tokens each), 8GB card, default tier:
+
+| prompt | answer |
+| --- | --- |
+| What is the capital of France? | ` It is Paris.` |
+| What is pi? | ` Pi is a mathematical constant approximately equal to 3.14159.` |
+| Who wrote Hamlet? | ` William Shakespeare` |
+
+All three complete and correct, which is the point of the whole exercise: a 510GB fp8/fp4
+checkpoint streamed from disk on an 8GB laptop answers factual questions correctly. The
+engine's remaining defects are documented (reproducibility on this card, chunked-prefill
+accumulation) and none of them change these answers.
+
