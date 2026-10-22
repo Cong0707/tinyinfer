@@ -998,6 +998,17 @@ class TinyModelBackend(BaseBackend):
                     logits = self._model.forward(ids[:, prefix_len:], prefix_len)
                 else:
                     logits = self._model.forward(ids, 0)
+                # the prefill kernels (tilelang workspace for the prompt-length shape)
+                # leave gigabytes of cached blocks behind; on a card this size that
+                # pushes reserved past physical memory and every decode step then
+                # pages. Engine.generate() has always done this -- the server did not,
+                # which is why the same 12-token prompt took 85-97s over HTTP against
+                # 51s in-process. Hand the blocks back to the driver before decoding.
+                try:
+                    if torch.cuda.is_available() and torch.cuda.is_initialized():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
                 # the next sampled token occupies position len(prompt_ids)-1+1 == len(prompt_ids)
                 position = len(prompt_ids) - 1
                 for step in range(sampling.max_tokens):
@@ -2811,9 +2822,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tier",
-        default="conservative",
-        choices=("conservative", "balanced"),
-        help="optimization tier for the reference path",
+        default="balanced",
+        choices=("conservative", "balanced", "aggressive"),
+        help="optimization tier for the reference path (default: balanced, i.e. the first",
     )
     parser.add_argument(
         "--api-key", default=None, help="comma separated API keys (or TINYINFER_API_KEY)"
