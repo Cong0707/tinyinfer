@@ -807,3 +807,9 @@ two small API additions: `Engine.generate(..., start_pos=, keep_session=)` (the 
 signature always reset the session, which threw away the freshly restored state) and the
 shared-state coverage in `snapshot`/`restore`.
 
+
+- Pinned-cache share: raising the pinned budget from ~11GB (80% of the RAM cache) to 13GB
+  gives a normalised 0.312 tok/s per GB/s against the default 0.315, i.e. no gain -- the
+  H2D side is not the bottleneck any more (the host-to-device copy is already 26.5GB/s on
+  the pinned path and most experts are pageable reads from disk, not copies).
+
