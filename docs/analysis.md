@@ -841,3 +841,24 @@ turns are ~2x faster, and the saving grows with conversation length (the prefix 
 grow the per-turn cost at all). The answers in the same run: Paris / 1.5 million /
 William Shakespeare.
 
+
+## 24. HTTP server: prefix resume is wired but does not pay (and the endpoint is slow)
+
+With `TI_SERVER_PREFIX=1` on a clean single-slot server:
+
+| turn | time | answer |
+| --- | --- | --- |
+| 1 (fresh prefix) | 107.8s | ` The capital of France is Paris` |
+| 2 (extends turn 1) | 149.7s | `  The population of Paris is` |
+
+Turn 2 is *slower*, so the resume did not take effect as hoped (the token-id prefix check
+may be defeated by how the chat template renders the assistant turn) -- and more
+importantly the HTTP path costs ~2x the engine path for the same work (107.8s against 51s
+for 10+6 tokens through `Engine.generate`). The overhead is in the server's own loop
+(per-token text decoding for streaming deltas, request bookkeeping), not in the model.
+
+Position: the engine-level mechanism is verified (`examples/multi_turn.py`, 51s -> 30.9s ->
+28.9s); the HTTP wiring stays opt-in and off by default, and the server's per-token overhead
+is now the more valuable thing to fix than the prefix logic. Recorded rather than papered
+over.
+
