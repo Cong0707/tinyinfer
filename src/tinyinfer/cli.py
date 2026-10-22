@@ -38,9 +38,10 @@ def _add_backend_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--model-id", default=None, help="model id reported by /v1/models")
     group.add_argument(
         "--tier",
-        default="conservative",
-        choices=("conservative", "balanced"),
-        help="optimization tier (conservative=reference, balanced=ExpertStore experts)",
+        default="aggressive",
+        choices=("conservative", "balanced", "aggressive"),
+        help="optimization tier (conservative=reference, balanced, aggressive=flat streaming;"
+             " the CLI default matches the engine's)",
     )
     group.add_argument(
         "--adapter",

@@ -865,9 +865,17 @@ class TinyModelBackend(BaseBackend):
     def _encode(self, text: str) -> list[int]:
         tokenizer = self._tokenizer
         if hasattr(tokenizer, "encode"):
-            return list(tokenizer.encode(text))
-        encoded = tokenizer(text)["input_ids"]
-        return list(encoded)
+            ids = list(tokenizer.encode(text))
+        else:
+            ids = list(tokenizer(text)["input_ids"])
+        # the checkpoint is a base model: without the sentence-start token it continues
+        # whatever pattern the raw text suggests instead of answering (measured: JSON
+        # fragments like `"role": "user"` for a plain question). The in-process path has
+        # always prepended it, which is why the same prompt answered correctly there.
+        bos = getattr(tokenizer, "bos_token_id", None)
+        if isinstance(bos, int) and (not ids or ids[0] != bos):
+            ids = [int(bos)] + ids
+        return ids
 
     def _decode(self, ids: Sequence[int]) -> str:
         tokenizer = self._tokenizer
