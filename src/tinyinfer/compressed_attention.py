@@ -299,11 +299,15 @@ class MLACompressedAttention:
 
         if __import__("os").environ.get("TI_DEBUG_ATTN") and \
                 getattr(self, "layer_id", -1) == 20:
-            print(f"[attn20] start={start_pos} s={s} ratio={ratio_now} "
-                  f"compress_len={compress_len} "
-                  f"kv={None if compress_kv is None else tuple(compress_kv.shape)} "
-                  f"idxs={None if compress_idxs is None else tuple(compress_idxs.shape)} "
-                  f"win={tuple(win_idxs.shape)}", flush=True)
+            _ck = self.rt.compress_kv
+            _ik = getattr(self.rt, "index_k", None)
+            _cd = getattr(self.rt, "candidates", None)
+            print(f"[attn20] start={start_pos} s={s} cl={compress_len} "
+                  f"kv={None if compress_kv is None else tuple(compress_kv.shape)}"
+                  f"|{0.0 if _ck is None else float(_ck.float().abs().sum()):.6f} "
+                  f"ik={None if _ik is None else tuple(_ik.shape)}"
+                  f"|{0.0 if _ik is None else float(_ik.float().abs().sum()):.6f} "
+                  f"cand={None if _cd is None else float(_cd.sum()):.1f}", flush=True)
         if compress_idxs is not None and compress_idxs.size(-1) > 0:
             kv_all = torch.cat([kv_w, compress_kv], dim=1)
             # Right-pad the compressed slots to the configured top-k. Near the start of a
