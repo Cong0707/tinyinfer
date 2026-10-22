@@ -124,7 +124,20 @@ class Engine:
                 # The layer slab asks for its bytes AFTER this, so the cache may only
                 # take a minority of what is free or the box starts paging to C: and
                 # every read turns into a swap-in (observed: 9.3s/token).
-                _cache_bytes = max(192 << 20, min(_plan_cache, int(_hb_room * 0.35)))
+                # Size the host expert cache from what is genuinely free after the pinned
+                # layer slab, not from a flat fraction: the slab needs (n_layers -
+                # resident) * layer_b and is requested *after* this, so a fraction that is
+                # too large starves it (measured: 9.3s/token with a 15.3GB cache on this
+                # box). TI_CACHE_GB overrides for A/B.
+                _slab_need = (self.cfg.n_layers - (hw.gpu_layers if hw is not None else 0)) * 178e6
+                _cache_room = max(192 << 20, int(_hb_room - _slab_need - 3 * (1 << 30)))
+                _cache_bytes = max(192 << 20, min(_plan_cache, _cache_room))
+                _ov = __import__("os").environ.get("TI_CACHE_GB")
+                if _ov:
+                    try:
+                        _cache_bytes = int(float(_ov) * (1 << 30))
+                    except ValueError:
+                        pass
                 self.expert_store = ExpertStore.from_store(
                     self.store,
                     slot_arena=bool(getattr(self.tier, "slot_arena", False)),
