@@ -88,6 +88,41 @@ class HostBudget:
         except Exception:
             return self._avail0
 
+    def claim(self, nbytes: int, real: bool = False) -> bool:
+        """Reserve the whole planned footprint up front (one measurement, one decision).
+
+        The planner sizes every buffer from a single measurement taken at start-up. When
+        allocation is lazy, other processes eat that memory in the meantime and the
+        numbers the plan was built on are gone: grants come back short and the box ends up
+        swapping. claim() books the planned bytes once so `room()` no longer has to consult
+        live `available()` (which is exactly what made the plan drift).
+
+        `real=True` also allocates and touches the pages so the OS commits them; that is
+        the strongest guarantee but it doubles the footprint while the caches are still
+        lazily filled, so it is opt-in (TI_CLAIM_REAL=1) until the caches allocate from
+        the claimed pool.
+        """
+        nbytes = max(0, int(nbytes))
+        if nbytes <= 0:
+            return False
+        with self._lock:
+            if self.granted + nbytes > self.limit:
+                return False
+            if real:
+                try:
+                    buf = bytearray(nbytes)
+                    for i in range(0, nbytes, 1 << 20):
+                        buf[i] = 1
+                    buf[-1] = 1
+                    if not hasattr(self, "_held"):
+                        self._held = []
+                    self._held.append(buf)
+                except MemoryError:
+                    return False
+            self.granted += nbytes
+            self._claimed = True
+            return True
+
     def room(self) -> int:
         """Bytes we may still hand out from our share of physical RAM.
 
@@ -97,6 +132,10 @@ class HostBudget:
         per-tensor copies and the box swapped to C:). Our share of *total* RAM is the
         stable quantity; the standby list is reclaimable by the OS on demand.
         """
+        if getattr(self, "_claimed", False):
+            # claimed up front: the plan's own arithmetic is authoritative, live
+            # available() would just make it drift with whatever else is running
+            return max(0, self.limit - self.granted)
         if not self.limit:
             return max(0, self.available() - self.reserve)
         # Both bounds matter: our share caps the total we hand out, and the live
