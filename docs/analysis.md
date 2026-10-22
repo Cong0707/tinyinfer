@@ -630,3 +630,29 @@ deterministic in its *decisions* (argmax stable most of the time) but not in its
 this card. Verifying that would need a VRAM-headroom experiment (fewer resident layers)
 which is queued in docs/ROADMAP.md.
 
+
+## 19. Reproducibility: final honest status
+
+Experiments, all on the 8GB card:
+
+| configuration | three identical forwards |
+| --- | --- |
+| tier 2, slot pool on (old default) | differ by 0.5-1.0 |
+| slot pool off (`TI_NO_SLOTS=1`) | once 0.000000, later 21.8 (coincidence) |
+| MTP off + pool off (new default) | 21.6-21.8 |
+| resident layers forced to 6 | once 0.000000, later 18.6 |
+| resident layers forced to 3 | 0.000000 |
+
+The 0.000000 rows are not reproducible as an outcome: the same configuration produced both
+exact agreement and 18-24 logit differences. That points at the platform (WDDM page
+migration and scheduling on a card whose plan already uses ~85% of the physical VRAM), not
+at an engine flag. Lower residency reduces the probability but does not remove it, and it
+costs speed.
+
+**What this means for a caller:** the engine is deterministic in its decisions but not in
+its logits on this card. The default plan keeps the fast configuration (10 resident layers,
+no pool, no MTP). If bit-identical repeats matter, run the same configuration in a loop
+and compare -- but do not rely on `TI_NO_SLOTS=1` for exactness; that claim was withdrawn
+in §18. Verifying the paging hypothesis properly needs a card with headroom or a
+CUDA_LAUNCH_BLOCKING run with residency 3, and is queued in docs/ROADMAP.md.
+
