@@ -813,3 +813,9 @@ shared-state coverage in `snapshot`/`restore`.
   H2D side is not the bottleneck any more (the host-to-device copy is already 26.5GB/s on
   the pinned path and most experts are pageable reads from disk, not copies).
 
+
+- Prefill chunk on a 63-token prompt: chunk=2 -> 87.8s, chunk=4 -> 69.5s, chunk=8 -> 69.4s
+  (1.10s/token). So 4 and 8 are the same plateau and the planner's 8 is right; the earlier
+  "chunk=4 is 1.58x better" was a 12-token effect (small enough that the per-block layer
+  re-streaming dominates). chunk=2 is 26% slower and is never the right choice.
+
