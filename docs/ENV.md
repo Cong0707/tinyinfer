@@ -33,6 +33,7 @@ them is required to run.
 | TI_PREFILL_CHUNK | token block size for prefill; 1 = exactly reference-matching, planner's value ~1.6x faster but 0.5%/layer off (docs/analysis.md §13) |
 | TI_REF_ATTN | 1 routes sparse attention through the PyTorch reference (diagnostic; slow) |
 | TI_DEBUG_ATTN | 1 prints the compressed layer's group bookkeeping per call (diagnostic) |
+| TI_MAX_RESIDENT | cap on resident layers: less VRAM pressure, only ~25% vs 12.5% argmax agreement on flat prompts (docs/analysis.md 19) |
 
 ## Measurement
 

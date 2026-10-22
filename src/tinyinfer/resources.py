@@ -419,6 +419,16 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
         buffers = min(buffers, 2)
         resident = min(n_layers, layers_that_fit(False, False, buffers, ws0))
 
+    # VRAM headroom knob: on cards where the plan uses ~85% of physical VRAM the driver
+    # can page, which makes identical runs differ (docs/analysis.md 19). Lower residency
+    # trades speed for a better chance of reproducibility.
+    _cap = __import__("os").environ.get("TI_MAX_RESIDENT")
+    if _cap:
+        try:
+            resident = max(0, min(resident, int(_cap)))
+        except ValueError:
+            pass
+
     # A handful of expert slots is worse than one fewer resident layer: without a
     # staging pool every expert allocates a fresh 18.8MB device buffer per layer per
     # token. Keep room for two layers' worth of experts (2 x top-k) before trading the
