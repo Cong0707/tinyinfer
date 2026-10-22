@@ -862,3 +862,18 @@ Position: the engine-level mechanism is verified (`examples/multi_turn.py`, 51s 
 is now the more valuable thing to fix than the prefix logic. Recorded rather than papered
 over.
 
+
+## 25. Final benchmark of the tree (10:30, disk 1.45GB/s)
+
+| metric | value |
+| --- | --- |
+| first forward | 31.8s |
+| warm prefill (8 tokens) | 13.5s |
+| decode | 0.475 tok/s |
+| expert cache hit | 21.9% |
+| disk (as the volume reports) | 1.45GB/s |
+
+Normalised by disk rate that is 0.328 tok/s per GB/s, up from the 0.282-0.315 measured
+before the cache was sized from the room left after the slab (§22) -- the +7.7% decode gain
+is still there, the absolute number moved only because the volume slowed down again.
+
