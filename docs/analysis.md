@@ -769,3 +769,28 @@ was the disk drift, not the policy. ARC stays the default because its hit rate i
 (less disk pressure); this also shows the normalisation method is what makes any of these
 comparisons meaningful on a volume whose rate wanders between 1.3 and 1.9GB/s.
 
+
+## 23. Multi-turn acceleration: the prefix checkpoint works (16.9MB, 0.01s restore)
+
+A 23-token conversation prefix costs **43.5s** to prefill and produces a **16.9MB**
+checkpoint that restores in **0.01s** (tier-2 `save_checkpoint`/`load_checkpoint`, i.e.
+`snapshot`/`restore`). Reusing it skips the entire prefix prefill -- a 4000x speedup for
+the reused part -- which is the mechanism that makes multi-turn chat usable on this box
+(each turn only prefills the new tokens).
+
+Parity check, and why the first attempt looked broken:
+
+| comparison | max abs diff | argmax |
+| --- | --- | --- |
+| two **full** prefills (no checkpoint) | 6.80 | same |
+| restore #1 / #2 / #3 vs a full prefill | 7.75 / 7.67 / 7.67 | same |
+
+The restore difference is the same size as the platform noise between two ordinary
+prefills, so the checkpoint is faithful; the earlier "restore is off by 8.3" reading was
+noise. `snapshot`/`restore` also now carry the shared compressed-attention handoff state
+(`compress_kv`, `index_k`, `topk_idxs`, `candidates`) which they used to drop -- that is a
+real gap when a restored session's followers read what the kv_source published.
+
+Practical use: `eng.save_checkpoint(path)` after a prefill, then `eng.load_checkpoint(path)`
+in the next turn and continue from `len(prefix)`. Both require tier 2 (the default).
+

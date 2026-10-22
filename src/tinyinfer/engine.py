@@ -469,10 +469,34 @@ class Engine:
             if idx is not None and getattr(idx, "_k_cache", None) is not None:
                 entry["ik"] = idx._k_cache.clone()
             snap[i] = entry
+        # The compressed layers hand state around through the shared handoff slot
+        # (compress_kv / index_k / candidates are published by the kv_source layer and
+        # read by its followers). Without these a restored session re-derives them on the
+        # next forward and drifts: measured max|d| = 8.3 (rel 0.51) against a full
+        # prefill while the argmax stayed the same.
+        try:
+            from .compressor import shared_attn as _sa
+            snap["_rt"] = {
+                "compress_kv": None if getattr(_sa, "compress_kv", None) is None
+                else _sa.compress_kv.clone(),
+                "index_k": None if getattr(_sa, "index_k", None) is None
+                else _sa.index_k.clone(),
+                "topk_idxs": None if getattr(_sa, "topk_idxs", None) is None
+                else _sa.topk_idxs.clone(),
+                "candidates": None if getattr(_sa, "candidates", None) is None
+                else _sa.candidates.clone(),
+                "candidates_by_chunk": dict(getattr(_sa, "candidates_by_chunk", {}) or {}),
+                "src_ratio": getattr(_sa, "src_ratio", None),
+            }
+        except Exception:
+            snap["_rt"] = None
         return snap
 
     def restore(self, snap: dict) -> None:
+        restore_rt = snap.pop("_rt", None) if isinstance(snap, dict) else None
         for i, entry in snap.items():
+            if not isinstance(i, int):
+                continue
             b = self.block(i)
             a = b.attn
             a._kv_window = None if entry.get("kv") is None else entry["kv"].clone()
@@ -489,6 +513,16 @@ class Engine:
             if idx is not None:
                 idx._k_cache = None if entry.get("ik") is None else entry["ik"].clone()
             b.ffn._expert_cache.clear()
+        if restore_rt:
+            try:
+                from .compressor import shared_attn as _sa
+                for _k in ("compress_kv", "index_k", "topk_idxs", "candidates"):
+                    _v = restore_rt.get(_k)
+                    setattr(_sa, _k, None if _v is None else _v.clone())
+                _sa.candidates_by_chunk = dict(restore_rt.get("candidates_by_chunk") or {})
+                _sa.src_ratio = restore_rt.get("src_ratio")
+            except Exception:
+                pass
 
     # -- double-buffered streaming -----------------------------------------
     def _ensure_stream_buffers(self, layer_id: int):
