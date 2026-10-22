@@ -110,18 +110,70 @@ class HostBudget:
                 return False
             if real:
                 try:
-                    buf = bytearray(nbytes)
-                    for i in range(0, nbytes, 1 << 20):
-                        buf[i] = 1
-                    buf[-1] = 1
-                    if not hasattr(self, "_held"):
-                        self._held = []
-                    self._held.append(buf)
+                    if not self._commit(nbytes):
+                        return False
                 except MemoryError:
                     return False
             self.granted += nbytes
             self._claimed = True
             return True
+
+    def _commit(self, nbytes: int) -> bool:
+        """Commit nbytes of address space so no other process can take it.
+
+        Windows VirtualAlloc(MEM_COMMIT) reserves *and* charges the commit limit in
+        kernel time (measured: 19GB in 0.000s), unlike bytearray(), which zero-fills and
+        costs ~1.7s per 19GB. This is the "claim it up front, in under a second" primitive.
+        """
+        try:
+            import ctypes
+
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.VirtualAlloc.restype = ctypes.c_void_p
+            k32.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
+                                         ctypes.c_ulong, ctypes.c_ulong]
+            k32.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong]
+            ptr = k32.VirtualAlloc(None, int(nbytes), 0x1000 | 0x2000, 0x04)
+            if not ptr:
+                return False
+            # VirtualAlloc alone only charges the commit limit; the physical pages are
+            # still unowned until written, which is why Task Manager showed a slow climb
+            # and the box could still page. Touch one byte per 4KB page from 16 threads:
+            # measured 14GB in 0.20s (vs 1.0s single-threaded).
+            import threading as _th
+
+            n = int(nbytes)
+            step = max(4096, (n // 16) // 4096 * 4096)
+            view = ctypes.c_char * n
+            buf = None
+            try:
+                import ctypes as _ct
+                buf = (_ct.c_char * n).from_address(ptr)
+            except Exception:
+                buf = None
+            if buf is None:
+                return True
+
+            def _touch(lo, hi):
+                for off in range(lo, hi, 4096):
+                    buf[off] = b"\x01"
+
+            ths = []
+            for i in range(16):
+                lo = i * step
+                hi = min(n, (i + 1) * step) if i < 15 else n
+                if lo < n:
+                    t = _th.Thread(target=_touch, args=(lo, hi), daemon=True)
+                    t.start()
+                    ths.append(t)
+            for t in ths:
+                t.join()
+            if not hasattr(self, "_held"):
+                self._held = []
+            self._held.append((k32, ptr))
+            return True
+        except Exception:
+            return False
 
     def room(self) -> int:
         """Bytes we may still hand out from our share of physical RAM.

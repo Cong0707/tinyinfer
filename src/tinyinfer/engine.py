@@ -138,8 +138,7 @@ class Engine:
                 # That drift is what made the engine page to disk halfway through a
                 # request. TI_CLAIM_REAL=1 also commits the pages (opt-in: it doubles the
                 # footprint until the caches are filled).
-                _host_budget().claim(_cache_bytes + int(_slab_need),
-                                     real=__import__("os").environ.get("TI_CLAIM_REAL") == "1")
+                _host_budget().claim(_cache_bytes + int(_slab_need), real=True)
                 _ov = __import__("os").environ.get("TI_CACHE_GB")
                 if _ov:
                     try:
