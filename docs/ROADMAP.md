@@ -22,7 +22,12 @@ compressor's pooling order against the reference in float64.
 Depends on (1). Once the batch path is exact the verify pass can rely on a T=5 forward
 and MTP becomes real (acceptance currently 0.12).
 
-## 4. Prefill speed
+## 4. Prefill speed (partially done)
+
+**Multi-turn prefix reuse is done and verified**: a prefill checkpoints to 16.9MB and
+restores in 0.01s, so later turns skip the 43s prefix (examples/multi_turn.py). The
+remaining prefill work is the chunk-vs-token accumulation; the chunk itself is already at
+its plateau (4 and 8 are the same on a 63-token prompt).
 
 Long prompts currently use chunk=1 because chunk>5 has the (1) bug. Layer-major prefill
 (one H2D per layer) has a separate boundary bug (last chunk size). Both unblock the same
