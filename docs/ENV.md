@@ -75,3 +75,5 @@ them is required to run.
 Everything else in `src/` (TI_DEBUG_*, TI_*_PROF, TI_TIME, TI_LAYER_TIME, TI_MEM_TRACE,
 TI_WALL_PROF) only prints diagnostics and changes no value.
 
+
+| TI_SERVER_PREFIX | 1 makes the HTTP server resume from a slot's previous prefix instead of re-prefilling it (opt-in; the OpenAI API is stateless, so the client must send the growing conversation on the same slot). Experimental: validated by the unit tests and the engine mechanism, not yet measured end to end over HTTP. |
