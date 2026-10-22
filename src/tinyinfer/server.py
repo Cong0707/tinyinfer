@@ -599,6 +599,9 @@ class TinyModelBackend(BaseBackend):
         )
         self._expert_store = None
         self._slot_kv: dict[int, dict[int, Any]] = {}
+        # slot -> (token ids of the conversation so far, their count); lets a
+        # request resume from the prefix instead of re-prefilling it (TI_SERVER_PREFIX=1)
+        self._slot_prefix: dict[int, tuple[tuple[int, ...], int]] = {}
         self._lock = threading.Lock()
         self._gen_lock = threading.Lock()
         if load_at_init:
@@ -983,7 +986,18 @@ class TinyModelBackend(BaseBackend):
         try:
             with torch.inference_mode():
                 ids = torch.tensor([prompt_ids], dtype=torch.long)
-                logits = self._model.forward(ids, 0)
+                prefix_len = 0
+                if __import__("os").environ.get("TI_SERVER_PREFIX") == "1":
+                    prev = self._slot_prefix.get(slot_id)
+                    if prev is not None:
+                        prev_ids, prev_len = prev
+                        if (len(prompt_ids) > prev_len
+                                and tuple(prompt_ids[:prev_len]) == prev_ids):
+                            prefix_len = prev_len
+                if prefix_len:
+                    logits = self._model.forward(ids[:, prefix_len:], prefix_len)
+                else:
+                    logits = self._model.forward(ids, 0)
                 # the next sampled token occupies position len(prompt_ids)-1+1 == len(prompt_ids)
                 position = len(prompt_ids) - 1
                 for step in range(sampling.max_tokens):
@@ -1023,6 +1037,9 @@ class TinyModelBackend(BaseBackend):
                     )
         finally:
             self._stash_slot(slot_id)
+            if __import__("os").environ.get("TI_SERVER_PREFIX") == "1":
+                full = tuple(prompt_ids + generated)
+                self._slot_prefix[slot_id] = (full, len(full))
             self._trim_expert_cache()
         yield TokenEvent(
             finish_reason=finish,
