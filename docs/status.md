@@ -75,7 +75,17 @@ continuations are its behaviour, not an engine defect (docs/analysis.md).
 | compressed slot indices padded to a constant width | removes the variable-width cat that killed layer-major |
 | `TI_NO_SLOTS` | reproducible logits (slot pool races; see below) |
 
-## Reproducibility (new, important)
+## Reproducibility (corrected, final)
+
+The earlier attribution to the VRAM slot pool was **wrong** (docs/analysis.md §18-19):
+three identical forwards differ by 18-24 logits even with the pool and MTP disabled, and a
+configuration that once gave 0.000000 later gave 18.6. Residency 3 (of 40) was the only
+setting that stayed exact in the tests run, at a large speed cost. The engine is
+deterministic in its decisions, not in its logits, on this card; the cause points at WDDM
+page migration with ~85% of physical VRAM in use. `TI_NO_SLOTS=1` is no longer claimed to
+give reproducibility.
+
+## Reproducibility (earlier claim, superseded)
 
 Two identical forwards differ by 0.63-0.78 relative with the VRAM slot pool on and
 0.000000 with `TI_NO_SLOTS=1`. Decode text stays coherent (top-1 stable), but the logits
