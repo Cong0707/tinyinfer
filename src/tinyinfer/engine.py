@@ -143,7 +143,9 @@ class Engine:
                     slot_arena=bool(getattr(self.tier, "slot_arena", False)),
                     # parallel reads saturate the device around QD=8-16; scale with the
                     # core count instead of pinning a machine-specific thread count
-                    reader_threads=min(16, max(4, (__import__("os").cpu_count() or 8))),
+                    reader_threads=int(__import__("os").environ.get(
+                        "TI_READERS",
+                        str(min(16, max(4, (__import__("os").cpu_count() or 8)))))),
                     cache_bytes=_cache_bytes,
                     policy=__import__("os").environ.get("TI_CACHE_POLICY", "arc"),
                     vram_slots=_slots if device != "cpu" else 0,

@@ -735,3 +735,9 @@ not the cache size but sizing it without accounting for the slab.
   the room-after-slab formula's 14GB is the sweet spot on this box, and the working set
   of the decode loop is ~26% of the 240 routable experts per session.
 
+
+- Disk-reader parallelism: normalising decode by the measured disk rate, 32 readers are
+  ~5% more efficient than 16 (0.313-0.315 vs 0.282-0.297 tok/s per GB/s). The default stays
+  16 because the difference is within run-to-run spread and 32 threads oversubscribe a
+  16-thread CPU, but `TI_READERS` is exposed for a box with more cores.
+
