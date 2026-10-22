@@ -154,13 +154,20 @@ class Engine:
                 # -- the claim could come back short and the plan would be fiction.
                 _target = max(192 << 20, int(_hb_room - _slab_need - 3 * (1 << 30)))
                 _taken = int(_budget.claim(_target, real=True))
-                _cache_bytes = max(192 << 20, _taken) if _taken else 192 << 20
+                # THE host pool: one allocation, everything pageable is carved from it
+                from .budget import HostPool
+                from .loading import BlobPool
+
                 _pool_view = getattr(_budget, "_claim_buf", None)
+                self.host_pool = (HostPool.from_claimed(_pool_view, _taken)
+                                  if _taken and _pool_view is not None else None)
+                _cache_bytes = max(192 << 20, _taken) if _taken else 192 << 20
                 _cache_pool = None
-                if _pool_view is not None and _cache_bytes > 0:
-                    from .loading import BlobPool
-                    _cache_pool = BlobPool(_pool_view.obj if hasattr(_pool_view, "obj")
-                                           else _pool_view, _cache_bytes)
+                if self.host_pool is not None:
+                    _cache_bytes = int(min(_cache_bytes, self.host_pool.free))
+                    _slot = self.host_pool.alloc(_cache_bytes) if _cache_bytes > 0 else None
+                    if _slot is not None:
+                        _cache_pool = BlobPool(_slot, _cache_bytes)
                 _ov = __import__("os").environ.get("TI_CACHE_GB")
                 if _ov:
                     try:

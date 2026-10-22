@@ -46,6 +46,61 @@ def _physical_ram() -> int:
     return 0
 
 
+class HostPool:
+    """One big host allocation that every pageable buffer carves from.
+
+    Rationale: the engine knows its whole footprint at start-up. Allocating it once and
+    sub-allocating keeps every byte inside memory the process already owns, so a later
+    cache fill cannot fail (or push the box to the page file) because some other program
+    took the RAM in between -- the failure mode seen in practice.
+
+    Also usable as a pinned pool by passing the buffer reported by a CUDA host alloc.
+    """
+
+    def __init__(self, total: int):
+        self.total = max(0, int(total))
+        self._view = None
+        self._off = 0
+        self._lock = threading.Lock()
+        self._owner = None
+
+    @classmethod
+    def from_claimed(cls, buffer, nbytes: int) -> "HostPool":
+        pool = cls(nbytes)
+        view = memoryview(buffer)
+        try:
+            view = view.cast("B")
+        except (TypeError, ValueError):
+            pass
+        pool._view = view[: int(nbytes)]
+        pool._owner = buffer          # keep the allocation alive
+        return pool
+
+    @property
+    def used(self) -> int:
+        return self._off
+
+    @property
+    def free(self) -> int:
+        return max(0, self.total - self._off)
+
+    def alloc(self, n: int, align: int = 4096) -> memoryview | None:
+        """Carve n bytes (4096-aligned by default). Returns None when full."""
+        n = int(n)
+        if n <= 0 or self._view is None:
+            return None
+        with self._lock:
+            start = (self._off + align - 1) // align * align
+            if start + n > self.total:
+                return None
+            self._off = start + n
+            return self._view[start:start + n]
+
+    def reset(self) -> None:
+        with self._lock:
+            self._off = 0
+
+
 class HostBudget:
     def __init__(self, reserve_gb: float | None = None):
         self._lock = threading.Lock()
