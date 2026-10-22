@@ -17,6 +17,21 @@ them with predicted floors (tools/plan_matrix.py): a 4GB card is refused with th
 size, a 6GB card runs, CPU-only boxes keep the tables on the host, unified memory books
 one pool, and a 24GB card gets full expert coverage.
 
+## Prefill (this round's second half)
+
+| prompt | path | time | vs token-by-token |
+| --- | --- | --- | --- |
+| 12 tokens | chunk=1 (exact) | 18.3s | 1.00x |
+| 12 tokens | chunk=4 | 11.6s | **1.58x** |
+| 63 tokens | default chunk (8) | 79.7s | **1.7x** (136s before) |
+
+The error of the chunked path is an accumulation (~0.95% at position 0, 57% by position 3
+after 40 layers), not a broken step: compressor, MoE, indexer score and attention each
+measure at their noise floor. Short prompts answer correctly (Paris, pi, multi-turn);
+long prompts should use `TI_PREFILL_CHUNK=1`. Two real defects were fixed on the way
+(candidate blocks not clipped to per-query visibility; index-list width varying with the
+chunk), and the remaining work is to make the compressed path bit-identical.
+
 ## Honesty items
 
 - **The session prefill drift (18-20 logits) is not fixed.** Five theories were tested and
