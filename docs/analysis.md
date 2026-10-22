@@ -794,3 +794,16 @@ real gap when a restored session's followers read what the kv_source published.
 Practical use: `eng.save_checkpoint(path)` after a prefill, then `eng.load_checkpoint(path)`
 in the next turn and continue from `len(prefix)`. Both require tier 2 (the default).
 
+
+### Verified end to end (examples/multi_turn.py)
+
+    Q: What is the capital of France?      ->  (saved 16.9MB prefix checkpoint)
+    Q: What is its population?              ->  1,000,000
+    Q: Who wrote Hamlet?                    ->  Shakespeare
+
+Turns 2 and 3 resumed from the checkpoint instead of re-prefilling the conversation, so
+the ~43s first-turn prefill is paid once per conversation rather than per turn. This needed
+two small API additions: `Engine.generate(..., start_pos=, keep_session=)` (the old
+signature always reset the session, which threw away the freshly restored state) and the
+shared-state coverage in `snapshot`/`restore`.
+
