@@ -143,7 +143,24 @@ class Engine:
                 # That drift is what made the engine page to disk halfway through a
                 # request. TI_CLAIM_REAL=1 also commits the pages (opt-in: it doubles the
                 # footprint until the caches are filled).
-                _host_budget().claim(_cache_bytes + int(_slab_need), real=True)
+                # Claim real memory for the expert cache and hand that very buffer to the
+                # store: the cache copies its entries INTO this slab instead of allocating
+                # a second one of the same size (which would defeat the claim and push the
+                # box back onto the page file).
+                _budget = _host_budget()
+                # Claim FIRST, plan from what was claimed: ask for our whole share minus
+                # the layer slab, then take the cache size to be whatever the OS actually
+                # handed over. Planning from an estimate and then claiming it was backwards
+                # -- the claim could come back short and the plan would be fiction.
+                _target = max(192 << 20, int(_hb_room - _slab_need - 3 * (1 << 30)))
+                _taken = int(_budget.claim(_target, real=True))
+                _cache_bytes = max(192 << 20, _taken) if _taken else 192 << 20
+                _pool_view = getattr(_budget, "_claim_buf", None)
+                _cache_pool = None
+                if _pool_view is not None and _cache_bytes > 0:
+                    from .loading import BlobPool
+                    _cache_pool = BlobPool(_pool_view.obj if hasattr(_pool_view, "obj")
+                                           else _pool_view, _cache_bytes)
                 _ov = __import__("os").environ.get("TI_CACHE_GB")
                 if _ov:
                     try:
@@ -159,6 +176,7 @@ class Engine:
                         "TI_READERS",
                         str(min(16, max(4, (__import__("os").cpu_count() or 8)))))),
                     cache_bytes=_cache_bytes,
+                    pool=_cache_pool,
                     policy=__import__("os").environ.get("TI_CACHE_POLICY", "arc"),
                     vram_slots=_slots if device != "cpu" else 0,
                     device=device if device != "cpu" else "cpu",
