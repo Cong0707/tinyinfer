@@ -528,3 +528,15 @@ path is made bit-identical to the token-wise one.
   prefill, and it needs a fixed reduction tree in the kernel rather than another masking
   fix.
 
+
+### Correction to the paragraph above
+
+Swapping in the reference softmax (`TI_REF_ATTN=1`) does **not** remove the chunk gap
+(0.80 -> 1.04), so the residual is **not** the kernel's softmax reduction tree after all.
+With compressor, MoE, indexer score and attention all ruled out by direct measurement, the
+remaining candidate is the **cross-layer handoff state** (`rt.compress_kv` / `rt.index_k` /
+`rt.candidates`) as a chunked pass publishes and consumes it -- every consumer reads what
+the source layer published for the same block, and both paths write the same values, yet
+the result differs. That is where the next investigation should start (and it is also
+where the slot-pool race lives, which may or may not be the same root cause).
+
