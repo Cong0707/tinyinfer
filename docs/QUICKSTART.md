@@ -47,6 +47,15 @@ JSON with build/first_forward/warm_prefill/decode/hit/disk. Compare `decode_tok_
 against the floor for that run's `disk_gb_s` (docs/PERFORMANCE.md), never against a
 number from a different disk state.
 
+## 3b. On an 8-12GB card, use `--tier 1`
+
+Measured on the 8GB box: tier 1 answers the same prompt in 50-69s where the default tier 2
+takes 91-94s, and tier 1 has no VRAM slot pool so its logits are reproducible. tier 2's
+level-2 features pay off on a card big enough to hold the experts (docs/analysis.md §15).
+
+    python -m tinyinfer.cli generate --backend tiny --tier 1 \
+        --model-dir <dir> "Question: What is pi?\nAnswer:" --max-tokens 16
+
 ## 4. If it is slow
 
 | symptom | first thing to check |
