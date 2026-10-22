@@ -401,7 +401,19 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
                 best = (cost, eg, hg, r)
         _, embed_gpu, head_gpu, _r = best
         buffers = BUF_COUNT
+    # forced head placement (diagnostics/tuning: keeps 1.3GB of VRAM for resident layers
+    # at the price of a host GEMV per token)
+    if __import__("os").environ.get("TI_HEAD_CPU") == "1":
+        head_gpu = False
+    # forced residency: overrides the solver so a caller can trade the streaming ring for
+    # resident layers (the prefill path has to free them again, see Engine._forward_impl)
+    _force_resident = __import__("os").environ.get("TI_RESIDENT")
     resident = min(n_layers, layers_that_fit(embed_gpu, head_gpu, buffers, ws0))
+    if _force_resident:
+        try:
+            resident = max(resident, min(int(_force_resident), n_layers))
+        except ValueError:
+            pass
     if resident >= n_layers:
         buffers = 0
         resident = n_layers
@@ -440,10 +452,13 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
 
     used = _used(resident)
     spare = max(0.0, V - used)
-    while resident > 0 and int(spare * SLOT_FRACTION // max(1.0, expert_b)) < MIN_SLOTS:
-        resident -= 1
-        used = _used(resident)
-        spare = max(0.0, V - used)
+    if not _force_resident:
+        # the solver only keeps slot room when it chose the residency itself; a caller
+        # that asked for a specific count (TI_RESIDENT) wants those layers, not slots
+        while resident > 0 and int(spare * SLOT_FRACTION // max(1.0, expert_b)) < MIN_SLOTS:
+            resident -= 1
+            used = _used(resident)
+            spare = max(0.0, V - used)
     slots = int(spare * SLOT_FRACTION // max(1.0, expert_b))
     slots = max(slots, 2) if has_gpu else 0
 
@@ -460,9 +475,10 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
 
     if need_slots and has_gpu and slots < need_slots * 0.15:
         # Below ~15% coverage the VRAM slot pool costs more than it saves: every expert
-        # that is not resident pays a DMA plus an event wait per use, and the pool is also
-        # the source of run-to-run logit noise. Measured on the 8GB card: disabling it made
-        # identical runs exactly reproducible and 8 tokens 53.0s -> 45.2s.
+        # that is not resident pays a DMA plus an event wait per use, and a slot that is
+        # still marked "ready" from a previous use hands back the wrong bytes (measured:
+        # 96 slots produced a different first token, and 13 slots made two identical
+        # greedy runs disagree). Decode speed comes from the host-pool read path instead.
         slots = 0
     if need_slots and has_gpu and slots < need_slots and (embed_gpu or head_gpu):
         for _eg, _hg in ((False, False), (False, True), (True, False)):

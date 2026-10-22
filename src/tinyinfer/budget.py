@@ -46,6 +46,62 @@ def _physical_ram() -> int:
     return 0
 
 
+_CUDART = None
+
+
+def _cudart():
+    """Locate the CUDA runtime that ships with torch (for cudaHostAlloc)."""
+    global _CUDART
+    if _CUDART is not False and _CUDART is not None:
+        return _CUDART
+    if _CUDART is False:
+        return None
+    try:
+        import ctypes
+        import glob
+        import os
+
+        import torch
+
+        lib_dir = os.path.join(os.path.dirname(torch.__file__), "lib")
+        for path in glob.glob(os.path.join(lib_dir, "cudart*.dll")):
+            try:
+                lib = ctypes.CDLL(path)
+                lib.cudaHostAlloc.argtypes = [ctypes.POINTER(ctypes.c_void_p),
+                                              ctypes.c_size_t, ctypes.c_uint]
+                lib.cudaHostAlloc.restype = ctypes.c_int
+                lib.cudaFreeHost.argtypes = [ctypes.c_void_p]
+                lib.cudaFreeHost.restype = ctypes.c_int
+                _CUDART = lib
+                return lib
+            except Exception:
+                continue
+    except Exception:
+        pass
+    _CUDART = False
+    return None
+
+
+def _touch_pages(buf, n: int) -> None:
+    """Commit every 4KB page of a host allocation right now.
+
+    A per-page Python loop (the old code) took tens of seconds for 18GB and showed up
+    in Task Manager as a slow climb while the engine was already "up": the physical
+    pages were being faulted in one by one as later writes landed. Doing the same walk
+    in C makes the claim a single visible step (the pool is fully resident when
+    _commit returns), which is what "claim it up front" is supposed to mean.
+    """
+    try:
+        import numpy as np
+
+        np.frombuffer(buf, dtype=np.uint8)[::4096] = 1
+        return
+    except Exception:
+        pass
+    for off in range(0, n, 4096):
+        buf[off] = b"\x01"
+
+
 class HostPool:
     """One big host allocation that every pageable buffer carves from.
 
@@ -95,6 +151,23 @@ class HostPool:
                 return None
             self._off = start + n
             return self._view[start:start + n]
+
+    def tensor(self, n: int, align: int = 4096):
+        """Carve n bytes out of the pool as a writable uint8 torch tensor.
+
+        The pool is created by cudaHostAlloc, so the slice is pinned and can be used
+        as the source of an async H2D. torch.frombuffer keeps the buffer alive itself,
+        but the memoryview is stored on the tensor too so the export cannot be dropped
+        while the layer still points at it.
+        """
+        mv = self.alloc(n, align=align)
+        if mv is None:
+            return None
+        import torch
+
+        t = torch.frombuffer(mv, dtype=torch.uint8)
+        t._tiny_pool_mv = mv
+        return t
 
     def reset(self) -> None:
         with self._lock:
@@ -206,6 +279,46 @@ class HostBudget:
             held = getattr(self, "_held", None)
             if held is None:
                 held = self._held = []
+            # Preferred path: CUDA host (pinned) memory. It is DMA-able (the layer slab and
+            # the expert cache both feed async H2D from it), and pinned pages cannot be
+            # paged out at all -- which is exactly what "claimed" has to mean. Measured:
+            # cudaHostAlloc(8GB) returns in 0.6s.
+            pinned = None
+            try:
+                pinned = _cudart()
+            except Exception:
+                pinned = None
+            if pinned is not None and n >= (256 << 20):
+                # Retry at half size before giving up: cudaHostAlloc fails as a whole when
+                # the request is larger than what the driver will pin, and falling
+                # straight to ordinary pages would hand the cache memory the OS is free
+                # to page out -- exactly the failure this pool exists to prevent. A
+                # smaller pinned pool still is DMA-able; a larger pageable one is not.
+                want = int(n)
+                while want >= (256 << 20):
+                    ptr = ctypes.c_void_p()
+                    rc = pinned.cudaHostAlloc(ctypes.byref(ptr), want, 0)
+                    if rc == 0 and ptr.value:
+                        # No VirtualLock here: cudaHostAlloc pages are already
+                        # non-pageable, and locking 20GB into the working set only
+                        # burns the PFN database / non-paged quota, which on Windows
+                        # showed up as later cudaMalloc calls failing with OOM.
+                        held = getattr(self, "_held", None)
+                        if held is None:
+                            held = self._held = []
+                        view = (ctypes.c_char * want).from_address(ptr.value)
+                        # commit the physical pages NOW: cudaHostAlloc reserves the
+                        # range, the pages land on first touch
+                        _touch_pages(view, want)
+                        held.append(("pinned", pinned, ptr.value, want, view))
+                        self._claim_buf = view
+                        self._claim_bytes = want
+                        self._claim_pinned = True
+                        if want < n:
+                            print(f"[tinyinfer] host pool: cudaHostAlloc shrank "
+                                  f"{n/2**30:.1f}GB -> {want/2**30:.1f}GB", flush=True)
+                        return want
+                    want //= 2
             while n >= (256 << 20):
                 # Prefer large pages: their pages cannot be trimmed by the memory
                 # manager, which is the only way to keep the cache resident for the
@@ -229,8 +342,7 @@ class HostBudget:
                 if ptr:
                     try:
                         buf = (ctypes.c_char * n).from_address(ptr)
-                        for off in range(0, n, 4096):
-                            buf[off] = b"\x01"
+                        _touch_pages(buf, n)
                     except Exception:
                         k32.VirtualFree(ptr, 0, 0x8000)
                         ptr = None

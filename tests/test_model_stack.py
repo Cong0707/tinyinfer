@@ -2,6 +2,7 @@
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -79,6 +80,7 @@ def build_fake_store(cfg, layers, seed=0):
     return FakeStore(t)
 
 
+@pytest.mark.kernel
 def test_two_layer_forward_and_decode():
     cfg = TinyConfig.from_hf(model_dir())
     store = build_fake_store(cfg, [0, 2], seed=7)

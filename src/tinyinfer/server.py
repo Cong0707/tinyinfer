@@ -43,6 +43,7 @@ import hmac
 import json
 import logging
 import os
+from pathlib import Path
 import queue
 import random
 import re
@@ -71,6 +72,13 @@ except ImportError as exc:  # pragma: no cover - exercised only without the extr
     ) from exc
 
 logger = logging.getLogger("tinyinfer.server")
+
+
+def _thinking_mode() -> str:
+    # "chat" (answer directly) or "thinking" (reason first); the checkpoint encodes the
+    # two differently, so this must reach the prompt renderer (see tinyinfer.chat)
+    mode = os.environ.get("TI_THINKING_MODE", "chat").strip().lower()
+    return mode if mode in ("chat", "thinking") else "chat"
 
 __all__ = [
     "APIError",
@@ -605,7 +613,7 @@ class TinyModelBackend(BaseBackend):
         self._slot_kv: dict[int, dict[int, Any]] = {}
         # slot -> (token ids of the conversation so far, their count); lets a
         # request resume from the prefix instead of re-prefilling it (TI_SERVER_PREFIX=1)
-        self._slot_prefix: dict[int, tuple[tuple[int, ...], int]] = {}
+        self._slot_prefix: dict = {}
         self._lock = threading.Lock()
         self._gen_lock = threading.Lock()
         if load_at_init:
@@ -809,9 +817,13 @@ class TinyModelBackend(BaseBackend):
                 if self.expert_cache_gb is not None
                 else float(self._tier.expert_cache_gb)
             )
-            expert_store = ExpertStore.from_store(
-                store, cache_bytes=max(256 << 20, int(cache_gb * (1 << 30)))
-            )
+            # Let the Engine own the expert store: it builds the cudaHostAlloc pool, the
+            # pinned layer slab and the VRAM slot plan around the same tier. A bare
+            # ExpertStore here (no pool, no slab) sent every layer through the per-tensor
+            # copy path and every expert through pageable reads -- measured 3.3s/token
+            # over HTTP against 0.85s in-process.
+            logger.debug("deferring the expert store to the engine (tier %s)", self.tier_name)
+            return None
         except Exception:
             logger.warning(
                 "balanced tier: ExpertStore unavailable; falling back to direct shard reads",
@@ -823,6 +835,25 @@ class TinyModelBackend(BaseBackend):
 
     def warmup(self) -> None:
         self.load()
+        # One short forward primes the allocator, the streaming ring and the expert cache.
+        # Without it the very first HTTP request paid for all of that inside its own
+        # budget: one cold request returned a single visible token where the identical
+        # code path in-process returned the full sentence, and every later request was
+        # exact. A ~15s start-up cost beats a wrong answer.
+        model = self._model
+        if model is None or self.requested_device == "cpu":
+            return
+        torch = self._torch
+        bos = getattr(self._tokenizer, "bos_token_id", None)
+        ids = torch.tensor([[int(bos) if isinstance(bos, int) else 0]], dtype=torch.long)
+        try:
+            with torch.inference_mode():
+                model.forward(ids, 0)
+            model.reset()
+            if torch.cuda.is_available() and torch.cuda.is_initialized():
+                torch.cuda.empty_cache()
+        except Exception as exc:
+            logger.debug("warmup forward failed; first request will pay for it", exc_info=exc)
 
     def _load_tokenizer(self):
         from transformers import AutoTokenizer
@@ -849,14 +880,18 @@ class TinyModelBackend(BaseBackend):
             return request.prompt
         messages = request.messages or []
         tokenizer = self._tokenizer
-        if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+        if getattr(tokenizer, "chat_template", None):
             try:
                 return tokenizer.apply_chat_template(
                     messages, tokenize=False, add_generation_prompt=True
                 )
             except Exception:
-                logger.debug("chat template rendering failed; using plain roles", exc_info=True)
-        return self.format_messages(messages)
+                logger.debug("chat template rendering failed; using the checkpoint encoder", exc_info=True)
+        # this tokenizer ships without a chat template, and the model only answers in its
+        # own turn format: <|User|>...<|Assistant|></think>... (see tinyinfer.chat)
+        from .chat import encode_messages
+
+        return encode_messages(messages, thinking_mode=_thinking_mode())
 
     def count_prompt_tokens(self, request: GenerationRequest) -> int:
         self.load()
@@ -900,18 +935,85 @@ class TinyModelBackend(BaseBackend):
         return ids
 
     # -- slot KV ownership -------------------------------------------------
-    def _bind_slot(self, slot_id: int) -> None:
+    def _kv_path(self, key: str):
+        # tinyinfer/src/tinyinfer/server.py -> tinyinfer/.kvcache
+        root = Path(__file__).resolve().parent.parent.parent / ".kvcache"
+        root.mkdir(exist_ok=True)
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in str(key))[:80]
+        return root / f"{safe}.pt"
+
+    def _load_slot_disk(self, slot_id: int, session_id: str | None = None):
+        """Restore a slot's KV + turn prefix from .kvcache (survives a server restart)."""
+        # one file per conversation: a slot is a reusable execution lane, a session is the
+        # conversation, and two different chats must never share a KV file
+        key = session_id or f"slot{slot_id}"
+        path = self._kv_path(key)
+        if not path.exists():
+            return None
+        try:
+            blob = self._torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as exc:
+            logger.warning("kvcache %s unreadable (%r); ignoring", path, exc)
+            return None
+        if blob.get("prefix") is not None:
+            self._slot_prefix[key] = blob["prefix"]
+        return blob.get("kv")
+
+    def _bind_slot(self, slot_id: int, session_id: str | None = None) -> None:
         if self._model is None:
             return
-        state = self._slot_kv.get(slot_id)
+        key = session_id or slot_id
+        state = self._slot_kv.get(key)
+        if state is None:
+            state = self._load_slot_disk(slot_id, session_id)
         if state is None:
             self._model.reset()
         else:
+            # the stash keeps tensors on the host (a device-side copy doubled the resident
+            # KV and OOM'd the next prefill), so restore has to place them back -- inside
+            # tuples/dicts too, the compressor keeps its pending group as a pair
+            t = self._torch
+            dev = self._model.device
+
+            def to_dev(v):
+                if t.is_tensor(v):
+                    return v.to(dev)
+                if isinstance(v, tuple):
+                    return tuple(to_dev(x) for x in v)
+                if isinstance(v, dict):
+                    return {k2: to_dev(x) for k2, x in v.items()}
+                return v
+
+            state = {k: to_dev(v) for k, v in state.items()}
+            self._slot_kv[key] = state
             self._model.restore(state)
 
-    def _stash_slot(self, slot_id: int) -> None:
-        if self._model is not None:
-            self._slot_kv[slot_id] = self._model.snapshot()
+    def _stash_slot(self, slot_id: int, session_id: str | None = None) -> None:
+        if self._model is None:
+            return
+        key = session_id or f"slot{slot_id}"
+        t = self._torch
+
+        def to_host(v):
+            if t.is_tensor(v):
+                return v.detach().cpu()
+            if isinstance(v, tuple):
+                return tuple(to_host(x) for x in v)
+            if isinstance(v, dict):
+                return {k2: to_host(x) for k2, x in v.items()}
+            return v
+
+        # host-side copy: keeping the snapshot on the device doubled the resident KV and
+        # the next turn's prefill then OOM'd (measured: free 1205MB at layer 2)
+        state = {k: to_host(v) for k, v in self._model.snapshot().items()}
+        self._slot_kv[key] = state
+        # persist the session (KV + rendered turn prefix) after every request so the
+        # server can be stopped at any time without losing the conversation
+        try:
+            t.save({"kv": state, "prefix": self._slot_prefix.get(key)},
+                   self._kv_path(key))
+        except Exception as exc:
+            logger.warning("kvcache save failed: %r", exc)
 
     def _trim_expert_cache(self) -> None:
         limit = self.max_cached_experts
@@ -991,7 +1093,7 @@ class TinyModelBackend(BaseBackend):
             )
 
         slot_id = 0 if request.slot_id is None else int(request.slot_id)
-        self._bind_slot(slot_id)
+        self._bind_slot(slot_id, request.session_id)
         eos_ids = self._eos_ids()
         generator = None
         if sampling.seed is not None:
@@ -1004,25 +1106,42 @@ class TinyModelBackend(BaseBackend):
             with torch.inference_mode():
                 ids = torch.tensor([prompt_ids], dtype=torch.long)
                 prefix_len = 0
-                if __import__("os").environ.get("TI_SERVER_PREFIX") == "1":
-                    prev = self._slot_prefix.get(slot_id)
+                # Multi-turn prefix reuse is on by default: an OpenAI chat request
+                # carries the whole conversation, so every turn after the first would
+                # otherwise re-prefill the entire history (measured 9 -> 25 tokens of
+                # prompt turning 10s into 26s). TI_SERVER_PREFIX=0 disables it.
+                if __import__("os").environ.get("TI_SERVER_PREFIX") != "0":
+                    prev = self._slot_prefix.get(request.session_id or slot_id)
                     if prev is not None:
                         prev_ids, prev_len = prev
-                        if (len(prompt_ids) > prev_len
+                        # >= not >: asking the same one-shot question again has the same
+                        # length, and that is exactly the case the KV file is for
+                        if (len(prompt_ids) >= prev_len
                                 and tuple(prompt_ids[:prev_len]) == prev_ids):
                             prefix_len = prev_len
+                try:
+                    if torch.cuda.is_available() and torch.cuda.is_initialized():
+                        # hand back the previous turn's blocks BEFORE this prefill: a
+                        # resumed session otherwise starts with ~1.2GB free and OOMs
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                if prefix_len >= len(prompt_ids):
+                    # identical prompt to last turn (same one-shot question): keep one token
+                    # to compute so we get logits, the rest is already in the KV cache
+                    prefix_len = max(0, len(prompt_ids) - 1)
                 if prefix_len:
                     logits = self._model.forward(ids[:, prefix_len:], prefix_len)
                 else:
                     logits = self._model.forward(ids, 0)
                 # the prefill kernels (tilelang workspace for the prompt-length shape)
-                # leave gigabytes of cached blocks behind; on a card this size that
-                # pushes reserved past physical memory and every decode step then
-                # pages. Engine.generate() has always done this -- the server did not,
-                # which is why the same 12-token prompt took 85-97s over HTTP against
-                # 51s in-process. Hand the blocks back to the driver before decoding.
+                # leave gigabytes of cached blocks behind; hand them back before decoding
+                # so the decode steps do not page.
                 try:
                     if torch.cuda.is_available() and torch.cuda.is_initialized():
+                        # hand back the previous turn's blocks BEFORE this prefill: a
+                        # resumed session needs the workspace and the first prefill
+                        # otherwise ran into 1.2GB of free VRAM and OOM'd
                         torch.cuda.empty_cache()
                 except Exception:
                     pass
@@ -1064,14 +1183,14 @@ class TinyModelBackend(BaseBackend):
                         torch.tensor([[next_id]], dtype=torch.long), position
                     )
         finally:
-            self._stash_slot(slot_id)
-            if __import__("os").environ.get("TI_SERVER_PREFIX") == "1":
+            self._stash_slot(slot_id, request.session_id)
+            if __import__("os").environ.get("TI_SERVER_PREFIX") != "0":
                 # Record the *rendered* prompt, not prompt+generated: the next request
                 # re-renders the assistant turn from the template, so appending the ids we
                 # generated makes the two sequences diverge before the new question and
                 # the prefix never matches (measured: turn2 was slower than turn1).
                 full = tuple(prompt_ids)
-                self._slot_prefix[slot_id] = (full, len(full))
+                self._slot_prefix[request.session_id or slot_id] = (full, len(full))
             self._trim_expert_cache()
         yield TokenEvent(
             finish_reason=finish,

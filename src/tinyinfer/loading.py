@@ -1155,6 +1155,16 @@ class ShardReader:
                                                            thread_name_prefix="tinyinfer-io")
         return [f.result() for f in [executor.submit(one, b, executor) for b in blobs]]
 
+    def io_executor(self):
+        """Shared, dedicated read pool (never the ExpertCache prefetch pool: a fetch task
+        already runs on that one, so nesting would deadlock)."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=max(2, self.threads),
+                                                thread_name_prefix="tinyinfer-io")
+        return self._executor
+
     def read_many(self, blobs: Sequence[ExpertBlob], max_workers: int | None = None) -> list[bytearray]:
         if not blobs:
             return []
@@ -1451,6 +1461,7 @@ class CacheStats:
     prefetch_issued: int = 0
     prefetch_hits: int = 0
     load_seconds: float = 0.0
+    fallbacks: int = 0          # reads that could not use a host-pool slot
 
     def as_dict(self) -> dict[str, float]:
         total = self.hits + self.misses
@@ -1462,6 +1473,7 @@ class CacheStats:
             "disk_gb": self.disk_bytes / 1e9,
             "evictions": self.evictions,
             "load_seconds": self.load_seconds,
+            "fallbacks": self.fallbacks,
         }
 
 
@@ -1483,7 +1495,14 @@ class BlobPool:
         self._view = view[: int(nbytes)]
         self._cap = int(nbytes)
         self._off = 0
+        self._free: list[tuple[int, int]] = []
         self._lock = threading.Lock()
+        # byte address of the slab start, so an evicted slice can be turned back into an
+        # (offset, size) range and reused instead of leaking the claim
+        try:
+            self._base = ctypes.addressof(ctypes.c_char.from_buffer(self._view))
+        except Exception:
+            self._base = -1
 
     @property
     def capacity(self) -> int:
@@ -1492,15 +1511,39 @@ class BlobPool:
     def take(self, n: int) -> memoryview | None:
         n = int(n)
         with self._lock:
+            # Recycle an evicted entry's range first: the cache churns ~2GB per decode
+            # step, and a pure bump allocator runs the claim out after a dozen tokens
+            # (measured: the read path then fell back to pageable reads at 0.55GB/s).
+            for idx, (off, size) in enumerate(self._free):
+                if size < n:
+                    continue
+                self._free.pop(idx)
+                if size > n + (1 << 16):
+                    self._free.append((off + n, size - n))
+                return self._view[off:off + n]
             if self._off + n > self._cap:
                 return None
             slot = self._view[self._off:self._off + n]
             self._off += n
             return slot
 
+    def release(self, slot) -> bool:
+        """Return a slice taken from this pool (best effort, no header to verify)."""
+        try:
+            off = ctypes.addressof(ctypes.c_char.from_buffer(slot)) - self._base
+            size = len(slot)
+        except Exception:
+            return False
+        if off < 0 or off + size > self._cap:
+            return False
+        with self._lock:
+            self._free.append((int(off), int(size)))
+        return True
+
     def reset(self) -> None:
         with self._lock:
             self._off = 0
+            self._free.clear()
 
 
 class ExpertCache:
@@ -1585,6 +1628,14 @@ class ExpertCache:
                         self._pin_free.append(data)
             except Exception:
                 pass
+            # Return the pool range so a long run cannot exhaust the claim.
+            pool = getattr(self, "_pool", None)
+            release = getattr(pool, "release", None) if pool is not None else None
+            if release is not None:
+                try:
+                    release(data)
+                except Exception:
+                    pass
         return True
 
     def _insert_locked(self, key: tuple[int, int], data: bytearray, *,
@@ -1603,7 +1654,9 @@ class ExpertCache:
         # the memory claimed at start-up, not in a second allocation of the same size
         # (that would defeat the claim and put the box back on the page file).
         pool = getattr(self, "_pool", None)
-        if pool is not None and isinstance(data, (bytearray, bytes, memoryview)):
+        # memoryview means _read_pinned already wrote it into a pool slot; copying it
+        # into a second slot would need twice the pool for the same data.
+        if pool is not None and not isinstance(data, memoryview) and isinstance(data, (bytearray, bytes)):
             slot = pool.take(len(data))
             if slot is not None:
                 slot[:] = data
@@ -1620,11 +1673,62 @@ class ExpertCache:
         self._stats.loads += 1
 
     def _can_pin(self, nbytes: int) -> bool:
-        return self.pin_budget <= 0 or (self._pinned_bytes + nbytes) <= self.pin_budget
+        # pin_budget == 0 means "do not pin": the old "<= 0 -> always" reading made every
+        # read allocate a fresh 18.8MB pinned tensor OUTSIDE the host pool, and the cache
+        # then held a different buffer than the first read had.
+        return self.pin_budget > 0 and (self._pinned_bytes + nbytes) <= self.pin_budget
+
+    def _read_many_pooled(self, blobs: Sequence[ExpertBlob]) -> list:
+        """Read several missed blobs into host-pool slots in parallel.
+
+        Everything about the misses is independent: separate files, separate byte ranges,
+        and ShardReader keeps one file handle + one scratch buffer per thread. Reading
+        them one after another on the fetch thread measured 1.1GB/s (118 experts = 2.1s of
+        a 3.6s decode step); the SSD reaches 4.6GB/s once a few reads are in flight.
+        """
+        pool = getattr(self, "_pool", None)
+        if pool is None or len(blobs) <= 1:
+            return [self._read_pinned(b) for b in blobs]
+        slots = []
+        for blob in blobs:
+            try:
+                slots.append(pool.take(blob.total_bytes))
+            except Exception:
+                slots.append(None)
+        target = int(__import__("os").environ.get("TI_READ_THREADS", "0")) or len(blobs)
+
+        def one(blob, slot):
+            if slot is None:
+                return self._read_pinned(blob)
+            try:
+                self.reader.read_into(blob.segments, slot)
+                return slot
+            except Exception:
+                return self.reader.read_blob(blob)
+
+        ex = getattr(self.reader, "io_executor", None)
+        if ex is None:
+            return [one(b, s) for b, s in zip(blobs, slots)]
+        pool_exec = ex()
+        if target < len(blobs):
+            # tuned depth (TI_READ_THREADS): bounded queue keeps other IO responsive
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=target, thread_name_prefix="tinyinfer-io") as tmp:
+                return [f.result() for f in [tmp.submit(one, b, s) for b, s in zip(blobs, slots)]]
+        return [f.result() for f in [pool_exec.submit(one, b, s) for b, s in zip(blobs, slots)]]
 
     def _fill_pin_pool(self) -> None:
         """Allocate the reusable pinned pool once (bounded by the pinned budget)."""
         if self._pin_pool_size:
+            return
+        if getattr(self, "_pool", None) is not None:
+            # The cache itself lives in a claimed pinned pool, and reads go straight into
+            # a slot of that pool (_read_pinned). A second pinned pool on top (up to
+            # 256 x 18.8MB = 4.8GB) put the process past what Windows lets one process
+            # pin and every later cudaMalloc failed -- the fresh-allocation path below is
+            # therefore not used when a pool exists.
+            self._pin_pool_size = 1
             return
         target = min(max(8, self.capacity_entries // 2), 256)
         self._pin_pool_size = 1
@@ -1661,6 +1765,23 @@ class ExpertCache:
         layer of pure stall). A pinned source is a direct async DMA at 26.5GB/s.
         Falls back to a pageable bytearray if the pinned pool refuses the allocation.
         """
+        pool = getattr(self, "_pool", None)
+        if pool is not None:
+            # One copy, not two: read the blob into the slot it will live in. Handing
+            # back a plain bytearray here made _insert_locked copy it a second time and
+            # the extra pinned pool was the only place to stage from.
+            slot = pool.take(blob.total_bytes)
+            if slot is not None:
+                try:
+                    # read_into wraps dest in memoryview(dest) and writes through it, so
+                    # the writable pool slice must be passed as-is; np.frombuffer gives a
+                    # READ-ONLY array, the write threw, the except swallowed it and the
+                    # cache kept empty slots (garbage experts, garbled answers).
+                    self.reader.read_into(blob.segments, slot)
+                    return slot
+                except Exception:
+                    pass
+        self._stats.fallbacks += 1
         if not self._can_pin(blob.total_bytes):
             return self.reader.read_blob(blob)
         buf = self._take_pinned(blob.total_bytes)
@@ -1735,6 +1856,9 @@ class ExpertCache:
         """Insert a pre-read expert (locked insert only; the disk read happened outside)."""
         key = (layer, expert)
         with self._lock:
+            if __import__("os").environ.get("TI_CACHE_TRACE") == "1" and len(self._entries) < 3:
+                print(f"[admit] {key} present={key in self._entries} len={len(data)} "
+                      f"type={type(data).__name__}", flush=True)
             if key not in self._entries:
                 self._stats.disk_reads += 1
                 self._stats.disk_bytes += len(data)
@@ -1835,10 +1959,13 @@ class VramSlotCache:
         self.hits = 0
         self.loads = 0
         self.evictions = 0
+        # set while a prefill wave owns the card: the pool must not re-create itself
+        # behind its back (it is 1.2GB at 64 slots and the prefill workspace OOMs)
+        self._paused = False
 
     # -- infrastructure ---------------------------------------------------
     def _ensure(self):
-        if self._buffers or self.slots == 0:
+        if self._buffers or self.slots == 0 or getattr(self, "_paused", False):
             return
         import torch
         self._torch = torch
@@ -1870,9 +1997,12 @@ class VramSlotCache:
     def _copy_blocking(self, idx: int, data: Any, event: Any = None):
         """Copy data bytes into slot idx; returns the completion CUDA event (or None)."""
         import torch
-        if isinstance(data, bytearray):
+        if isinstance(data, (bytearray, memoryview)):
+            # memoryview comes from the claimed pool: wrap it, never copy it. bytearray
+            # wrapping was zero-copy already; routing memoryview through bytearray() made
+            # every expert a pageable copy (lost the async DMA path entirely).
             cpu = torch.frombuffer(data, dtype=torch.uint8)
-        elif isinstance(data, (bytes, memoryview)):
+        elif isinstance(data, bytes):
             cpu = torch.frombuffer(bytearray(data), dtype=torch.uint8)
         else:
             cpu = data
@@ -1883,6 +2013,22 @@ class VramSlotCache:
         use_b = threading.current_thread().name.startswith("vram-prefetch")
         lock = self._staging_lock_b if use_b else self._staging_lock
         staging = self._staging_b if use_b and self._staging_b is not None else self._staging
+        # A host-pool slice IS pinned (cudaHostAlloc) but torch.frombuffer() does not say
+        # so, which sent it down the pageable path: an 18.8MB host memcpy on the fetch
+        # thread (measured 18ms/layer) and then an async DMA out of the SHARED staging
+        # buffer. The next expert's memcpy can overwrite a transfer that is still in
+        # flight -- exactly the disagreement two identical greedy runs showed. Issue the
+        # DMA against the pool slice itself: no staging, no race, 13.3GB/s.
+        # Direct DMA from the pool slice (1.08s/token vs 1.27s through staging). The
+        # staging path also produced " 2023-1-1 20:" for a capital question with the same
+        # slots: one shared staging buffer is reused while an earlier async DMA out of it
+        # may still be in flight.
+        if isinstance(data, memoryview) and self._copy_stream is not None:
+            ev = event if event is not None else torch.cuda.Event()
+            with torch.cuda.stream(self._copy_stream):
+                if _async_h2d(buf, data, int(buf.numel())):
+                    ev.record(self._copy_stream)
+                    return ev
         # Pinned sources go straight to the device as an async DMA (26GB/s, six in
         # parallel). Routing them through the single shared staging buffer serialised
         # them through one 18.8MB host memcpy (measured 18ms/layer). Pageable sources
@@ -2112,6 +2258,44 @@ _DTYPES = {"I8": "int8", "U8": "uint8", "F8_E4M3": "float8_e4m3fn",
            "F32": "float32", "I32": "int32", "I64": "int64", "BOOL": "bool"}
 
 
+def _async_h2d(dst, src, nbytes: int) -> bool:
+    """cudaMemcpyAsync from a host-pool slice straight into a device tensor.
+
+    torch.frombuffer() over cudaHostAlloc memory reports is_pinned() == False (measured),
+    so copy_() stages the bytes through a private pinned buffer and synchronises. The
+    source really is pinned, so the DMA is issued directly -- same stream as the caller,
+    so the kernels that consume it are ordered after it.
+    """
+    import torch
+
+    lib = getattr(_async_h2d, "lib", None)
+    if lib is None:
+        try:
+            from .budget import _cudart
+
+            lib = _cudart()
+            lib.cudaMemcpyAsync.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                            ctypes.c_size_t, ctypes.c_int,
+                                            ctypes.c_void_p]
+            lib.cudaMemcpyAsync.restype = ctypes.c_int
+            _async_h2d.lib = lib
+        except Exception:
+            return False
+    try:
+        if torch.is_tensor(src):
+            addr = int(src.data_ptr())
+        else:
+            addr = ctypes.addressof(ctypes.c_char.from_buffer(src))
+        rc = lib.cudaMemcpyAsync(
+            ctypes.c_void_p(int(dst.data_ptr())), ctypes.c_void_p(int(addr)),
+            ctypes.c_size_t(int(nbytes)), 1,
+            ctypes.c_void_p(int(torch.cuda.current_stream().cuda_stream)),
+        )
+        return rc == 0
+    except Exception:
+        return False
+
+
 class ExpertRecord:
     """One materialized expert; tensor(name) returns a zero-copy view."""
 
@@ -2138,6 +2322,42 @@ class ExpertRecord:
             buf = self.buffer
         view = buf.narrow(0, slot.dest_offset, slot.nbytes).view(torch_dtype)
         return view.view(slot.shape) if len(slot.shape) != 1 else view.view(slot.shape[0])
+
+    def tensors_on(self, device) -> dict:
+        """Every tensor of this blob on `device` from ONE transfer.
+
+        Two things go wrong when torch copies this, and both were measured: the six
+        tensors are six separate copy_() calls (1440 submissions per decode step), and
+        torch.frombuffer() over cudaHostAlloc memory reports is_pinned() == False, so
+        every one of them takes the pageable route -- stage 18.8MB into a private pinned
+        buffer, then DMA, synchronously. The bytes ARE pinned; the runtime just has to be
+        told, so this issues the DMA itself against the pool slice.
+        """
+        import torch
+
+        def view_of(flat):
+            out = {}
+            for name, slot in self.tensors.items():
+                torch_dtype = getattr(torch, _DTYPES.get(slot.dtype, "uint8"))
+                view = flat.narrow(0, slot.dest_offset, slot.nbytes).view(torch_dtype)
+                out[name] = (view.view(slot.shape) if len(slot.shape) != 1
+                             else view.view(slot.shape[0]))
+            return out
+
+        if torch.is_tensor(self.buffer) and self.buffer.device.type == "cuda":
+            return view_of(self.buffer)
+        if torch.is_tensor(self.buffer):
+            buf = self.buffer
+            nbytes = int(buf.numel())
+            dev = torch.empty(nbytes, dtype=torch.uint8, device=device)
+            if not _async_h2d(dev, buf, nbytes):
+                dev.copy_(buf, non_blocking=True)
+            return view_of(dev)
+        nbytes = len(self.buffer)
+        dev = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        if not _async_h2d(dev, self.buffer, nbytes):
+            dev.copy_(torch.frombuffer(self.buffer, dtype=torch.uint8), non_blocking=True)
+        return view_of(dev)
 
     def names(self) -> tuple[str, ...]:
         return tuple(self.tensors)
@@ -2285,14 +2505,18 @@ class ExpertStore:
         return out
 
     def _pin_cap(self) -> int:
-        """Pinned bytes admitted to the RAM cache (TI_PIN_CACHE_GB overrides)."""
+        """Pinned bytes admitted to the RAM cache (TI_PIN_CACHE_GB overrides).
+
+        DEFAULT 0: the separate pinned-slot pool recycles buffers through _pin_free, and
+        an evicted buffer could be handed back while a fetch() record still referenced it
+        -- measured as expert 0 returning expert 2's bytes on the second forward, which
+        made the same layer give a different answer after reset(). With no pin pool every
+        expert lives in its own host-pool slot (bump allocation, never reused).
+        """
         cap = getattr(self, "_pin_cap_bytes", None)
         if cap is None:
             env = __import__("os").environ.get("TI_PIN_CACHE_GB")
-            if env:
-                cap = int(float(env) * (1 << 30))
-            else:
-                cap = int(self.ram.capacity_entries * self.ram.blob_bytes * 0.8)
+            cap = int(float(env) * (1 << 30)) if env else 0
             self._pin_cap_bytes = cap
         return cap
 
@@ -2341,10 +2565,14 @@ class ExpertStore:
             # single-expert fetches go to the bytearray reader; the pinned path costs
             # an 18.8MB cudaHostAlloc per blob and measured 2x slower for that case
             misses = [e for e in experts if not self.ram.contains(layer, e)]
+            if __import__("os").environ.get("TI_CACHE_TRACE") == "1" and layer == 0:
+                print(f"[fetch] layer0 experts={experts} misses={misses}", flush=True)
             if misses:
                 # a prefetch for this very expert may already be in flight: wait for it
                 # instead of issuing a second read of the same blob on this thread
                 misses = [e for (_, e) in self._settle_pending([(layer, e) for e in misses])]
+                if __import__("os").environ.get("TI_CACHE_TRACE") == "1" and layer == 0:
+                    print(f"[fetch] layer0 settled misses={misses}", flush=True)
             if misses:
                 blobs = [self.index.expert_blob(layer, e) for e in misses]
                 datas = None
@@ -2361,29 +2589,30 @@ class ExpertStore:
                     # pinned reads: 7.4GB/s vs 3.2 pageable, and the bytes stay pinned
                     # for the H2D-to-slot copy (13.3GB/s vs 8.3)
                     _d0 = __import__("time").perf_counter()
-                    datas = self._reader.read_many_pinned(blobs) if blobs else []
+                    # read straight into the host pool: pinned tensors allocated here would
+                    # live OUTSIDE the pool (47 experts x 18.8MB x 40 layers ~= 35GB of extra
+                    # commit charge, the observed "82GB committed" in the task manager)
+                    # Only decode-sized fetches (one token routes to <=8 experts) are
+                    # admitted: a prefill batch may touch all 384 experts, and filling the
+                    # cache with those evicts the decode working set while making the
+                    # stored buffer a different one from the read that produced the output.
+                    _admit_ok = cache and len(experts) <= 8
+                    if _admit_ok:
+                        datas = self.ram._read_many_pooled(blobs) if blobs else []
+                    else:
+                        # Prefill streams each expert once and never admits it. Taking pool
+                        # slots for those reads leaked the claim: nothing was inserted, so
+                        # no eviction ever released them, and after the first prefill the
+                        # pool ran dry -- every later read silently fell back to a fresh
+                        # pageable buffer (measured: 4.6GB/s -> 0.54GB/s, 2.1s per token).
+                        datas = [self.reader.read_blob(b) for b in blobs] if blobs else []
                     self._disk_ms = getattr(self, "_disk_ms", 0.0) + (__import__("time").perf_counter() - _d0) * 1e3
                     for b, d in zip(blobs, datas):
-                        # Admit the pinned buffer directly (zero copy) while the pinned
-                        # budget lasts; past it fall back to a pageable copy so the
-                        # cudaHostAlloc pool is never exhausted.
-                        self._pinned_cache_bytes = getattr(self, "_pinned_cache_bytes", 0)
-                        # keep the pinned tensor when the lambda budget allows it: a
-                        # pinned source is the only one that can use async DMA
-                        pin_cache = __import__("os").environ.get("TI_PIN_CACHE", "1") == "1"
-                        if pin_cache:
-                            self._pinned_cache_bytes = getattr(self, "_pinned_cache_bytes", 0)
-                            # keep most of the RAM cache pinned: only a pinned source can be
-                            # an async DMA (26.5GB/s); pageable blobs serialise through the
-                            # single 18.8MB staging buffer and cap H2D at ~8.9GB/s
-                            if self._pinned_cache_bytes < self._pin_cap():
-                                self._pinned_cache_bytes += int(d.numel())
-                                self.ram.admit(layer, b.key[1], d)
-                                continue
-                        arr = d.numpy().copy()
-                        self.ram.admit(layer, b.key[1], arr)
-                except Exception:
-                    pass  # fall back to per-expert reads inside _materialize
+                        if _admit_ok and d is not None:
+                            self.ram.admit(layer, b.key[1], d)
+                except Exception as exc:
+                    if __import__("os").environ.get("TI_CACHE_TRACE") == "1":
+                        print(f"[fetch] admit path failed: {exc!r}", flush=True)
         # batch the slot reservations under one lock (decode fetches 6 experts/layer)
         acquired = None
         if self.slots is not None and self.slots.slots > 0 and len(experts) > 1 and cache:
@@ -2452,6 +2681,45 @@ class ExpertStore:
                 return self.fetch(layer, ids, cache=cache)
 
         return self._fetch_pool.submit(run)
+
+    def drop_slots(self) -> None:
+        """Release the VRAM slot pool; _ensure() re-creates it on the next acquire.
+
+        A prefill wave allocates a tilelang workspace that alone needs more than the slot
+        pool leaves free on an 8GB card (measured: 64 slots = 1.2GB -> CUDA OOM inside
+        the first chunk). Decode is what the slots are for, so prefill hands the VRAM back
+        and decode gets it again lazily.
+        """
+        slots = self.slots
+        if slots is None:
+            return
+        slots._paused = True
+        if not getattr(slots, "_buffers", None):
+            return
+        with slots._lock:
+            for idx in range(slots.slots):
+                slots._state[idx] = slots.FREE
+                slots._key[idx] = None
+                slots._refs[idx] = 0
+                slots._event[idx] = None
+            slots._by_key.clear()
+            try:
+                slots._lru.clear()
+            except Exception:
+                pass
+            slots._buffers = []
+            slots._arena = None
+        try:
+            import torch
+
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def resume_slots(self) -> None:
+        """Let the slot pool allocate itself again (the next acquire does it lazily)."""
+        if self.slots is not None:
+            self.slots._paused = False
 
     def release(self, records: Iterable[ExpertRecord]) -> None:
         for rec in records:

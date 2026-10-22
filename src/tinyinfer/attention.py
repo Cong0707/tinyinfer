@@ -51,6 +51,12 @@ class MLAWindowAttention:
             self.wq_a = QuantLinear(store.get(p + "wq_a.weight"), store.get(p + "wq_a.scale"))
             self.wq_b = QuantLinear(store.get(p + "wq_b.weight"), store.get(p + "wq_b.scale"))
             self.wkv = QuantLinear(store.get(p + "wkv.weight"), store.get(p + "wkv.scale"))
+            # q_a and kv read the same x, so one GEMM over the stacked weights replaces two
+            # cublasLt setups (0.65ms each). The concatenated copy is the device-resident
+            # one; the two originals stay on the host and are not migrated.
+            self.wqkv = QuantLinear(
+                torch.cat([self.wq_a.weight, self.wkv.weight], dim=0),
+                torch.cat([self.wq_a.scale, self.wkv.scale], dim=0))
             self.wo_a = QuantLinear(store.get(p + "wo_a.weight"), store.get(p + "wo_a.scale"),
                                     cache_bf16=cache_wo_a)
             self.wo_b = QuantLinear(store.get(p + "wo_b.weight"), store.get(p + "wo_b.scale"))
@@ -179,11 +185,20 @@ class MLAWindowAttention:
         def _lin(w, x_):
             return w.forward(x_) if hasattr(w, "forward") else F.linear(x_, w)
 
-        qr = rms_norm(_lin(self.wq_a, x), self.q_norm, self.eps)
-        q = _lin(self.wq_b, qr).view(b, s, self.n_local_heads, self.head_dim)
-        apply_rope(q[..., -self.rope_dim:], freqs)
+        _wqkv = getattr(self, "wqkv", None)
+        if _wqkv is not None:
+            _qkv = _lin(_wqkv, x)
+            _q_lora = self.wq_a.out_features
+            qr = rms_norm(_qkv[..., :_q_lora], self.q_norm, self.eps)
+            q = _lin(self.wq_b, qr).view(b, s, self.n_local_heads, self.head_dim)
+            apply_rope(q[..., -self.rope_dim:], freqs)
+            _kv_raw = _qkv[..., _q_lora:]
+        else:
+            qr = rms_norm(_lin(self.wq_a, x), self.q_norm, self.eps)
+            q = _lin(self.wq_b, qr).view(b, s, self.n_local_heads, self.head_dim)
+            apply_rope(q[..., -self.rope_dim:], freqs)
 
-        _kv_raw = _lin(self.wkv, x)
+            _kv_raw = _lin(self.wkv, x)
         kv = None
         if (getattr(self, "quant", False) and _kv_raw.is_cuda and _kv_raw.size(0) == 1
                 and __import__("os").environ.get("TI_FUSED_KV") == "1"):
@@ -211,7 +226,10 @@ class MLAWindowAttention:
         # the reference quantises the window KV to fp8 (and back) AFTER RoPE -- that is
         # the form the cache holds. Order matters: skipping the round trip is a ~4.7%
         # output difference, and doing it before the rotation is a different value again.
-        if getattr(self, "quant", False) and kv.is_cuda and kv.dtype != torch.bfloat16:
+        if getattr(self, "quant", False) and kv.is_cuda:
+            # the reference ALWAYS round-trips the window KV through fp8 (post-RoPE):
+            # that is the form the cache holds. The old "kv.dtype != bfloat16" guard
+            # silently skipped it for bf16 inputs, which is where layer 0 diverged.
             from .official_kernel_ref import act_quant
             kv = act_quant(kv, 32, "ue8m0", torch.float8_e8m0fnu, True)
 

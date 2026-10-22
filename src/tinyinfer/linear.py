@@ -44,7 +44,13 @@ class QuantLinear:
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._bf16 is not None:
-            return F.linear(x, self._bf16.to(x.dtype) if self._bf16.dtype != x.dtype else self._bf16)
+            w = self._bf16
+            if w.device != x.device:
+                # the bf16 copy is built on the host in __init__ and Block.to() only moves
+                # the fp8 weights it knows about; migrate lazily, once per block
+                w = w.to(x.device)
+                self._bf16 = w
+            return F.linear(x, w.to(x.dtype) if w.dtype != x.dtype else w)
         if x.device.type == "cuda" and gemm.available():
             shape = x.shape
             y = gemm.fp8_linear(x.reshape(-1, shape[-1]), self.weight, self.scale)

@@ -139,12 +139,26 @@ class ShardStore:
         if dtype is None:
             raise ValueError(f"unsupported dtype {entry['dtype']} for {name}")
         path = self.model_dir / shard
+        # When the engine is building its pinned pool, read the weights STRAIGHT into a
+        # pool slice: the tensor then lives inside the pool, so the start-up build shows
+        # no growth in Task Manager (the pool was already fully committed) instead of
+        # adding ~17GB of private transients on top of it.
+        pool = getattr(self, "build_pool", None)
+        slot = pool.alloc(nbytes) if pool is not None else None
+        if slot is not None:
+            with path.open("rb") as f:
+                f.seek(data_start + start)
+                got = f.readinto(slot)
+            if got != nbytes:
+                raise ValueError(f"tensor {name} is truncated in {shard} (download incomplete)")
+            flat = torch.frombuffer(slot, dtype=torch.uint8)
+            return flat.view(dtype).reshape(tuple(entry["shape"]))
         with path.open("rb") as f:
             f.seek(data_start + start)
             raw = f.read(nbytes)
         if len(raw) != nbytes:
             raise ValueError(f"tensor {name} is truncated in {shard} (download incomplete)")
-        flat = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+        flat = torch.frombuffer(raw, dtype=torch.uint8)
         return flat.view(dtype).reshape(tuple(entry["shape"]))
 
     def read_many(self, names: list[str], *, threads: int = 8) -> dict[str, torch.Tensor]:

@@ -17,7 +17,8 @@ class Block(HCBlockMixin):
 
     def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, expert_store=None, quant: bool = False,
                  tp=None,
-                 hashes=None, cache_wo_a: bool = False, expert_topk: int = 0, rt=None):
+                 hashes=None, cache_wo_a: bool = False, expert_topk: int = 0, rt=None,
+                 cache_shared_bf16: bool = False):
         self.layer_id = layer_id
         self.cfg = cfg
         self._expert_store = expert_store
@@ -48,6 +49,7 @@ class Block(HCBlockMixin):
         # bf16 copies per layer only cost VRAM (40 x 8 x 30MB = 9.6GB, which is what made
         # a 63-token prefill run the allocator past physical memory)
         self.ffn = MoE(store, layer_id, cfg, expert_store=expert_store, topk=expert_topk,
+                       cache_shared_bf16=cache_shared_bf16,
                        max_bf16_experts=(0 if quant and not __import__("os").environ.get("TI_BF16_CACHE")
                                           else 8))
         p = f"layers.{layer_id}."
@@ -73,13 +75,26 @@ class Block(HCBlockMixin):
             out.append((a, name, getattr(a, name)))
         if getattr(a, "freqs_cis", None) is not None and a.freqs_cis.device.type != "cpu":
             pass  # already resident on the device
-        for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
-            ql = getattr(a, name)
-            if hasattr(ql, "weight"):
-                out.append((ql, "weight", ql.weight))
-                out.append((ql, "scale", ql.scale))
-            else:
-                out.append((a, name, ql))
+        if getattr(a, "wqkv", None) is not None:
+            # the stacked q/kv projection owns the device copy; wq_a/wkv stay on the host
+            ql = a.wqkv
+            out.append((ql, "weight", ql.weight))
+            out.append((ql, "scale", ql.scale))
+            for name in ("wq_b", "wo_a", "wo_b"):
+                ql = getattr(a, name)
+                if hasattr(ql, "weight"):
+                    out.append((ql, "weight", ql.weight))
+                    out.append((ql, "scale", ql.scale))
+                else:
+                    out.append((a, name, ql))
+        else:
+            for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b"):
+                ql = getattr(a, name)
+                if hasattr(ql, "weight"):
+                    out.append((ql, "weight", ql.weight))
+                    out.append((ql, "scale", ql.scale))
+                else:
+                    out.append((a, name, ql))
         comp = getattr(a, "compressor", None)
         if comp is not None:
             for name in ("norm_w", "wkv", "wgate"):
@@ -174,6 +189,11 @@ class Block(HCBlockMixin):
             def _pin(t):
                 if not (t.is_cpu and t.device.type == "cpu"):
                     return t
+                if t.is_pinned():
+                    # already a pinned pool slice: pin_memory() would COPY it (another
+                    # ~221MB per layer outside the pool), which must never happen once
+                    # the pool owns the host footprint
+                    return t
                 try:
                     return t.pin_memory()
                 except Exception:
@@ -236,6 +256,9 @@ class Block(HCBlockMixin):
         if self.profile:
             ev[1].record()
         h = self.attn.forward(h, start_pos)
+        _dp = getattr(self, "_dump_parts", None)
+        if _dp is not None:
+            _dp.append((self.layer_id, "y_attn", h.clone()))
         if _wt:
             _w.append(_t.perf_counter())          # 2: attn submitted
         if self.profile:
@@ -253,6 +276,8 @@ class Block(HCBlockMixin):
         if self.profile:
             ev[3].record()
         h = self.ffn.forward(h)
+        if _dp is not None:
+            _dp.append((self.layer_id, "y_ffn", h.clone()))
         if _wt:
             _w.append(_t.perf_counter())          # 5: MoE done
         if self.profile:
@@ -289,14 +314,22 @@ class TinyModel:
     takes an explicit layer list for staged verification.
     """
 
-    def __init__(self, store: ShardStore, cfg: TinyConfig, layers: list[int] | None = None):
+    def __init__(self, store: ShardStore, cfg: TinyConfig, layers: list[int] | None = None,
+                 tokenizer=None):
         self.store = store
         self.cfg = cfg
         self.embed = store.get("embed.weight")
         self.out_norm = store.get("norm.weight")
         self.head = store.get("head.weight")
         self.layers = layers or []
-        self.blocks = [Block(store, i, cfg) for i in self.layers]
+        # engram needs the compressed-token hash state; without the tokenizer the engram
+        # layers would silently contribute nothing (which disagreed with the engine path)
+        self.hashes = None
+        if tokenizer is not None and cfg.engram_layer_ids:
+            from .engram import EngramHashes
+
+            self.hashes = EngramHashes(cfg, tokenizer)
+        self.blocks = [Block(store, i, cfg, hashes=self.hashes) for i in self.layers]
 
     def reset(self) -> None:
         for block in self.blocks:
@@ -309,12 +342,28 @@ class TinyModel:
         h = h.unsqueeze(2).repeat(1, 1, self.cfg.hc_mult, 1)
         pre_mix = torch.zeros(h.size(0), h.size(1), self.cfg.hc_mult, dtype=torch.float32)
         pre_mix[:, :, 0] = 1.0
+        hashes = None
+        if self.hashes is not None:
+            hashes = self.hashes(ids.reshape(-1).tolist(), start_pos)
         for block in self.blocks:
+            if block.engram is not None and hashes is not None:
+                h = block.engram.forward(h, hashes[block.engram.hash_index])
             h, pre_mix = block.forward(h, start_pos, pre_mix)
         from .hc import hc_split_sinkhorn  # noqa: F401  (kept importable for users)
         h = (pre_mix.unsqueeze(-1) * h.float()).sum(dim=2).to(h.dtype)
         h = rms_norm(h, self.out_norm, self.cfg.rms_norm_eps)
-        # bf16 matvec (official head stores fp32 weights; bf16 is 2x faster on CPU and
-        # numerically fine for sampling) -- see docs/loading.md head measurements
-        logits = torch.nn.functional.linear(h, self.head).float()
-        return logits
+        # the official ParallelHead projects in fp32; chunk the vocab axis so the fp32
+        # copy of the 129k x 5120 head never exists whole (2.65GB per call)
+        h = h.float()
+        head = self.head
+        if head.dtype == torch.float32:
+            return torch.nn.functional.linear(h, head)
+        step = 32768
+        out = None
+        for start in range(0, head.shape[0], step):
+            chunk = torch.nn.functional.linear(h, head[start:start + step].float())
+            if out is None:
+                out = torch.empty(*chunk.shape[:-1], head.shape[0],
+                                  dtype=chunk.dtype, device=chunk.device)
+            out[..., start:start + step] = chunk
+        return out
