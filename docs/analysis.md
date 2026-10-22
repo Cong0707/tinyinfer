@@ -913,3 +913,18 @@ called at the top of every request, and if it does not short-circuit when the mo
 already resident it would re-run the whole load path (the same shape of bug as the tier
 default). That is the concrete next step, recorded here rather than guessed at.
 
+
+### Two candidate causes ruled out for the ~40s
+
+1. `load()` short-circuits on an already-resident model (`if self._model is not None:
+   return`, twice-nested), so it is not re-running the load path.
+2. The server passes `layers=range(40)` to `Engine`, which is exactly what the engine's own
+   default is (`layer_ids=None` -> all layers); it does not bypass the planner's
+   resident/streaming split (the log line that says "all 40 layers resident" is the tier's
+   level description, not the plan -- the plan line right above it says 10/40 stream=30).
+
+So the fixed cost is inside the generation loop, not before it. The way to settle it is to
+run the server with `TI_LAYER_TIME=1` (or `TI_MOE_PROF=1`) and compare the per-layer
+timings with the same knobs in `Engine.generate` -- that is the concrete next step, and it
+is cheap now that both paths are known to share the same plan.
+
