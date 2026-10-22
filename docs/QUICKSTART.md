@@ -84,3 +84,22 @@ docs/ENV.md lists every one. The three worth knowing:
 - `TI_PREFILL_CHUNK=1` -- exactly reference-matching prefill (slower); the planner value
   is the fast path.
 - `TI_MOE_PROF=1` / `TI_LAYER_TIME=1` -- diagnostics only, they change nothing.
+## 3d. Multi-turn without re-prefilling the conversation
+
+A conversation prefix costs ~43s to prefill and checkpoints to 16.9MB that restores in
+~0.01s, so each turn only prefills the new text (verified: population -> 1,000,000, Hamlet
+-> Shakespeare, no re-prefill).
+
+    ids = tok.encode(transcript, add_special_tokens=False)
+    out = eng.generate(ids, max_new_tokens=16)          # turn 1
+    eng.save_checkpoint('/tmp/prefix.pt')
+
+    # next turn
+    eng.load_checkpoint('/tmp/prefix.pt')
+    new_ids = tok.encode('\nQuestion: ...\nAnswer:', add_special_tokens=False)
+    out = eng.generate(new_ids, max_new_tokens=16,
+                       start_pos=len(ids), keep_session=True)
+
+`examples/multi_turn.py` is the runnable version. (The HTTP server does not wire this up
+yet; it takes one request at a time.)
+
