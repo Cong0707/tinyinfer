@@ -46,3 +46,13 @@ the planner, so this is a matter of VRAM, not new code.
 - expert prediction from the previous token: 0% adjacent overlap
 - top-k below 6: visibly degraded output
 - KV fp8: KV is ~10MB total, no VRAM to gain
+## 5. Server path (open, concrete)
+
+The HTTP backend runs the reference path: `--tier aggressive` is refused and
+`TI_LAYER_TIME` shows every layer `streamed=False`, so it never reaches the engine's flat
+streaming ring (analysis.md §27). Measured cost: 82.2s for a 12-token prompt over HTTP vs
+~51s in-process. The task is to wire the `aggressive` level into `TinyModelBackend` -- the
+engine already supports it; the backend only needs to construct the engine with that tier
+and drop the reference-path assertion. That is the single largest user-visible speedup left
+for `tinyinfer serve`.
+
