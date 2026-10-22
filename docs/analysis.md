@@ -829,3 +829,15 @@ shared-state coverage in `snapshot`/`restore`.
 All three correct, and turns 2-3 pay only the new text's prefill. That is the multi-turn
 path a chat UI would use on this box.
 
+
+### Per-turn timing (the number a chat UI would care about)
+
+    turn 1: 51.0s   (43s prefill + decode, checkpoint saved)
+    turn 2: 30.9s   (prefix restored in 0.01s; only the new text is prefilled)
+    turn 3: 28.9s   (same)
+
+Against a hypothetical 63s/turn without reuse (43s prefill + 20s decode), the reused
+turns are ~2x faster, and the saving grows with conversation length (the prefix does not
+grow the per-turn cost at all). The answers in the same run: Paris / 1.5 million /
+William Shakespeare.
+
