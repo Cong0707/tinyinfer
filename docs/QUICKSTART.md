@@ -56,6 +56,16 @@ level-2 features pay off on a card big enough to hold the experts (docs/analysis
     python -m tinyinfer.cli generate --backend tiny --tier 1 \
         --model-dir <dir> "Question: What is pi?\nAnswer:" --max-tokens 16
 
+## 3c. What works today (verified)
+
+    Question: What is the capital of France?   ->  Paris
+    Question: What is pi?                     ->  Pi is a mathematical constant ... 3.14159
+    Question: Who wrote Hamlet?                ->  William Shakespeare
+
+English question/answer framing works; chat markers do not; Chinese prompts land in the
+model's exercise/answer-key style (docs/faq.md). A base checkpoint, so short or ambiguous
+prompts produce flat distributions and therefore unstable output (docs/analysis.md §20).
+
 ## 4. If it is slow
 
 | symptom | first thing to check |
