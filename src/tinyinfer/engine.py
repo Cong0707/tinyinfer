@@ -132,6 +132,14 @@ class Engine:
                 _slab_need = (self.cfg.n_layers - (hw.gpu_layers if hw is not None else 0)) * 178e6
                 _cache_room = max(192 << 20, int(_hb_room - _slab_need - 3 * (1 << 30)))
                 _cache_bytes = max(192 << 20, min(_plan_cache, _cache_room))
+                # One measurement, one decision: book the whole planned footprint now
+                # (slab + expert cache) instead of letting every later allocation
+                # re-read live available() and drift as other processes claim memory.
+                # That drift is what made the engine page to disk halfway through a
+                # request. TI_CLAIM_REAL=1 also commits the pages (opt-in: it doubles the
+                # footprint until the caches are filled).
+                _host_budget().claim(_cache_bytes + int(_slab_need),
+                                     real=__import__("os").environ.get("TI_CLAIM_REAL") == "1")
                 _ov = __import__("os").environ.get("TI_CACHE_GB")
                 if _ov:
                     try:
