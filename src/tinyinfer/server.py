@@ -760,7 +760,12 @@ class TinyModelBackend(BaseBackend):
                     status_code=501,
                     code="adapter_not_supported",
                 )
-            layer_ids = list(range(cfg.n_layers)) if self.layers is None else list(self.layers)
+            # None means "let the engine decide": the planner then keeps its resident
+            # set and streams the rest. Passing every layer id here told the engine that
+            # nothing needed streaming, so all 40 layers were treated as resident and the
+            # 8GB card paged on every step -- measured as `streamed=False` on all 40 layers
+            # and 73-97s for a 12-token prompt against ~51s in-process (analysis.md 27).
+            layer_ids = None if self.layers is None else list(self.layers)
             if self._tokenizer is None:
                 self._tokenizer = self._load_tokenizer()
             expert_store = self._make_expert_store(store)
@@ -2823,7 +2828,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tier",
         default="balanced",
-        choices=("conservative", "balanced", "aggressive"),
+        choices=("conservative", "balanced"),
         help="optimization tier for the reference path (default: balanced, i.e. the first",
     )
     parser.add_argument(
