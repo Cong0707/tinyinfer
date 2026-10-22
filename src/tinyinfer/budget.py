@@ -138,36 +138,18 @@ class HostBudget:
                 return False
             # VirtualAlloc alone only charges the commit limit; the physical pages are
             # still unowned until written, which is why Task Manager showed a slow climb
-            # and the box could still page. Touch one byte per 4KB page from 16 threads:
-            # measured 14GB in 0.20s (vs 1.0s single-threaded).
-            import threading as _th
-
+            # and the box could still page. Touch one byte per 4KB page, single-threaded:
+            # 14GB measures ~1.0s, which is fine -- this runs once at start-up and being
+            # simple and correct matters more here than being fast.
             n = int(nbytes)
-            step = max(4096, (n // 16) // 4096 * 4096)
-            view = ctypes.c_char * n
-            buf = None
             try:
                 import ctypes as _ct
+
                 buf = (_ct.c_char * n).from_address(ptr)
-            except Exception:
-                buf = None
-            if buf is None:
-                return True
-
-            def _touch(lo, hi):
-                for off in range(lo, hi, 4096):
+                for off in range(0, n, 4096):
                     buf[off] = b"\x01"
-
-            ths = []
-            for i in range(16):
-                lo = i * step
-                hi = min(n, (i + 1) * step) if i < 15 else n
-                if lo < n:
-                    t = _th.Thread(target=_touch, args=(lo, hi), daemon=True)
-                    t.start()
-                    ths.append(t)
-            for t in ths:
-                t.join()
+            except Exception:
+                pass
             if not hasattr(self, "_held"):
                 self._held = []
             self._held.append((k32, ptr))
