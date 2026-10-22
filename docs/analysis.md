@@ -990,3 +990,22 @@ Functionally the path is fine (both answers are sensible); it just does not save
 prefill. The in-process mechanism (examples/multi_turn.py) does, because there the caller
 controls the exact token ids.
 
+
+### After recording the rendered prompt: faster, but the output breaks
+
+    turn 1 (12 prompt tokens): 65.5s
+    turn 2 (27 prompt tokens): 60.6s  -> output `[ASY][]`
+
+Recording the rendered prompt makes the prefix match (turn 2 is now faster than turn 1,
+which is the prefill saving), but the generated text is garbage. So enablement is not a
+free win: the restored session (slot snapshot taken under the aggressive/flat-streaming
+tier) does not reproduce what a full prefill would. Two candidate causes: the snapshot does
+not capture the flat-stream state / ring position, or the restore happens before the tier's
+lazy flat setup has run for this process.
+
+**Position:** `TI_SERVER_PREFIX` stays off by default. The in-process multi-turn path
+(`examples/multi_turn.py`, 51s -> 30.9s -> 28.9s with correct answers) remains the verified
+way to reuse a prefix, and making the HTTP variant correct is a concrete follow-up rather
+than a finished feature. Recording this so nobody enables it on the strength of the timing
+alone.
+
