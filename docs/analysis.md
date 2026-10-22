@@ -928,3 +928,29 @@ run the server with `TI_LAYER_TIME=1` (or `TI_MOE_PROF=1`) and compare the per-l
 timings with the same knobs in `Engine.generate` -- that is the concrete next step, and it
 is cheap now that both paths are known to share the same plan.
 
+
+## 27. Why the HTTP path is slower: the server runs the reference path
+
+`TI_LAYER_TIME=1` inside the server shows **all 40 layers `streamed=False use_flat=False`**
+and no `flat streaming` line at all, while `Engine.from_hf` prints `flat streaming: 30
+layers, 463MBx3`. `tinyinfer server --tier aggressive` refuses with:
+
+    tier 'aggressive' is not wired into the reference path yet; use 'conservative' or 'balanced'
+
+So the server's `TinyModelBackend` is the **reference path**: it loads each layer from the
+store per step instead of using the engine's flat streaming ring and resident/streaming
+split. That is the whole ~40s: not a bug in the request loop, not cold disk (which is worth
+~9s), but the fact that the HTTP path never reaches the engine's 8GB machinery.
+
+Two fixes landed anyway (both real, both measured):
+
+- the default tier was `conservative` (level 0, the slowest reference configuration) -> now
+  `balanced` (97.1s -> 85.3s),
+- the server never returned the prefill workspace before decoding although
+  `Engine.generate` always does (85.3s -> 82.2s).
+
+The structural fix -- wiring `aggressive` (flat streaming) into the server backend -- is the
+next real task for the serve path and is recorded in docs/ROADMAP.md. Until then the honest
+statement is: in-process generation uses the engine; HTTP serves the reference path and is
+~50% slower for that reason.
+
