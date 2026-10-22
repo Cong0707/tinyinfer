@@ -604,3 +604,29 @@ slot-free so every run is reproducible):
 Decode is the same as with the pool (0.485 at 1.58GB/s disk, 0.482 at 1.86), so dropping it
 costs nothing measurable while making the output repeatable -- and prefill got faster.
 
+
+## 18. CORRECTION: the non-determinism is not the slot pool
+
+With the new default plan (no expert pool, no MTP, 10 resident layers) three identical
+calls to the same `forward` still differ:
+
+    run1 vs run0: max|d| = 21.8   argmax 2568 vs 12285
+    run2 vs run0: max|d| = 21.6   argmax 2568 vs 31114
+
+So the earlier attribution to the slot pool was wrong (or at best coincidental: the run
+where disabling the pool gave 0.000000 was a lucky pair). The pool is still a *cost* on
+this card (-15% decode, slower prefill) and the plan still drops it, but the run-to-run
+difference has another cause.
+
+Leading candidate now: **VRAM pressure / WDDM paging**. The plan keeps 10 layers resident
+and streams the other 30 through a 3-buffer ring on an 8GB card whose budget includes the
+display; the driver can migrate pages under the 1.3GB head plus ring under memory pressure,
+which changes the timing of asynchronous work and any reduction that overlaps it. That is
+consistent with: the noise being large (tens of logits), independent of which software
+feature is enabled, and absent from the small, purely single-token probes.
+
+Honest status: `TI_NO_SLOTS=1` is no longer claimed to give reproducibility. The engine is
+deterministic in its *decisions* (argmax stable most of the time) but not in its logits on
+this card. Verifying that would need a VRAM-headroom experiment (fewer resident layers)
+which is queued in docs/ROADMAP.md.
+
