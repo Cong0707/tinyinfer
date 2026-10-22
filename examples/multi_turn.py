@@ -40,7 +40,7 @@ def main() -> None:
     out = eng.generate(ids, max_new_tokens=args.max_new_tokens)
     answer = tok.decode(out, skip_special_tokens=True)
     print("Q:", QUESTIONS[0])
-    print("A:", answer.strip())
+    print("A:", answer.strip() or answer)
     text += answer
     eng.save_checkpoint(ckpt)
     print("saved prefix checkpoint:", ckpt, flush=True)
@@ -55,7 +55,7 @@ def main() -> None:
                            start_pos=start, keep_session=True)
         ans = tok.decode(out, skip_special_tokens=True)
         print("Q:", q)
-        print("A:", ans.strip())
+        print("A:", ans.strip() or ans)
         text += new + ans
 
     os.remove(ckpt)
