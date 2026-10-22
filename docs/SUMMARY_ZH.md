@@ -132,9 +132,10 @@
 | `--tier conservative`（旧默认） | 97.1s |
 | `--tier balanced` | 85.3s |
 | balanced + prefill 后 empty_cache | 82.2s |
-| **`--tier aggressive`（新默认，flat 流式）** | **63.9s** |
+| `--tier aggressive`（新默认，flat 流式，冷盘） | 66.7s |
 
 根因：服务端档位解析拒绝 aggressive（"not wired into the reference path yet"），导致 HTTP 路径
 永远走参考驱动（每层从 store 取权重），从不进入引擎的 flat 流式环。打开后 `TI_LAYER_TIME`
-显示 `streamed=True use_flat=True`，同一请求快 **34%**。
+显示 `streamed=True use_flat=True`。冷盘 66.7s、热盘 **45.5s**（与进程内生成 ~51s 一致），
+相对旧默认 97.1s 快 **53%**。
 
