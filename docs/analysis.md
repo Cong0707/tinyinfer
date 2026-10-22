@@ -708,3 +708,24 @@ checkpoint streamed from disk on an 8GB laptop answers factual questions correct
 engine's remaining defects are documented (reproducibility on this card, chunked-prefill
 accumulation) and none of them change these answers.
 
+
+## 22. Real speedup: the host expert cache was under-sized by a flat fraction
+
+The engine sized the RAM expert cache as `min(planner_cache, host_room * 0.35)` while the
+pinned layer slab only needs `(n_layers - resident) * layer_b` (4.97GB here) and is
+requested *after* the cache. With host_room = 22.96GB that put the cache at 508 experts
+(9.5GB) instead of the planner's 13.1GB. Sizing it from the room actually left over after
+the slab (and a 3GB reserve) gives 747 experts (14.0GB).
+
+Measured at the same disk rate (1.84GB/s):
+
+| metric | 508 experts (9.5GB) | 747 experts (14.0GB) |
+| --- | --- | --- |
+| expert cache hit | 16.3% | **25.5%** |
+| decode | 0.482 tok/s | **0.519 tok/s** (+7.7%) |
+| warm prefill | 12.6s | 13.1s |
+
+That is the only lever left on a disk-bound box, and it also explains why earlier cache
+experiments looked like they went "negative past 15GB": what actually starves the slab is
+not the cache size but sizing it without accounting for the slab.
+
