@@ -549,3 +549,21 @@ where the slot-pool race lives, which may or may not be the same root cause).
   40-layer pass runs chord-wise. That is consistent with an accumulation effect that no
   single component owns, and it is where I would put the next pair of eyes.
 
+
+## 15. On this 8GB box, tier 1 is both faster and reproducible
+
+Same prompt, 8 new tokens, measured twice:
+
+| tier | time | answer | notes |
+| --- | --- | --- | --- |
+| 1 (BALANCED) | 50-69s | Paris (correct) | no VRAM slot pool -> deterministic |
+| 2 (AGGRESSIVE, default) | 91-94s | Paris (correct) | slot pool on -> 0.5-1.0 logit noise |
+
+tier 2's level-2 features (slot arena, batched scatter, async fetch, MTP) were designed
+for throughput, but on this card the slot pool mostly pays H2D copies and the MTP stages
+have an acceptance rate of 0.08 -- so the default tier is ~35% slower *and* the only
+source of the non-reproducibility. On a large card the arithmetic inverts (the slot pool
+then holds every routable expert), which is why the tier defaults stay as they are; for an
+8-12GB box, `--tier 1` is the better operating point and it is now documented in
+docs/QUICKSTART.md.
+
