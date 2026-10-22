@@ -656,3 +656,14 @@ and compare -- but do not rely on `TI_NO_SLOTS=1` for exactness; that claim was 
 in §18. Verifying the paging hypothesis properly needs a card with headroom or a
 CUDA_LAUNCH_BLOCKING run with residency 3, and is queued in docs/ROADMAP.md.
 
+
+- `CUDA_LAUNCH_BLOCKING=1` (every kernel synchronised) still gives max|d| = 21.7 between
+  identical forwards, so it is not an asynchronous-execution race either. With synchronous
+  kernels, an identical call sequence, and reset state between runs, the only remaining
+  source is the platform: on this laptop the display driver (WDDM) can migrate the
+  card's pages while the engine holds ~85% of the VRAM, and that changes what the GPU
+  computes across launches even when each launch is synchronised. That is outside what an
+  engine can fix; it needs either a VRAM budget with real headroom (a bigger card) or
+  residency small enough that the driver never pages (measured exact at 3 of 40 layers,
+  which costs most of the speed).
+
