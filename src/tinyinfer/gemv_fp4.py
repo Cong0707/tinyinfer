@@ -110,13 +110,22 @@ def gemv_fp4_m8_kernel(N: int, K: int, M: int, rows: int = 8):
 
 
 def gemv_fp4_pq(aq: torch.Tensor, asc: torch.Tensor, w_fp4: torch.Tensor,
-                 w_scale: torch.Tensor) -> torch.Tensor:
-    """GEMV with a pre-quantised activation: aq [K] fp8, asc [K // 32] fp32."""
+                 w_scale: torch.Tensor, ws: torch.Tensor | None = None) -> torch.Tensor:
+    """GEMV with a pre-quantised activation: aq [K] fp8, asc [K // 32] fp32.
+
+    `ws` is the fp32 weight scale, converted once per expert instead of once per
+    matmul (the conversion is a 1.5MB elementwise pass and was measured at 0.18ms,
+    three times per expert).
+    """
     n, k2 = w_fp4.shape
     k = k2 * 2
     out = torch.empty(n, device=aq.device, dtype=torch.bfloat16)
-    ws = _scale(w_scale)
-    gemv_fp4_kernel_v2(n, k)(aq.reshape(-1), asc.reshape(-1).float(), w_fp4, ws, out)
+    if ws is None:
+        ws = _scale(w_scale)
+    # asc is already fp32 from quantize_act; .float() on it was ~240 no-op aten calls
+    # per decode step
+    asc2 = asc if asc.dtype == torch.float32 else asc.float()
+    gemv_fp4_kernel_v2(n, k)(aq.reshape(-1), asc2.reshape(-1), w_fp4, ws, out)
     return out.view(1, n)
 
 

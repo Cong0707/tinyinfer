@@ -2,6 +2,7 @@
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,6 +52,7 @@ def make_store(cfg, layer_id=2, seed=0):
     return FakeStore(t)
 
 
+@pytest.mark.kernel
 def test_prefill_and_decode():
     cfg = TinyConfig.from_hf(model_dir())
     assert cfg.compress_ratios[2] == 2

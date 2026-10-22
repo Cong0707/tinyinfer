@@ -12,6 +12,10 @@ cache/
 *.pt
 *.log
 
+# 本地会话缓存（KV 文件很大，session 映射是机器本地状态）
+.kvcache/*.pt
+.kvcache/*.db
+
 # 本地配置
 .env
 config.local.*

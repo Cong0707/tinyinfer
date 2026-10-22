@@ -46,7 +46,13 @@ class Gate:
         bias = self.bias
         if image_mask is not None and self.bias_vl is not None:
             bias = torch.where(image_mask.unsqueeze(-1), self.bias_vl, bias)
-        indices = (scores + bias).topk(self.topk, dim=-1)[1]
+        # deterministic top-k: torch.topk's tie order is not stable on CUDA, so the same
+        # layer could pick a different expert set on every call (measured: two forwards of
+        # an identical input went to disjoint expert sets and the MoE output differed by
+        # 0.49). A stable descending argsort always breaks ties by expert index.
+        logits = scores + bias
+        order = torch.argsort(logits, dim=-1, descending=True, stable=True)
+        indices = order[..., :self.topk]
         weights = scores.gather(1, indices)
         if self.norm_topk_prob and self.topk > 1:
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
@@ -121,7 +127,7 @@ class Expert:
         # Several tokens of one chunk can route to the same expert: the single-row GEMV
         # flattens a [rows, K] activation into the kernel's [K] slot and reads it wrong,
         # which is what made a multi-token forward disagree with token-by-token decoding.
-        def _lin(aqq, assc, w, s):
+        def _lin(aqq, assc, w, s, ws=None):
             # The multi-row kernel is exact on synthetic weights (M=1..8, rel 0) but
             # measured 42% off with real expert-34 weights, while the single-row kernel
             # is exact on both. Rows are therefore done one at a time unless the batch
@@ -130,15 +136,30 @@ class Expert:
                     and __import__("os").environ.get("TI_MULTIROW_GEMV") == "1"):
                 return gemv_fp4_m8(aqq, assc, w, s)
             if aqq.dim() == 2 and aqq.size(0) > 1:
-                rows = [gemv_fp4_pq(aqq[i], assc[i], w, s) for i in range(aqq.size(0))]
+                rows = [gemv_fp4_pq(aqq[i], assc[i], w, s, ws) for i in range(aqq.size(0))]
                 return torch.cat(rows, 0)
             a1 = aqq[0] if aqq.dim() == 2 else aqq
             s1 = assc[0] if assc.dim() == 2 else assc
-            return gemv_fp4_pq(a1, s1, w, s)
+            return gemv_fp4_pq(a1, s1, w, s, ws)
 
         w1, s1, w2, s2, w3, s3 = self.fp4
-        gate = _lin(aq, asc, w1, s1).float()
-        up = _lin(aq, asc, w3, s3).float()
+        ws = (None, None, None)
+        # NOTE: stacking [w1; w3] into one 2N-row GEMV was tried and removed: the two
+        # torch.cat calls it needs cost 768 launches and 22ms of GPU time per token, more
+        # than the 18 -> 12 launch saving. The GEMVs are not the bottleneck.
+        if aq.dim() == 2 and aq.size(0) == 1:
+            # Decode only: the fp32 scale conversion is a 1.5MB elementwise pass and it
+            # was done once per matmul (0.18ms x 3 per expert, 130ms per token). Caching
+            # it per expert at prefill would hold 3 tensors for every one of the ~2400
+            # experts a prompt touches, which OOMs an 8GB card -- so prefill converts as
+            # before and decode keeps it for the few experts it serves.
+            ws = getattr(self, "_ws_cache", None)
+            if ws is None:
+                from .gemv_fp4 import _scale
+
+                ws = self._ws_cache = (_scale(s1), _scale(s2), _scale(s3))
+        gate = _lin(aq, asc, w1, s1, ws[0]).float()
+        up = _lin(aq, asc, w3, s3, ws[2]).float()
         if self.swiglu_limit > 0:
             up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
             gate = torch.clamp(gate, max=self.swiglu_limit)
@@ -169,7 +190,7 @@ class Expert:
 
 class MoE:
     def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, expert_store=None,
-                 max_bf16_experts: int = 8, topk: int = 0):
+                 max_bf16_experts: int = 8, topk: int = 0, cache_shared_bf16: bool = False):
         self.cfg = cfg
         self.layer_id = layer_id
         self._expert_store = expert_store  # optional tinyinfer.loading.ExpertStore
@@ -180,9 +201,9 @@ class MoE:
         # shared expert stays fp8 on the device (halves its VRAM; official fp8 GEMM path)
         from .linear import QuantLinear
         self.shared = Expert(
-            QuantLinear(store.get(p + "shared_experts.w1.weight"), store.get(p + "shared_experts.w1.scale")),
-            QuantLinear(store.get(p + "shared_experts.w2.weight"), store.get(p + "shared_experts.w2.scale")),
-            QuantLinear(store.get(p + "shared_experts.w3.weight"), store.get(p + "shared_experts.w3.scale")),
+            QuantLinear(store.get(p + "shared_experts.w1.weight"), store.get(p + "shared_experts.w1.scale"), cache_bf16=cache_shared_bf16),
+            QuantLinear(store.get(p + "shared_experts.w2.weight"), store.get(p + "shared_experts.w2.scale"), cache_bf16=cache_shared_bf16),
+            QuantLinear(store.get(p + "shared_experts.w3.weight"), store.get(p + "shared_experts.w3.scale"), cache_bf16=cache_shared_bf16),
             cfg.swiglu_limit,
         )
         self._store = store
@@ -208,6 +229,23 @@ class MoE:
             self.swiglu_limit,
         )
 
+    def _expert_from_rec(self, rec) -> Expert:
+        """One cudaMemcpyAsync per expert, straight from the host-pool slice.
+
+        Six per-tensor copy_() calls per expert is 36 synchronous pageable copies per
+        layer: the link is PCIe 5.0 x8 (measured 26GB/s), but each blocking copy waits for
+        the queue to drain, which put ~18ms/layer on the critical path. One async 18.8MB
+        DMA is 0.7ms and never blocks.
+        """
+        target = self.gate.weight.device
+        if target.type == "cuda" and hasattr(rec, "tensors_on"):
+            t = rec.tensors_on(target)
+            e = Expert(None, None, None, self.swiglu_limit)
+            e.fp4 = (t["w1.weight"], t["w1.scale"], t["w2.weight"], t["w2.scale"],
+                     t["w3.weight"], t["w3.scale"])
+            return e
+        return self._expert_from(rec.tensor)
+
     def _make_expert(self, rec) -> Expert:
         """Materialise one expert for the gate's device: fp4 stays packed on CUDA.
 
@@ -215,7 +253,7 @@ class MoE:
         any CPU-side path, so the packed fp4 tensors go to the device and the fp4 kernel
         consumes them directly.
         """
-        return self._expert_from(rec.tensor)
+        return self._expert_from_rec(rec)
 
     def _expert(self, i: int) -> Expert:
         e = self._expert_cache.get(i)
@@ -268,8 +306,11 @@ class MoE:
             # much of the step is the CPU waiting for the GPU to finish this layer.
             active = list(range(min(6, self.cfg.n_routed_experts)))
         else:
-            counts = torch.bincount(indices.flatten(), minlength=self.cfg.n_routed_experts).tolist()
-            active = [i for i, cnt in enumerate(counts) if cnt > 0]
+            # One small D2H instead of a bincount over 384 classes: decode routes <= 8
+            # distinct experts, so the kernel plus its 384-element sync (3.3ms per layer,
+            # 130ms per token) buys nothing over fetching the 6 routed ids directly.
+            _route = [int(v) for v in indices.reshape(-1).tolist()]
+            active = sorted(set(_route))
             if _prof:
                 self._parts["bincount"] += _tp.perf_counter() - _t2
         # Expert parallelism: with several tensor-parallel ranks a rank serves only the
@@ -281,7 +322,17 @@ class MoE:
             active = [i for i in active if (i % _world) == _rank]
         self._last_ids = list(active)  # already the unique routed set (one host sync total)
         target = xf.device
-        use_fp4_kernel = target.type == "cuda"
+        # Decode (one token) reads each expert's packed fp4 tiles directly through the
+        # single-row GEMV kernel, which is exact (the 42% divergence was the multi-row
+        # kernel) and skips materialising ~70MB of bf16 weights per expert. Prefill keeps
+        # the bf16 dequant path: at M>8 it uses the fused kernel, and the row-by-row
+        # fallback measured 2.7x slower on a 13-token prompt. TI_MOE_FP4=0 restores the
+        # old always-bf16 behaviour, TI_MOE_FP4=1 forces the kernel path everywhere.
+        _fp4_env = _os0.environ.get("TI_MOE_FP4")
+        _single_token = xf.size(0) == 1
+        use_fp4_kernel = target.type == "cuda" and (
+            _fp4_env == "1" or (_single_token and _fp4_env != "0")
+        )
         limit = self._max_bf16
 
         # one activation quantisation for every routed expert of this layer: the
@@ -297,11 +348,33 @@ class MoE:
 
         # per-expert (token, slot) selection computed once and reused by both passes
         sels: dict[int, tuple] = {}
+        _single = xf.size(0) == 1
+        _groups: dict[int, list[int]] = {}
+        if _single and not _os.environ.get("TI_NO_SYNC") == "1":
+            # decode: one row, six experts -- group them from the route list we already
+            # pulled to the host instead of one torch.where launch per expert (6 per
+            # layer, 240 per token)
+            for _col, _e in enumerate(_route):
+                _groups.setdefault(_e, []).append(_col)
+
+        # decode: the routing weight of each expert, summed over the top-k slots it won.
+        # Built once per layer (six small tensors) instead of one torch.tensor per expert.
+        _wsum: dict[int, object] = {}
+        if _single and _groups:
+            for _e, _cols in _groups.items():
+                _wsum[_e] = weights[0, torch.tensor(_cols, dtype=torch.long,
+                                                    device=weights.device)].sum().view(1, 1)
 
         def sel_of(i: int):
             s = sels.get(i)
             if s is None:
-                s = sels[i] = torch.where(indices == i)
+                _cols = _groups.get(i)
+                if _cols:
+                    rows = torch.zeros(len(_cols), dtype=torch.long, device=indices.device)
+                    s = sels[i] = (rows, torch.tensor(_cols, dtype=torch.long,
+                                                     device=indices.device))
+                else:
+                    s = sels[i] = torch.where(indices == i)
             return s
 
         # 1) start the disk reads for the experts we do not hold BEFORE serving the
@@ -319,6 +392,15 @@ class MoE:
                                                             cache=_admit_cache)
             except Exception:
                 _pre_fetch = None
+        # The shared expert does not depend on the routing, so compute it while the routed
+        # experts' reads are in flight. It used to be the last statement of this method,
+        # which put its ~1ms/layer (plus its 3 GEMM submissions) on the critical path of
+        # every decode step.
+        _sh0 = _tp.perf_counter() if _prof else 0.0
+        if _world == 1 or _rank == 0:
+            y += self.shared.forward(xf)
+        if _prof:
+            self._parts["shared"] += _tp.perf_counter() - _sh0
 
         if limit > 0:
             for i in cached_hits:
@@ -352,6 +434,7 @@ class MoE:
                 store = self._expert_store
 
                 def serve(ids_batch, recs):
+                    nonlocal y
                     # the DMA for these slots was started inside fetch(); make the
                     # compute stream wait for it here, immediately before the tiles are
                     # read, so the routing sync of the next layer is not blocked by it
@@ -370,12 +453,22 @@ class MoE:
                         idx, top = sel_of(i)
                         rec = rec_by_id[i]
                         if use_fp4_kernel:
-                            e = Expert(None, None, None, self.swiglu_limit)
-                            e.fp4 = (
-                                rec.tensor("w1.weight").to(target), rec.tensor("w1.scale").to(target),
-                                rec.tensor("w2.weight").to(target), rec.tensor("w2.scale").to(target),
-                                rec.tensor("w3.weight").to(target), rec.tensor("w3.scale").to(target),
-                            )
+                            # one async DMA per expert (see _expert_from_rec). This used to
+                            # be six blocking rec.tensor(...).to(target) copies per expert =
+                            # 480 synchronous pageable copies per decode step, which was the
+                            # single largest host cost in the step.
+                            e = self._expert_from_rec(rec)
+                            if _single and i in _wsum:
+                                # one row, one expert: accumulate straight into y instead
+                                # of building row/col index tensors and scattering
+                                _w = _wsum[i]
+                                if _aq is not None:
+                                    _val = e.forward_fp4_pq(_aq, _asc, _w).float()
+                                else:
+                                    _val = e.forward_fp4(xf, _w).float()
+                                y += _val
+                                served.append(i)
+                                continue
                             if _aq is not None:
                                 # idx holds *every* row routed to this expert. Taking
                                 # idx[0] (as this did) fed only the first row through the
@@ -455,15 +548,10 @@ class MoE:
                 else:
                     y[idx] += e.forward(xf[idx], weights[idx, top, None])
 
-        _sh0 = _tp.perf_counter() if _prof else 0.0
-        # the shared expert is replicated: only rank 0 computes it, so the all-reduce
-        # below lands it once instead of once per rank
-        if _world == 1 or _rank == 0:
-            y += self.shared.forward(xf)
+        # the shared expert was already accumulated above (rank 0 only, so the all-reduce
+        # lands it once instead of once per rank)
         if _world > 1:
             from .tp import all_reduce_sum
 
             y = all_reduce_sum(y)
-        if _prof:
-            self._parts["shared"] += _tp.perf_counter() - _sh0
         return y.to(x.dtype).view(shape)

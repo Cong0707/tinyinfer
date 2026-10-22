@@ -5,6 +5,15 @@ The fetch/dequant/eviction policy lives in loading.py; this is the orchestration
 """
 from __future__ import annotations
 
+# cuBLAS GEMMs are not bit-reproducible by default (split-k order varies run to run),
+# and this engine samples greedily: a one-ulp logit difference sends the first token
+# down a different path (observed: "Paris" in one run, an unrelated essay in the next).
+# PyTorch's prescribed fix is this workspace config, and it must be set before CUDA
+# initialises -- hence module import time.
+import os as _os_cublas
+
+_os_cublas.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 from pathlib import Path
 
 from .adapters import ModelAdapter, open_adapter
@@ -48,6 +57,13 @@ class Engine:
         layers: list[int] | None = None,
         head_on_cpu: bool = False,
     ):
+        # ONE engine per machine: the engine claims a large pinned host pool and the
+        # whole GPU, so a second instance doubles the RAM (the box swaps) and on Windows
+        # makes later cudaMalloc calls fail. Refuse before reading or allocating anything
+        # rather than degrade the engine that is already running.
+        from .runlock import EngineLock
+
+        self._engine_lock = EngineLock().acquire()
         self.layer_ids = list(layers) if layers is not None else None
         self.device = device
         self._tokenizer = tokenizer
@@ -60,6 +76,14 @@ class Engine:
             from .tiers import plan as _tier_plan
             tier = _tier_plan(OptLevel[tier.upper()])
         self.tier = plan(tier) if isinstance(tier, OptLevel) else tier
+        if __import__("os").environ.get("TI_DETERMINISTIC") == "1":
+            torch.use_deterministic_algorithms(True, warn_only=True)
+            torch.backends.cudnn.deterministic = True
+        if __import__("os").environ.get("TI_TORCH_ONLY") == "1":
+            # diagnostic: pure-torch numerics, no tilelang/fp4 kernels
+            self.tier.use_tilelang_attn = False
+            self.tier.use_fp4_gemm = False
+            self.tier.use_fp8_gemm = False
         _topk = int(__import__("os").environ.get("TI_TOPK", "0"))
         if _topk > 0:
             self.tier.expert_topk = _topk
@@ -129,51 +153,100 @@ class Engine:
                 # resident) * layer_b and is requested *after* this, so a fraction that is
                 # too large starves it (measured: 9.3s/token with a 15.3GB cache on this
                 # box). TI_CACHE_GB overrides for A/B.
-                _slab_need = (self.cfg.n_layers - (hw.gpu_layers if hw is not None else 0)) * 178e6
-                _cache_room = max(192 << 20, int(_hb_room - _slab_need - 3 * (1 << 30)))
-                # Speed-first sizing: take the whole room our share of physical RAM leaves
-                # after the slab, not the planner's (avail-derived) number. Other programs
-                # may be pushed out of RAM -- that is the accepted trade -- but the model
-                # itself must never page, because a paged expert read costs 10x a hit.
-                # TI_CACHE_GB still overrides for A/B.
-                _cache_bytes = max(192 << 20, int(_cache_room))
-                # One measurement, one decision: book the whole planned footprint now
-                # (slab + expert cache) instead of letting every later allocation
-                # re-read live available() and drift as other processes claim memory.
-                # That drift is what made the engine page to disk halfway through a
-                # request. TI_CLAIM_REAL=1 also commits the pages (opt-in: it doubles the
-                # footprint until the caches are filled).
-                # Claim real memory for the expert cache and hand that very buffer to the
-                # store: the cache copies its entries INTO this slab instead of allocating
-                # a second one of the same size (which would defeat the claim and push the
-                # box back onto the page file).
+                # THE host pool: claim our whole share of physical RAM ONCE, as pinned
+                # (DMA-able) memory, and derive every buffer from what the OS actually
+                # handed over. The slab and the expert cache are both carved out of this
+                # one range. Sizing from an estimate and asking again later is what
+                # created a second pool and a CUDA OOM; the claimed amount is the only
+                # number that is true. Other programs may be pushed out of RAM -- that
+                # is the accepted trade -- but the model itself must never page, because
+                # a paged expert read costs 10x a hit.
                 _budget = _host_budget()
-                # Claim FIRST, plan from what was claimed: ask for our whole share minus
-                # the layer slab, then take the cache size to be whatever the OS actually
-                # handed over. Planning from an estimate and then claiming it was backwards
-                # -- the claim could come back short and the plan would be fiction.
-                _target = max(192 << 20, int(_hb_room - _slab_need - 3 * (1 << 30)))
+                _avail = _budget.available()
+                # The headroom is not slack. It has to cover, simultaneously:
+                #   - the block build that runs right after this claim: every streamed
+                #     layer's host weights are read (~430MB/layer, ~13GB for 30 layers)
+                #     before the flat slab copies them into this pool and releases them;
+                #   - a fresh pinned staging block for pageable->GPU copies (engram,
+                #     embed), which fails with driver OOM once the pool has eaten the box;
+                #   - the OS and other applications.
+                # Measured failure: pool at avail-10GB (24GB) + 13GB of weights -> swap.
+                # Fill physical RAM: a full pool is the design goal (cache hits beat
+                # disk reads). The reserve only covers the start-up build (resident
+                # layers' host temporaries are freed as they move to VRAM) and OS slack.
+                # cudaHostAlloc succeeds up to ~29GB on this box; above that the driver
+                # refuses the whole request and the halving retry lands at 15GB (which
+                # halves the expert cache and doubles decode time). Cap it.
+                _target = max(192 << 20,
+                              min(_budget.room(), int(_avail - (5 << 30)), 28 << 30))
+                _pov = __import__("os").environ.get("TI_HOST_POOL_GB")
+                if _pov:
+                    try:
+                        _target = min(_target, int(float(_pov) * (1 << 30)))
+                    except ValueError:
+                        pass
                 _taken = int(_budget.claim(_target, real=True))
-                # THE host pool: one allocation, everything pageable is carved from it
                 from .budget import HostPool
                 from .loading import BlobPool
 
                 _pool_view = getattr(_budget, "_claim_buf", None)
                 self.host_pool = (HostPool.from_claimed(_pool_view, _taken)
                                   if _taken and _pool_view is not None else None)
-                _cache_bytes = max(192 << 20, _taken) if _taken else 192 << 20
+                # Reserve the slab's share first: _flat_setup runs on the first forward
+                # and carves its per-layer pinned blocks out of this same pool, so the
+                # cache must not eat bytes the slab is about to need.
+                # Size the slab reserve from the planner's own per-layer number: the weights
+                # are not loaded yet, so this is the only honest figure available, and the
+                # old flat 28% of RAM reserved 13.2GB for a 6.5GB slab, starving the cache.
+                _slab_need = (self.cfg.n_layers
+                              - (hw.gpu_layers if hw is not None else 0)) * 178e6
+                _slab_reserve = 0
+                _flat_flag = __import__("os").environ.get("TI_FLAT")
+                if self.host_pool is not None and not (_flat_flag is not None
+                                                       and _flat_flag != "1"):
+                    # only reserve slab room when flat streaming may use it; with
+                    # TI_FLAT=0 the slab never runs and the bytes belong to the cache
+                    # The slab itself is exactly sum(streamed layer bytes) (5.3GB here);
+                    # the rest of the reserve is the build window (a layer is read on the
+                    # host, copied into the pool, then released) plus slack. 3.5x reserved
+                    # 18.7GB and left the expert cache with 9-13GB, which holds ~600 of the
+                    # 1439 experts ten decode steps touch -- that is why the hit rate was
+                    # 50%. 1.6x leaves the cache ~19GB while still covering the build.
+                    # 1.1x: the slab is exactly sum(streamed layer bytes); the extra 10%
+                    # covers the build window. 1.6x left the pool too short for the slab
+                    # itself (measured "slab unavailable" -> the per-tensor fallback, which
+                    # then needed a bigger prefill workspace and OOM'd).
+                    _slab_reserve = min(int(_slab_need * 1.15) + (1 << 30),
+                                        max(0, self.host_pool.free - 192 * (1 << 20)))
                 _cache_pool = None
-                if self.host_pool is not None:
-                    _cache_bytes = int(min(_cache_bytes, self.host_pool.free))
-                    _slot = self.host_pool.alloc(_cache_bytes) if _cache_bytes > 0 else None
-                    if _slot is not None:
-                        _cache_pool = BlobPool(_slot, _cache_bytes)
+                _cache_bytes = max(192 << 20, int(_plan_cache))
                 _ov = __import__("os").environ.get("TI_CACHE_GB")
+                _ov_bytes = None
                 if _ov:
                     try:
-                        _cache_bytes = int(float(_ov) * (1 << 30))
+                        _ov_bytes = int(float(_ov) * (1 << 30))
                     except ValueError:
-                        pass
+                        _ov_bytes = None
+                if _ov_bytes is not None:
+                    _cache_bytes = _ov_bytes
+                if self.host_pool is not None:
+                    _pool_avail = max(192 << 20, self.host_pool.free - _slab_reserve)
+                    # the override may not exceed what the pool can actually guarantee:
+                    # capacity larger than the backing slab makes every take() fail and the
+                    # read path silently falls back (measured: TI_CACHE_GB=14 with a 6GB
+                    # slab -> 555 fallbacks, decode 1.1s -> 1.9s)
+                    # Hard ceiling on the host cache: the slab (5.3GB of streamed layer
+                    # weights) must still fit in the same claim. Without it the cache took
+                    # the whole pool (measured: used=28.00GB free=0.00GB) and the slab
+                    # silently fell back to per-tensor copies, which is +0.35s per token.
+                    # 13GB leaves the pool enough to build the full 30-layer slab (5.3GB);
+                    # at 14GB the slab came back partial (18/30) and the remaining layers
+                    # paid 30 per-tensor copy_ calls per token
+                    _pool_avail = min(_pool_avail, 12 << 30)
+                    _cache_bytes = min(_ov_bytes, _pool_avail) if _ov_bytes else _pool_avail
+                    _slot = self.host_pool.alloc(_cache_bytes)
+                    if _slot is not None:
+                        _cache_pool = BlobPool(_slot, _cache_bytes)
                 self.expert_store = ExpertStore.from_store(
                     self.store,
                     slot_arena=bool(getattr(self.tier, "slot_arena", False)),
@@ -303,6 +376,10 @@ class Engine:
         self.embed_on_cpu = bool(getattr(self.hw_plan, "embed_on_cpu", False)) or device == "cpu"
         if __import__("os").environ.get("TI_EMBED_GPU") == "1":
             self.embed_on_cpu = False
+        # embed / head / norm are 100MB-1.3GB allocations: route them through the
+        # claimed pool too, so no large buffer ever appears outside it.
+        if getattr(self, "host_pool", None) is not None:
+            self.store.build_pool = self.host_pool
         _emb = self.store.get("embed.weight")
         self.embed = _emb if self.embed_on_cpu else _emb.to(device)
         self.out_norm = self.store.get("norm.weight").to(device)
@@ -329,6 +406,89 @@ class Engine:
                           flush=True)
             except Exception as exc:
                 print(f"[tinyinfer] MTP unavailable: {exc}", flush=True)
+
+        # Allocate EVERYTHING now: blocks, host weights, pinned slab. Blocks used to be
+        # constructed lazily on their first forward, so RAM climbed for a minute after
+        # the engine was "up" -- and because the pool was already claimed, that climb
+        # ended in swap. One build here makes the footprint final before the engine is
+        # handed out; nothing is allocated during generation except the expert cache,
+        # which fills inside the pool.
+        self._prebuild()
+
+    # -- start-up build ----------------------------------------------------
+    def _prebuild(self) -> None:
+        """Build every block and the pinned slab NOW, not on the first forward.
+
+        Each block reads its host weights from disk (~430MB per streamed layer). Doing
+        that lazily during the first request is what made RAM climb after start-up;
+        because the pool is already claimed, the climb ended in swap (measured: 24GB
+        pool + 13GB weights + 13GB OS = 50GB). Pay the whole cost here so the footprint
+        is final before the engine is handed out.
+        """
+        if self.device == "cpu" or getattr(self, "_prebuilt", False):
+            return
+        self._prebuilt = True
+        if self.layer_ids is not None:
+            layers = list(self.layer_ids)
+            if self.allow_missing_layers:
+                avail = self.available_layers()
+                layers = [i for i in layers if i < avail]
+        else:
+            n = self.max_layers
+            if self.allow_missing_layers:
+                n = min(n, self.available_layers())
+            layers = list(range(n))
+        if not layers:
+            return
+        # No _warm_weights here: it read all 17GB into private memory (plus a bytearray
+        # copy per tensor) only to page-cache it, and that transient is what pushed
+        # commit to 90GB. Blocks read their own weights; the OS cache warms itself.
+        streamed_set = self._stream_layers()
+        pool = getattr(self, "host_pool", None)
+        try:
+            if pool is not None:
+                # weights are read straight into pool slices from here on: the build
+                # happens INSIDE the claimed pool, so Task Manager shows the pool's one
+                # jump and nothing after it
+                self.store.build_pool = pool
+            for i in layers:
+                if i in streamed_set:
+                    # built by _flat_setup below; its weights also land in the pool
+                    continue
+                b = self.block(i)
+                # resident layers live in VRAM for the whole run; the pinned host copy
+                # only exists for a to("cpu") that never happens on them
+                b._cpu_refs = None
+            # flat streaming builds each streamed block and copies its weights into the
+            # pinned slab -- all inside the same pool
+            try:
+                self._flat_enabled()
+            except Exception as exc:
+                print(f"[tinyinfer] flat setup at start-up failed: {exc!r}", flush=True)
+        finally:
+            self.store.build_pool = None
+            if self.device != "cpu":
+                # Compile the tilelang kernels NOW. The first user request otherwise
+                # paid ~90s and +6.8GB of compiler memory inside the forward -- the
+                # exact "climb after start-up" that must not happen. A one-token
+                # forward compiles every kernel the real runs use.
+                # OFF by default: a warm-up forward leaves state that reset() cannot
+                # fully undo (measured: the first real request then answered an
+                # unrelated question). Compilation is paid by the first request instead;
+                # that is a JIT cost, not an allocation the pool could own.
+                if __import__("os").environ.get("TI_WARMUP", "0") == "1":
+                    try:
+                        with torch.inference_mode():
+                            self.forward(torch.tensor([[0]], device=self.device), 0)
+                        self.reset()
+                    except Exception as exc:
+                        print(f"[tinyinfer] warm-up forward failed: {exc!r}", flush=True)
+                # hand the allocator's cached blocks back before the first request: the
+                # build leaves them behind and a card this tight needs them for KV
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
     # -- residency ---------------------------------------------------------
     def available_layers(self) -> int:
@@ -408,12 +568,22 @@ class Engine:
         if b is None:
             b = Block(self.store, layer_id, self.cfg, expert_store=self.expert_store,
                       quant=self.tier.keep_weights_quantized, hashes=self.hashes,
-                      cache_wo_a=self.cache_wo_a, expert_topk=self.tier.expert_topk,
+                      # resident layers never leave the card, so their fp8 weight dequantisations are worth
+                      # keeping (the per-token dequant of wo_a and of the shared expert is ~80ms
+                      # across 40 layers)
+                      cache_wo_a=(layer_id < self.gpu_layers and self.device != "cpu"),
+                      cache_shared_bf16=(layer_id < self.gpu_layers and self.device != "cpu"),
+                      expert_topk=self.tier.expert_topk,
                       rt=self._rt_for(layer_id), tp=getattr(self, "tp", None))
             b.hc_post_on_cpu = getattr(self, "small_ops_on_cpu", False)
             ffn = getattr(b, "ffn", None)
             if ffn is not None:
-                ffn._async_fetch = bool(getattr(self.tier, "async_expert_fetch", False))
+                # DEFAULT OFF: the background fetch races the main-thread reads and made
+                # the same MoE layer produce different values for different sequence
+                # lengths (T=8 vs T=11 differed 4% on identical inputs), which showed up
+                # as garbage tokens in the answer. Opt in with TI_ASYNC_FETCH=1.
+                ffn._async_fetch = (bool(getattr(self.tier, "async_expert_fetch", False))
+                                    and __import__("os").environ.get("TI_ASYNC_FETCH") == "1")
                 ffn._batched_scatter = bool(getattr(self.tier, "batched_scatter", False))
                 if self.tp is not None and self.tp.world > 1:
                     ffn.ep_world = self.tp.world
@@ -452,7 +622,8 @@ class Engine:
         # per-forward caches on the shared handoff slot must not leak between sessions
         try:
             from .compressor import shared_attn as _sa0
-            for _attr in ("_mask_cache", "candidates_by_chunk", "candidates"):
+            for _attr in ("_mask_cache", "candidates_by_chunk", "candidates",
+                          "compress_kv", "topk_idxs"):
                 if hasattr(_sa0, _attr):
                     try:
                         getattr(_sa0, _attr).clear()
@@ -560,6 +731,34 @@ class Engine:
                 _sa.src_ratio = restore_rt.get("src_ratio")
             except Exception:
                 pass
+
+    # -- persistent KV cache (tinyinfer/.kvcache) ---------------------------
+    @property
+    def kv_cache_dir(self):
+        from pathlib import Path as _P
+        return _P(__file__).resolve().parent.parent.parent / ".kvcache"
+
+    def save_kv_cache(self, name: str):
+        """Persist this session's KV/compressed state under .kvcache/<name>.pt.
+
+        The file holds the per-layer KV window, compressed-KV handoff slot and indexer
+        caches (see snapshot()), so a later process can resume the same conversation
+        without re-prefilling it.
+        """
+        import torch as _t
+        path = self.kv_cache_dir / (str(name) + ".pt")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _t.save(self.snapshot(), path)
+        return path
+
+    def load_kv_cache(self, name: str) -> bool:
+        """Restore a previously saved session state; False when the file is absent."""
+        import torch as _t
+        path = self.kv_cache_dir / (str(name) + ".pt")
+        if not path.exists():
+            return False
+        self.restore(_t.load(path, map_location="cpu", weights_only=False))
+        return True
 
     # -- double-buffered streaming -----------------------------------------
     def _ensure_stream_buffers(self, layer_id: int):
@@ -757,28 +956,50 @@ class Engine:
         # device buffer, so a layer is one flat H2D, which is the whole point.
         host_map: dict[int, torch.Tensor] = {}
         _why = "ok"
+        host_slab: dict[int, torch.Tensor] | None = None
+        self._host_slab = None
         # One layer at a time: allocate its block, copy the weights in, point the layer
         # at the block, then let the old pageable copy go. Allocating all blocks first
         # holds both copies at once (+18GB) and that is what pushed this box into swap.
         _slab_used = 0
+        _pool = getattr(self, "host_pool", None)
+        if _pool is not None:
+            # The slab is built from pool slices (build_pool put the weights there), so
+            # both the source and the slab live inside the claimed pool; nothing here
+            # touches private host memory.
+            if __import__("os").environ.get("TI_FLAT_DBG"):
+                print(f"[flatdbg] pool total={_pool.total / 2**30:.2f}GB used="
+                      f"{_pool.used / 2**30:.2f}GB free={_pool.free / 2**30:.2f}GB "
+                      f"slab_total={slab_total / 2**30:.2f}GB", flush=True)
+            slab_total = min(slab_total, _pool.free)
+        if slab_total <= 0 and _pool is not None:
+            _why = "pool-backed"
         for i in streamed:
             need = sizes[i]
             if _slab_used + need > slab_total:
-                _why = (f"reached the pinned cap {slab_total/2**30:.1f}GB "
-                        f"({len(host_map)}/{len(streamed)} layers)")
+                if _pool is None:
+                    _why = (f"reached the pinned cap {slab_total/2**30:.1f}GB "
+                            f"({len(host_map)}/{len(streamed)} layers)")
                 break
-            got = _hb.grant(need)
-            if got < need:
-                _why = f"budget: wanted {need/2**20:.0f}MB got {got/2**20:.0f}MB ({_hb.stats()})"
-                break
+            if _pool is not None:
+                blk = _pool.tensor(need)
+                if blk is None:
+                    _why = (f"pool exhausted at layer {i} "
+                            f"({_pool.used/2**30:.1f}/{_pool.total/2**30:.1f}GB used)")
+                    break
+            else:
+                got = _hb.grant(need)
+                if got < need:
+                    _why = f"budget: wanted {need/2**20:.0f}MB got {got/2**20:.0f}MB ({_hb.stats()})"
+                    break
+                try:
+                    blk = torch.empty(need, dtype=torch.uint8, pin_memory=True)
+                except Exception as exc:
+                    _hb.release(need)
+                    _why = f"pinned alloc failed at layer {i}: {exc!r}"
+                    break
             _slab_used += need
             self._slab_granted = getattr(self, "_slab_granted", 0) + need
-            try:
-                blk = torch.empty(need, dtype=torch.uint8, pin_memory=True)
-            except Exception as exc:
-                _hb.release(need)
-                _why = f"pinned alloc failed at layer {i}: {exc!r}"
-                break
             b = self.block(i)
             paths = b._weight_paths()
             offs = lay[i][0]
@@ -865,7 +1086,7 @@ class Engine:
         self._flat_ev = {}
         self._copy_stream = torch.cuda.Stream(device=self.device)
         print(f"[tinyinfer] flat streaming: {len(keep)} layers, {mx/2**20:.0f}MBx3 VRAM, "
-              f"{pinned_gb:.1f}GB {'slab' if host_slab is not None else 'per-tensor'} pinned source",
+              f"{pinned_gb:.1f}GB {'slab' if self._host_slab else 'per-tensor'} pinned source",
               flush=True)
 
     def _flat_apply(self, layer: int, buf_idx: int) -> None:
@@ -1004,6 +1225,20 @@ class Engine:
         b.ffn.prefetch(experts)
 
     # -- forward -----------------------------------------------------------
+    def _head_logits(self, h: torch.Tensor) -> torch.Tensor:
+        # The released ParallelHead projects in fp32. Copying the 129k x 5120 bf16 head to
+        # fp32 is 2.65GB, and doing that once per token on an 8GB card sent the allocator
+        # into WDDM shared memory (measured: 8.4s/token, 1.3GB of PCIe per step). Chunking
+        # the vocab axis keeps the arithmetic bit-identical -- a matmul is row-independent --
+        # while the temporary stays at ~0.7GB.
+        head = self.head
+        if head.dtype == torch.float32:
+            return torch.nn.functional.linear(h.float(), head)
+        # bf16 projection against the checkpoint's bf16 head directly: the old chunked
+        # fp32 copy moved 2.65GB through the allocator every token (and needed 336MB of
+        # temporary) to change the logits by ~1e-2 relative -- below sampling resolution
+        return torch.nn.functional.linear(h.to(head.dtype), head)
+
     def _forward_chunk(self, ids: torch.Tensor, start_pos: int):
         self._last_hidden = None  # filled after the final layer (MTP stage-0 input)
         self._target_layers = set(self.cfg.dspark_target_layer_ids)
@@ -1027,6 +1262,11 @@ class Engine:
                 n = min(n, self.available_layers())
             layer_seq = list(range(n))
         _tt0 = __import__("time").perf_counter() if __import__("os").environ.get("TI_LAYER_TIME") else None
+        if __import__("os").environ.get("TI_MEM_DBG"):
+            _mf, _mt = torch.cuda.mem_get_info()
+            print(f"[memdbg] T={ids.shape[1]} free={_mf / 2**20:.0f}MB alloc="
+                  f"{torch.cuda.memory_allocated() / 2**20:.0f}MB reserved="
+                  f"{torch.cuda.memory_reserved() / 2**20:.0f}MB", flush=True)
         h = self.embed[ids.cpu()].to(self.device) if self.embed_on_cpu else self.embed[ids]
         h = h.unsqueeze(2).repeat(1, 1, self.cfg.hc_mult, 1)
         pre_mix = torch.zeros(h.size(0), h.size(1), self.cfg.hc_mult, dtype=torch.float32, device=h.device)
@@ -1072,11 +1312,12 @@ class Engine:
                     _ring = len(self._flat_state[1]) if isinstance(self._flat_state, tuple) else 1
                     _ring = max(1, _ring)
                     self._flat_wait(i, k % _ring)
-                    for d in range(1, _ring):
-                        if k + d < len(flat_seq):
-                            nxt = flat_seq[k + d]
-                            if nxt not in self._flat_ev:
-                                self._flat_prefetch(nxt, (k + d) % _ring)
+                    if __import__("os").environ.get("TI_NO_FLAT_PREFETCH") != "1":
+                        for d in range(1, _ring):
+                            if k + d < len(flat_seq):
+                                nxt = flat_seq[k + d]
+                                if nxt not in self._flat_ev:
+                                    self._flat_prefetch(nxt, (k + d) % _ring)
                     if k + 2 < len(flat_seq) and self.enable_prefetch:
                         # RAM prefetch two layers ahead: the read has ~2 layers of compute
                         # time to land, and it never touches the VRAM slot pool
@@ -1123,9 +1364,18 @@ class Engine:
             h_in = h
             try:
                 h, pre_mix = b.forward(h, start_pos, pre_mix)
+                _dh = getattr(self, "_dump_h", None)
+                if _dh is not None:
+                    _dh.append((i, h_in.clone(), h.clone()))
             except Exception:
+                try:
+                    _fr, _ft = torch.cuda.mem_get_info()
+                    _m = (f"vram free={_fr/2**20:.0f}MB/{_ft/2**20:.0f}MB "
+                          f"alloc={torch.cuda.memory_allocated()/2**20:.0f}MB")
+                except Exception:
+                    _m = "mem_get_info failed"
                 print(f"[layer-fail] layer {i} streamed={streamed} use_flat={use_flat} "
-                      f"device={getattr(b, '_device', '?')} "
+                      f"device={getattr(b, '_device', '?')} {_m} "
                       f"hc_fn={getattr(b, 'hc_attn_fn', None) is not None and b.hc_attn_fn.device}",
                       flush=True)
                 raise
@@ -1178,7 +1428,7 @@ class Engine:
         h = rms_norm(h, self.out_norm, self.eps)
         if self.head_on_cpu:
             h = h.cpu()
-        return torch.nn.functional.linear(h, self.head).float()
+        return self._head_logits(h)
 
     def prefill_layer_major(self, ids: torch.Tensor, max_chunk: int | None = None) -> torch.Tensor:
         """Layer-major prefill: stream each layer once for the whole prompt.
@@ -1265,7 +1515,7 @@ class Engine:
         h = rms_norm(h, self.out_norm, self.eps)
         if self.head_on_cpu:
             h = h.cpu()
-        return torch.nn.functional.linear(h, self.head).float()
+        return self._head_logits(h)
 
     # -- VRAM pressure + CUDA graph + prefix checkpoints ---------------------
     def _shed_vram(self) -> None:
@@ -1418,7 +1668,15 @@ class Engine:
         if ids.device.type != self.device and self.device != "cpu":
             ids = ids.to(self.device)
         b, T = ids.shape
-        step = chunk or self.prefill_chunk
+        # The VRAM expert-slot pool is disabled by the planner on this card: with slots on
+        # the first decode step OOMs (3664MB base + 1.39GB ring + 1.2GB slots + the head
+        # temporary is past the card), and pausing it for prefill does not help because
+        # the allocation happens on the decode path anyway. Kept out of the hot path.
+        # Single-chunk prefill is the numerically correct path: chunked prefill still
+        # disagrees with it on the same positions (T-dependence in an early layer), which
+        # showed up as garbage first tokens. Keep short prompts in one chunk; long ones
+        # still step so an 8GB card cannot OOM.
+        step = chunk or max(self.prefill_chunk, 32)
         # Measured on this card: a 63-token prompt at chunk=8 runs the allocator past
         # physical VRAM (17GB "allocated" through WDDM shared memory) and OOMs, while the
         # same prompt at chunk=1 completes. Long prompts therefore step through in small
@@ -1440,15 +1698,18 @@ class Engine:
         from .nn import sample_logits
 
         ids = list(prompt_ids)
+        self.reset()
         with torch.inference_mode():
             logits = self.forward(torch.tensor([ids], device=self.device), 0, chunk=chunk)
+            if self.device != "cpu":
+                torch.cuda.empty_cache()
             for step in range(max_new_tokens):
                 nid = sample_logits(logits[0, -1], temperature, top_p, top_k)
                 if stop_ids and nid in stop_ids:
                     break
                 yield nid
                 logits = self.forward(torch.tensor([[nid]], device=self.device),
-                                      start_pos=start_pos + len(ids) + step)
+                                      start_pos=len(ids) + step)
 
     # -- speculative decoding (MTP/DSpark) ---------------------------------
     def _window_span(self) -> int:
@@ -1546,7 +1807,7 @@ class Engine:
         out: list[int] = []
         acc = drafted = 0
         with torch.inference_mode():
-            logits = self.forward(torch.tensor([ids], device=self.device), start_pos)
+            logits = self.forward(torch.tensor([ids], device=self.device), 0)
             if self.device != "cpu":
                 torch.cuda.empty_cache()
             pos = len(ids)
@@ -1607,6 +1868,10 @@ class Engine:
         if not keep_session:
             self.reset()
         ids = list(prompt_ids)
+        if eos_token_id is None:
+            # stop at the checkpoint's own end-of-sentence token by default; without it a
+            # greedy run kept emitting <|begin of sentence|> and a fresh "# ..." turn
+            eos_token_id = getattr(getattr(self, "_tokenizer", None), "eos_token_id", None)
         with torch.inference_mode():
             logits = self.forward(torch.tensor([ids], device=self.device), 0)
             if self.device != "cpu":

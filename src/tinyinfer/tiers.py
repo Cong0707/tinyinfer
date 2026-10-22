@@ -87,7 +87,7 @@ def plan(level: OptLevel = OptLevel.BALANCED, vram_gb: float = 8.0, ram_gb: floa
     if level == OptLevel.AGGRESSIVE:
         # OUR engine optimizations (main production target): streaming + caches + prefetch + MTP
         return TierConfig(
-            level=level, use_tilelang_attn=True, use_fp8_gemm=True, use_fp4_gemm=True,
+            level=level, use_tilelang_attn=True, use_fp8_gemm=True, use_fp4_gemm=False,
             keep_weights_quantized=True, expert_cache_gb=cache, kv_bits=8,
             prefetch=True, prefetch_k=2, mtp=True, head_on_cpu=True,
             # level 2 = our engine's features on top of the ported mechanisms
@@ -95,8 +95,13 @@ def plan(level: OptLevel = OptLevel.BALANCED, vram_gb: float = 8.0, ram_gb: floa
             mtp_feedback_window=True, async_expert_fetch=True, batched_scatter=True,
             slot_arena=True, prefix_checkpoint=True, resume_sampling=True,
             approximations={"allocator_expandable": True},
-            notes="engine features: tiered streaming, expert caches, gated prefetch, MTP")
-    # EXTREME: lossy approximations for maximum speed; promote validated items down to tier 2
+            notes="engine features: tiered streaming, expert caches, gated prefetch, MTP; "
+                  "fp4 GEMM kernel is NOT used here (it degrades output, see tier 3)")
+    # EXTREME: lossy approximations for maximum speed; promote validated items down to tier 2.
+    # The fp4 GEMM/GEMV kernel lives HERE and only here: it coerces activations and expert
+    # weights to fp4 on the fly (not a faithful run of the checkpoint) and measured a ~20%
+    # per-layer error with a different answer on every run, so it demonstrably DEGRADES the
+    # model. It is opt-in (TI_MOE_FP4=1) and must never be the default of any tier.
     return TierConfig(
         level=level, use_tilelang_attn=True, use_fp8_gemm=True, use_fp4_gemm=True,
         keep_weights_quantized=True, expert_cache_gb=cache, kv_bits=4,
@@ -111,5 +116,9 @@ def plan(level: OptLevel = OptLevel.BALANCED, vram_gb: float = 8.0, ram_gb: floa
             "skip_layer_pattern": "every8",
             "fast_math": ["exp", "silu", "rsqrt", "sin", "cos"],
             "fp4_experts": True,
+            "fp4_gemm_kernel": "DEGRADES output: coerces activations/weights to fp4 at "
+                               "runtime, ~20% per-layer error, non-deterministic; opt-in "
+                               "only (TI_MOE_FP4=1)",
         },
-        notes="approximations: top-4 experts, low-rank wo, KV4, fast math; promote stable items to tier 2")
+        notes="approximations: top-4 experts, low-rank wo, KV4, fast math, fp4 GEMM kernel "
+              "(degrading); promote stable items to tier 2")

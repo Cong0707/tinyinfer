@@ -153,7 +153,7 @@ class EngramHashes:
                                for p in positions], dtype=np.int64))
             for shift in range(self.max_n)
         ], axis=-1)  # [n_new, max_n]
-        prod = tokens[None, :, :] * self.multipliers.numpy()[:, None, :]  # [L, n_new, max_n]
+        prod = tokens[None, :, :] * self.multipliers.cpu().numpy()[:, None, :]  # [L, n_new, max_n]
         rolling = prod[..., 0]
         hashes = []
         for i in range(1, self.max_n):
