@@ -58,3 +58,20 @@ them is required to run.
 - Everything under Measurement only prints; it never changes results.
 - The tier flags (cuda_graph, mtp, speculation, official_gemv, ...) live in
   `tiers.py` and are documented in `docs/level2_mechanisms.md`.
+### Switches for measurement or A/B that were missing from the table above
+
+| name | meaning |
+| --- | --- |
+| TI_CACHE_GB | host expert-cache size in GB; overrides the room-after-slab calculation (docs/analysis.md §22) |
+| TI_READERS | disk reader threads (default min(16, cores)); 32 normalises ~5% better on a big-CPU box |
+| TI_SERVE_BATCH | experts served per batch in the MoE loop (default 3; 1 is slower, 6 no better) |
+| TI_SLOTS | expert VRAM slots; overrides the planner's pool size |
+| TI_MTP | 1 forces the MTP draft stages on even when the plan says they do not fit (accept-rate measurement) |
+| TI_V | 1 enables the v5 double-buffered streamed layers (off by default: measured +OOM on 8GB) |
+| TI_IOCP | 1 switches expert reads to the IOCP reader (measured 2.3x slower in-engine) |
+| TI_NO_SYNC | 1 skips the routing host sync (experiment only: routing becomes wrong) |
+| TI_SA_BLOCK / TI_SA_HCHUNK | sparse-attention kernel tiling (32 / 16 defaults) |
+
+Everything else in `src/` (TI_DEBUG_*, TI_*_PROF, TI_TIME, TI_LAYER_TIME, TI_MEM_TRACE,
+TI_WALL_PROF) only prints diagnostics and changes no value.
+
