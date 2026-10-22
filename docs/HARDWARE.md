@@ -89,3 +89,22 @@ card, 26.5GB/s pinned H2D.
 Two things do not depend on the card: the checkpoint is 510GB, so the volume must be
 fast (4.5GB/s measured best, 1.5GB/s after long sweeps) and the host needs ~13GB pinned for
 the streaming slab. A machine with a small SSD will be slower than the 8GB laptop.
+
+## What the planner decides automatically (and why)
+
+These are the rules that make the same command line behave correctly on every box; all of
+them are driven by measured geometry, not by a tier name.
+
+| decision | rule | measured reason |
+| --- | --- | --- |
+| keep the expert slot pool? | only if it covers >= 15% of `topk*n_layers` (240) experts | below that, every use pays a DMA and an event wait: -15% decode and slower prefill on the 8GB card (analysis.md §16) |
+| enable MTP/speculation? | only with >= 16GB VRAM | accept rate 0.08 here; the draft stages cost 40s per short answer and 3-4 resident layers (§16) |
+| how big is the host expert cache? | host_room - slab_need - 3GB, capped by the planner's number | the old flat 35% of host room under-sized it by 27% (§22: hit 16.3% -> 25.5%, decode +7.7%) |
+| how many resident layers? | as many as fit after ring, tables and workspace | each one removes a 166MB H2D per token (~6ms) |
+| how many expert slots at all? | `spare * 0.70 / blob`, at least 12 before trading a layer | a handful of slots is worse than one fewer layer |
+| prefill chunk | 8, step down for long prompts | 8 is the workspace sweet spot; chunk=4 is 1.58x faster than token-wise (§13) |
+
+On a 24GB card the same rules give: pool on with 298 slots (all 240 experts), MTP on,
+everything resident, 64-token prefill chunks -- i.e. the IO term disappears and the card
+becomes compute-bound.
+
