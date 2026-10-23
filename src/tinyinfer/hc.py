@@ -186,6 +186,31 @@ def hc_split_sinkhorn(
     return _sinkhorn_body(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
 
 
+_NATIVE = {"ok": None}
+
+
+def _native_ok() -> bool:
+    """True when the hand-written hc kernels are built."""
+    if _NATIVE["ok"] is None:
+        try:
+            from . import native
+            native.kernel("hc", "hc_pre_f")
+            _NATIVE["ok"] = True
+        except Exception:
+            _NATIVE["ok"] = False
+    return _NATIVE["ok"]
+
+
+def _kern(name: str):
+    from . import native
+    return native.kernel("hc", name)
+
+
+def _launch(fn, grid, block, args):
+    from . import native
+    native.launch(fn, grid, block, args, 0)
+
+
 class HCBlockMixin:
     """The coefficient machinery every Block uses (official Block.hc_mixes/hc_pre/hc_post)."""
 
@@ -214,19 +239,64 @@ class HCBlockMixin:
                         comb.view(b, s, self.hc_mult, self.hc_mult))
             except Exception:
                 _FUSED_MIXES_OK = False
+        # NOTE: a fused hc_mixes kernel (native/hc.cu, hc_mixes_f/_bf) exists and matches the
+        # eager projection to ~2.9e-6, but that is not bit-identical: the torch path goes
+        # through F.linear (cuBLAS tile order) while the kernel reduces with a warp tree.
+        # Enabling it changed the greedy answer from "中国的首都是北京" to "中国的首都北京",
+        # so it stays off -- tier 2 is defined as full precision and the answer must not
+        # move. TI_HC_MIXES_KERNEL=1 re-enables it for benchmarking only.
+        if (__import__("os").environ.get("TI_HC_MIXES_KERNEL") == "1"
+                and x.is_cuda and x.dtype in (torch.bfloat16, torch.float32) and _native_ok()):
+            try:
+                b, s = x.shape[0], x.shape[1]
+                hc, d = x.shape[2], x.shape[3]
+                k_dim = hc * d
+                j_dim = int(hc_fn.shape[0])
+                x2 = x.reshape(b * s, k_dim)
+                fn32 = hc_fn.float().contiguous()
+                out = torch.empty((b * s, j_dim), dtype=torch.float32, device=x.device)
+                bfs = x.dtype == torch.bfloat16
+                _launch(_kern("hc_mixes_bf" if bfs else "hc_mixes_f"),
+                        (b * s,), (256,),
+                        [x2.contiguous() if bfs else x2.contiguous().float(), fn32, out,
+                         b * s, k_dim, j_dim, float(self.hc_eps), 0])
+                return hc_split_sinkhorn(out.view(b, s, j_dim), hc_scale, hc_base,
+                                         self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
+            except Exception:
+                pass
         xf = x.flatten(2).float()
         rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.hc_eps)
         mixes = F.linear(xf, hc_fn) * rsqrt
         return hc_split_sinkhorn(mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
 
     def hc_pre(self, x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
-        global _FUSED_PRE_OK
-        if x.is_cuda and _FUSED_PRE_OK:
+        # One kernel instead of mul+sum+to. The eager form is 5 launches per call and this
+        # runs twice per layer (80 calls per token, ~400 launches); the kernel does the
+        # same fp32 accumulation and the same final cast, one thread per output element,
+        # so it is bit-identical and needs no chain of temporaries.
+        if x.is_cuda and x.dtype in (torch.bfloat16, torch.float32) and _native_ok():
             try:
-                from .hc_fused import fused_hc_pre
-                return fused_hc_pre(x, pre_mix)
+                b, s, hc, d = x.shape
+                xc = x.reshape(b * s, hc, d)
+                if xc.dtype == torch.bfloat16:
+                    xc = xc.contiguous()
+                    xf = None
+                    out = torch.empty((b * s, d), dtype=torch.bfloat16, device=x.device)
+                    fn = _kern("hc_pre_bf")
+                    n = b * s * d
+                    _launch(fn, ((n + 255) // 256,), (256,),
+                            [xc, pre_mix.reshape(b * s, hc).float().contiguous(), out,
+                             b * s, hc, d])
+                else:
+                    out = torch.empty((b * s, d), dtype=torch.float32, device=x.device)
+                    fn = _kern("hc_pre_f")
+                    n = b * s * d
+                    _launch(fn, ((n + 255) // 256,), (256,),
+                            [xc.contiguous(), pre_mix.reshape(b * s, hc).float().contiguous(),
+                             out, b * s, hc, d])
+                return out.view(b, s, d)
             except Exception:
-                _FUSED_PRE_OK = False
+                pass
         y = torch.sum(pre_mix.unsqueeze(-1) * x.float(), dim=2)
         return y.to(x.dtype)
 
@@ -238,6 +308,26 @@ class HCBlockMixin:
         availability is latched once per process rather than re-raised per call.
         """
         global _FUSED_POST_OK
+        # Deterministic native fast path: post*x + comb@residual, one thread per output
+        # element with the same fp32 accumulation order the eager expression uses. The
+        # eager form is 6 launches (unsqueeze x2, mul x2, sum, type_as) twice per layer.
+        if (x.is_cuda and x.dtype in (torch.bfloat16, torch.float32)
+                and residual.shape == x.shape and _native_ok()):
+            try:
+                b, s, hc, d = x.shape
+                xc = x.reshape(b * s, hc, d).contiguous()
+                rc = residual.reshape(b * s, hc, d).contiguous()
+                pc = post.reshape(b * s, hc, hc).float().contiguous()
+                cc = comb.reshape(b * s, hc, hc).float().contiguous()
+                bfs = x.dtype == torch.bfloat16
+                out = torch.empty((b * s, hc, hc, d), dtype=x.dtype, device=x.device)
+                n = b * s * hc * hc * d
+                _launch(_kern("hc_post_bf" if bfs else "hc_post_f"),
+                        ((n + 255) // 256,), (256,),
+                        [xc, rc, pc, cc, out, b * s, hc, d])
+                return out.view(b, s, hc, hc, d)
+            except Exception:
+                pass
         import os as _os
         if x.is_cuda and _FUSED_POST_OK and _os.environ.get("TI_HC_NOFUSE") != "1":
             try:

@@ -65,6 +65,7 @@ def _check(n_rows: int, k_dim: int) -> None:
 _PTR_RING = 16
 _ptr_pool: dict[tuple, list] = {}
 _ptr_next = [0]
+_host_views: dict[int, "np.ndarray"] = {}
 
 
 def _ptrs(tensors) -> torch.Tensor:
@@ -94,8 +95,15 @@ def _ptrs(tensors) -> torch.Tensor:
     i = _ptr_next[0]
     _ptr_next[0] = (i + 1) % _PTR_RING
     host, gpu = pool[i]
-    for j, t in enumerate(tensors):
-        host[j] = t.data_ptr()
+    # One write into the pinned block, not one ``aten::copy_`` per element. The loop that
+    # used to be here issued a kernel launch per pointer (12 per call, 4 calls per layer,
+    # ~1920 per decode step) purely to move 8 bytes into host memory that a plain store
+    # could write. numba-free numpy view: the pinned allocation is already host memory,
+    # so this is a memcpy the CPU does inline.
+    _host_np = _host_views.get(id(host))
+    if _host_np is None:
+        _host_np = _host_views[id(host)] = host.numpy()
+    _host_np[:n] = [t.data_ptr() for t in tensors]
     gpu.copy_(host, non_blocking=True)
     return gpu
 
