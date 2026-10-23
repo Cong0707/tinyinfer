@@ -55,11 +55,25 @@ def session_for(key: str) -> str:
 
 
 
-def _post(messages, max_tokens: int, temperature: float, session_id: str | None = None):
+# Qwen's model card, text tasks / non-thinking mode:
+#   temperature=1.0, top_p=1.00, top_k=20, min_p=0.0, presence_penalty=2.0,
+#   repetition_penalty=1.0
+# These are the published defaults, so repl sends them instead of relying on whatever the
+# client thinks is reasonable. presence_penalty is the one that stops a small model from
+# collapsing into a loop over the same token.
+DEFAULT_SAMPLING = {
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 20,
+    "presence_penalty": 2.0,
+    "repetition_penalty": 1.0,
+}
+
+
+def _post(messages, max_tokens: int, sampling: dict, session_id: str | None = None):
     body = json.dumps(
         {"model": MODEL, "messages": messages, "max_tokens": max_tokens,
-         "temperature": temperature, "stream": True,
-         "stream_options": {"include_usage": True}}
+         "stream": True, "stream_options": {"include_usage": True}, **sampling}
     ).encode("utf-8")
     req = urllib.request.Request(
         URL, data=body,
@@ -69,7 +83,7 @@ def _post(messages, max_tokens: int, temperature: float, session_id: str | None 
     return urllib.request.urlopen(req, timeout=900)
 
 
-def chat(messages, max_tokens: int = 2048, temperature: float = 1.0,
+def chat(messages, max_tokens: int = 2048, sampling: dict | None = None,
          session_id: str | None = None) -> str:
     """Stream one completion to stdout, print the counters, return the text."""
     started = time.perf_counter()
@@ -78,7 +92,7 @@ def chat(messages, max_tokens: int = 2048, temperature: float = 1.0,
     usage = None
     parts: list[str] = []
     try:
-        with _post(messages, max_tokens, temperature, session_id) as resp:
+        with _post(messages, max_tokens, sampling or DEFAULT_SAMPLING, session_id) as resp:
             sys.stdout.write("model: ")
             sys.stdout.flush()
             for raw in resp:
@@ -127,20 +141,36 @@ def main() -> int:
         except Exception:
             pass
     argv = sys.argv[1:]
-    temperature = 1.0
+    sampling = dict(DEFAULT_SAMPLING)
     max_tokens = 2048
     rest: list[str] = []
+    # name -> (sampling key, type); -t 0 still means greedy
+    flags = {
+        "-t": ("temperature", float), "--temperature": ("temperature", float),
+        "-p": ("top_p", float), "--top-p": ("top_p", float),
+        "-k": ("top_k", int), "--top-k": ("top_k", int),
+        "--presence-penalty": ("presence_penalty", float),
+        "--repetition-penalty": ("repetition_penalty", float),
+    }
     i = 0
     while i < len(argv):
-        if argv[i] in ("-t", "--temperature") and i + 1 < len(argv):
-            temperature = float(argv[i + 1]); i += 2; continue
         if argv[i] in ("-n", "--max-tokens") and i + 1 < len(argv):
             max_tokens = int(argv[i + 1]); i += 2; continue
+        if argv[i] in flags and i + 1 < len(argv):
+            key, cast = flags[argv[i]]
+            sampling[key] = cast(argv[i + 1]); i += 2; continue
         if argv[i] in ("-h", "--help"):
             print(__doc__.strip())
             print()
-            print("  -t, --temperature F   sampling temperature (default 1.0; 0 = greedy)")
-            print("  -n, --max-tokens N    safety cap only; generation runs to EOS")
+            print("Sampling defaults are Qwen's published non-thinking text settings:")
+            print("  temperature=1.0 top_p=1.0 top_k=20 presence_penalty=2.0")
+            print()
+            print("  -t, --temperature F        temperature (0 = greedy)")
+            print("  -p, --top-p F              nucleus cutoff")
+            print("  -k, --top-k N              keep the N best tokens (0 = off)")
+            print("  --presence-penalty F       subtracted once per distinct seen token")
+            print("  --repetition-penalty F     multiplier on seen tokens (1.0 = off)")
+            print("  -n, --max-tokens N         safety cap only; generation runs to EOS")
             return 0
         rest.append(argv[i]); i += 1
     one_shot = " ".join(rest).strip()
@@ -153,7 +183,7 @@ def main() -> int:
         # same question -> same session -> the server resumes its KV from .kvcache
         sid = session_for(hashlib.sha1(one_shot.encode("utf-8")).hexdigest())
         chat([{"role": "user", "content": one_shot}], max_tokens=max_tokens,
-             temperature=temperature, session_id=sid)
+             sampling=sampling, session_id=sid)
         return 0
     while True:
         try:
@@ -170,7 +200,7 @@ def main() -> int:
             session = session_for("interactive:" + hashlib.sha1(user.encode("utf-8")).hexdigest())
         messages.append({"role": "user", "content": user})
         reply = chat(messages, max_tokens=max_tokens,
-                    temperature=temperature, session_id=session)
+                    sampling=sampling, session_id=session)
         if reply:
             messages.append({"role": "assistant", "content": reply})
 

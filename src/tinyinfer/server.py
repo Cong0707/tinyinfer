@@ -212,6 +212,11 @@ class SamplingParams:
     top_p: float = 1.0
     top_k: int = 0
     repetition_penalty: float = 1.0  # vLLM-style: >1 discourages already generated ids
+    # OpenAI-style: subtracted from the logit of every token that has already appeared,
+    # once per distinct token however often it appeared. Qwen's model card specifies 2.0
+    # for text tasks, which is what keeps a small model from collapsing into a looping
+    # count.
+    presence_penalty: float = 0.0
     stop: tuple[str, ...] = ()
     seed: int | None = None
 
@@ -578,6 +583,7 @@ class _Sampler:
         self.top_p = float(params.top_p or 1.0)
         self.top_k = int(params.top_k or 0)
         self.repetition_penalty = float(params.repetition_penalty or 1.0)
+        self.presence_penalty = float(params.presence_penalty or 0.0)
         self.generator = None
         if params.seed is not None:
             self.generator = torch_module.Generator(device="cuda")
@@ -587,6 +593,12 @@ class _Sampler:
     def pick(self, logits: Any, generated: int) -> int:
         torch = self.torch
         row = logits[0]
+        if self.presence_penalty != 0.0 and self._seen:
+            # one penalty per distinct token already emitted; the original row is left
+            # untouched (it belongs to the graph buffer, not to us)
+            ids = torch.tensor(self._seen, dtype=torch.long, device=row.device).unique()
+            row = row.clone()
+            row[ids] = row[ids] - self.presence_penalty
         if self.repetition_penalty != 1.0 and self._seen:
             ids = torch.tensor(self._seen, dtype=torch.long, device=row.device).unique()
             picked = row[ids]
@@ -649,6 +661,7 @@ class QwenBackend(BaseBackend):
         self._slots: dict[int, Any] = {}
         self._graphs: dict[int, Any] = {}
         self._prep: dict[int, list[int]] = {}
+        self._gen_lock = threading.Lock()
         self._lock = threading.Lock()
         self.ready = False
 
@@ -711,8 +724,14 @@ class QwenBackend(BaseBackend):
 
     # -- generation -----------------------------------------------------
     def generate(self, request: GenerationRequest) -> Iterator[TokenEvent]:
-        with self._torch.inference_mode():
-            yield from self._generate(request)
+        # One captured graph owns one KV buffer, and replay mutates it in place, so two
+        # generations cannot interleave: doing so corrupts the cache and trips a
+        # device-side assert (measured: seven concurrent requests from a REPL left open
+        # plus two probes). The engine is single-model single-card here, so serializing
+        # is correct rather than a shortcut.
+        with self._gen_lock:
+            with self._torch.inference_mode():
+                yield from self._generate(request)
 
     def _generate(self, request: GenerationRequest) -> Iterator[TokenEvent]:
         from tinyinfer.hf_graph import GraphDecoder
@@ -1820,6 +1839,10 @@ class SamplingRequest(BaseModel):
     temperature: float = Field(default=1.0, ge=0.0, le=2.0)
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
     top_k: int = Field(default=0, ge=0)
+    # both are OpenAI API fields; presence_penalty is the one Qwen's model card names for
+    # text tasks (2.0), and it is what keeps a small model from looping over a count
+    presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
+    repetition_penalty: float = Field(default=1.0, gt=0.0)
     n: int = Field(default=1, ge=1, le=1, description="only n=1 is supported")
     stream: bool = False
     stream_options: StreamOptions | None = None
@@ -2363,6 +2386,8 @@ def _sampling_from(
         temperature=float(body.temperature),
         top_p=float(body.top_p),
         top_k=int(body.top_k),
+        presence_penalty=float(body.presence_penalty),
+        repetition_penalty=float(body.repetition_penalty),
         stop=stops,
         seed=None if body.seed is None else int(body.seed),
     )
