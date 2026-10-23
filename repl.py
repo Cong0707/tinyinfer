@@ -69,7 +69,7 @@ def _post(messages, max_tokens: int, temperature: float, session_id: str | None 
     return urllib.request.urlopen(req, timeout=900)
 
 
-def chat(messages, max_tokens: int = 64, temperature: float = 0.0,
+def chat(messages, max_tokens: int = 2048, temperature: float = 0.0,
          session_id: str | None = None) -> str:
     """Stream one completion to stdout, print the counters, return the text."""
     started = time.perf_counter()
@@ -128,7 +128,7 @@ def main() -> int:
             pass
     argv = sys.argv[1:]
     temperature = 0.0
-    max_tokens = 64
+    max_tokens = 2048
     rest: list[str] = []
     i = 0
     while i < len(argv):
@@ -140,7 +140,7 @@ def main() -> int:
             print(__doc__.strip())
             print()
             print("  -t, --temperature F   sampling temperature (default 0 = greedy)")
-            print("  -n, --max-tokens N    cap on generated tokens (default 64)")
+            print("  -n, --max-tokens N    safety cap only; generation runs to EOS")
             return 0
         rest.append(argv[i]); i += 1
     one_shot = " ".join(rest).strip()
