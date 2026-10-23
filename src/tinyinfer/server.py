@@ -649,11 +649,23 @@ class QwenBackend(BaseBackend):
         model_dir: str | Path,
         *,
         model_id: str | None = None,
-        max_context_tokens: int = 8192,
+        max_context_tokens: int | None = None,
     ) -> None:
         self.model_dir = Path(model_dir)
         self.model_id = model_id or self.model_dir.name
         self.aliases: tuple[str, ...] = (self.model_id,)
+        # Read the window from the checkpoint rather than guessing: it bounds max_tokens,
+        # so a wrong value rejects valid requests with "max_tokens plus prompt tokens
+        # exceeds the context". Qwen3.5-0.8B declares 262144, and its KV costs 12KB per
+        # position (6 full-attention layers x 2 kv heads x 256 head_dim x 2 for k and v),
+        # so the whole window is 3GB -- it fits next to the 1.4GB of weights.
+        if max_context_tokens is None:
+            try:
+                _cfg = json.loads((self.model_dir / "config.json").read_text(encoding="utf-8"))
+                _cfg = _cfg.get("text_config", _cfg)
+                max_context_tokens = int(_cfg.get("max_position_embeddings") or 8192)
+            except Exception:
+                max_context_tokens = 8192
         self.max_context_tokens = int(max_context_tokens)
         self._tok = None
         self._model = None
