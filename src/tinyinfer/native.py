@@ -55,7 +55,12 @@ def module(name: str) -> int:
     lib = _lib()
     path = _DIR / f"{name}.cubin"
     if not path.exists():
-        raise FileNotFoundError(f"{path} (run scripts/build_native.ps1)")
+        # the cubins are build products, not sources: they are specific to one GPU
+        # architecture, so the repo ships only the .cu files
+        raise FileNotFoundError(
+            f"{path} is missing. The kernels are compiled per architecture: run "
+            f"scripts/build_native.ps1 on Windows, or nvcc -cubin -arch=sm_<xx> in "
+            f"src/tinyinfer/native")
     handle = ctypes.c_void_p()
     rc = lib.cuModuleLoad(ctypes.byref(handle), str(path).encode())
     if rc != 0:

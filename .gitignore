@@ -26,3 +26,15 @@ _*.txt
 # trace 产物
 _*.json
 
+# 编译产物：kernel 的 cubin 由 scripts/build_native.ps1 生成
+*.cubin
+
+# 服务端日志
+serve.log
+serve.err.log
+
+# 厂商参考实现（DeepSeek 官方 minimal inference），仅本地比对用，不随本仓库分发
+reference/
+
+# 早期 kernel 实验（import 会失败，不是引擎的一部分）
+prototypes/

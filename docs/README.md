@@ -1,37 +1,46 @@
-# Documentation index
+# 文档
 
-| file | contents |
-| --- | --- |
-| STATUS.md | what runs, measured numbers, open items (read this first) |
-| lower_bounds.md | the hardware IO floor computed from measured constants |
-| analysis.md | routing predictability, speculative-decoding ceiling, top-k floor |
-| decode_speed.md | every optimisation and what it changed, with before/after numbers |
-| benchmarks.md | benchmark history and rules of thumb (disk rate is part of every row) |
-| parity.md | numeric parity per component against DeepInfer |
-| kernels_provenance.md | every kernel: official port / re-implementation / why |
-| level2_mechanisms.md | the level 1/2 mechanisms and their upstream references |
-| flare_analysis.md | NVIDIA Flare (b12x) mechanisms: ported, rejected, why |
-| official_repos.md | what each official DeepSeek repository offers |
-| architecture.md | module map, streaming model, expert path, sessions |
-| ENV.md | every environment switch (measurement and A/B only) |
-| changelog.md | chronological notes of each round |
-| CONTRIBUTING.md | ground rules, workflow, how to add an optimisation |
-| GLOSSARY.md | the project's terms (slab, ring, slot, record, tier, ...) |
-| PHILOSOPHY.md | why the project is shaped the way it is |
-| PERFORMANCE.md | one-page performance summary |
-| OPERATIONS.md | runbook: start, monitor, failure modes, resource budget |
-| EXTENDING.md | adding models, operators, endpoints; changing the planner |
-| CHECKLIST.md | release checklist (code, numerics, performance, service, docs) |
+## 入门
 
-## Reading order
+- [QUICKSTART](QUICKSTART.md) — 从零到跑起来
+- [ENV](ENV.md) — 环境变量与运行时开关
+- [HARDWARE](HARDWARE.md) — 硬件要求与实测机型
+- [faq](faq.md) — 常见问题
 
-1. `STATUS.md` — current capability and known gaps.
-2. `lower_bounds.md` + `analysis.md` — why the speed is what it is.
-3. `parity.md` — why the numbers are trusted.
-4. `architecture.md` — how the engine is put together.
+## 设计
 
-## Reproduce
+- [architecture](architecture.md) — 模块结构、流式模型、会话
+- [PHILOSOPHY](PHILOSOPHY.md) — 取舍的理由
+- [loading](loading.md) — 权重加载、分片、跨盘布局
+- [level2_mechanisms](level2_mechanisms.md) — 流式、专家缓存、门控预取
+- [mtp_design](mtp_design.md) — 多 token 预测
+- [long_context](long_context.md) — 长上下文与压缩注意力
 
-    PYTHONPATH=src python -m tinyinfer.bench --model <dir>
-    PYTHONPATH=src python examples/generate.py --model <dir>
-    PYTHONPATH=src python -m pytest tests -q
+## Kernel
+
+- [kernels](kernels.md) — 每个 kernel 的实现说明
+- [kernels_provenance](kernels_provenance.md) — 官方移植 / 重实现的来源对照
+
+## 性能
+
+- [PERFORMANCE](PERFORMANCE.md) — 实测数字
+- [benchmarks](benchmarks.md) — 基准方法与经验规则
+- [decode_speed](decode_speed.md) — 每项优化带来的变化
+- [lower_bounds](lower_bounds.md) — 硬件物理下限的推算
+
+## 正确性
+
+- [parity](parity.md) — 与参考实现的分量级对比
+- [GLOSSARY](GLOSSARY.md) — 术语（slab / ring / slot / tier）
+
+## 使用
+
+- [api](api.md) — HTTP API
+- [OPERATIONS](OPERATIONS.md) — 运维
+- [EXTENDING](EXTENDING.md) — 接入新模型 / 新 kernel
+- [changelog](changelog.md) — 变更记录
+- [ROADMAP](ROADMAP.md) — 计划
+
+## history/
+
+过程记录与早期分析，保留备查，不是给使用者看的。
