@@ -204,10 +204,13 @@ class Engram:
 
     def forward(self, x: torch.Tensor, hash_ids: np.ndarray, token_mask: torch.Tensor | None = None) -> torch.Tensor:
         """x: [1, L, hc, dim]; hash_ids: [L, (max_n-1)*heads] for this layer."""
+        b, L = x.shape[0], x.shape[1]
         rows = hash_ids.reshape(-1)
         vals = self._tabular(rows)  # [n_rows, 256]
-        vals = vals.view(1, -1, self.n_cols, self.head_dim).to(x.device).to(x.dtype)
-        kv = F.linear(vals.flatten(-2), self._bf16_wkv())  # [1, L, dim*(hc+1)]
+        # hash_ids arrives flattened over (batch, position), so the rows cover b*L
+        # positions; layout them back with the batch axis instead of assuming b == 1
+        vals = vals.view(b, L, self.n_cols, self.head_dim).to(x.device).to(x.dtype)
+        kv = F.linear(vals.flatten(-2), self._bf16_wkv())  # [b, L, dim*(hc+1)]
         key, value = kv.split([self.hc * self.dim, self.dim], dim=-1)
         key = key.float().unflatten(-1, (self.hc, self.dim))
         weight = self.q_weight * self.k_weight
