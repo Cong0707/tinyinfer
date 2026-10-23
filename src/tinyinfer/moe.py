@@ -361,9 +361,14 @@ class MoE:
         # Built once per layer (six small tensors) instead of one torch.tensor per expert.
         _wsum: dict[int, object] = {}
         if _single and _groups:
+            # a routed expert usually wins exactly one slot; indexing the weight with a
+            # python int avoids the 240 torch.tensor() calls per token that building an
+            # index tensor per expert cost (~118ms of host time at 320 calls/step)
             for _e, _cols in _groups.items():
-                _wsum[_e] = weights[0, torch.tensor(_cols, dtype=torch.long,
-                                                    device=weights.device)].sum().view(1, 1)
+                if len(_cols) == 1:
+                    _wsum[_e] = weights[0, _cols[0]].view(1, 1)
+                else:
+                    _wsum[_e] = weights[0][_cols].sum().view(1, 1)
 
         def sel_of(i: int):
             s = sels.get(i)

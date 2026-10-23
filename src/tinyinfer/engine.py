@@ -1731,6 +1731,12 @@ class Engine:
         logits = None
         for off in range(0, T, step):
             logits = self._forward_chunk(ids[:, off:off + step], start_pos + off)
+            # the prefill borrows its expert reads from a private pool region; give the
+            # whole region back between chunks (no DMA can be in flight here)
+            _store = getattr(self, "expert_store", None)
+            _reset = getattr(_store, "reset_prefill_pool", None)
+            if _reset is not None:
+                _reset()
         return logits
 
     def stream_generate(self, prompt_ids, max_new_tokens: int = 64, temperature: float = 0.0,
