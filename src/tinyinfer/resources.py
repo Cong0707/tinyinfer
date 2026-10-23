@@ -211,11 +211,15 @@ def model_profile(index: Any) -> dict:
             _m = 1.0
             avg = _m * sum(per_layer.values()) / len(per_layer)
             mx = _m * max(per_layer.values())
-            # The streamed flat buffer is sized to the largest layer, and one layer's
-            # copy-in must fit beside the buffers, so the effective per-layer cost is
-            # the larger of the average and a fraction of the worst case (measured on
-            # this checkpoint: avg 162MB, worst 719MB, real streaming slab 468MB/layer).
-            prof["layer_bytes"] = max(avg, 1.0 * mx)
+            # Two different numbers, used for two different things:
+            #   layer_bytes     -> average, for "how many layers fit" (resident * avg)
+            #   max_layer_bytes -> worst case, for sizing one flat/prefetch buffer
+            # This used to be max(avg, mx), which is just mx: every layer was costed at
+            # the worst one. On Qwen3.8-27B (mean 737MB, max 1441MB) that turned a 46GB
+            # model into a 92GB plan, so the solver concluded only one layer could be
+            # resident, gave the host cache its 256MB floor, and every token then read
+            # all 63 streamed layers from disk.
+            prof["layer_bytes"] = avg
             prof["max_layer_bytes"] = mx
             # routing width: needed to size the expert pool / decide on coverage
             try:
@@ -561,7 +565,13 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     if hw.unified:
         # same physical pool: subtract what the device side already booked
         host = max(0.0, host - V)
-    slab_b = max(0.0, (n_layers - resident) * layer_b)
+    # The pinned slab is a PREFETCH buffer, not one slot per streamed layer: the ring is
+    # BUF_COUNT deep. Booking (n_layers - resident) * layer_b assumed every streamed layer
+    # needs its own pinned copy, which for a dense 27B (63 layers x 1441MB) claimed 88GB
+    # of a 47GB box and collapsed the host cache to its 256MB floor -- the model then read
+    # every layer from disk on every token.
+    slab_b = min(max(0.0, (n_layers - resident) * layer_b),
+                 max(1, buffers) * max_layer_b)
     cpu_tables = (embed_b if not embed_gpu else 0.0) + (head_b if not head_gpu else 0.0)
     page_cache_b = min(6.0 * GB, 0.20 * host)
     # 0.8 of the remainder measured best: 4.8GB of cache held only one token's experts
