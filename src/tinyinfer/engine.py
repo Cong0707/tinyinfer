@@ -920,8 +920,11 @@ class Engine:
         # compute (~15ms), so it can never hide. Three let layer k compute while
         # k+1 and k+2 stream in.
         # ring depth is measurable: 3 hides one H2D behind compute, 2 frees a layer-sized
-        # buffer (719MB here) for one more resident layer on a card this tight
-        _ring_n = max(2, min(4, int(__import__("os").environ.get("TI_RING", "3"))))
+        # buffer (463MB here) for one more resident layer on a card this tight.
+        # Measured at decode with the expert path already in place: depth 3 = 0.739s/token,
+        # depth 2 = 0.723-0.729s/token, so the freed VRAM is worth more than the extra
+        # overlap on this card. TI_RING=3 restores the deeper ring.
+        _ring_n = max(2, min(4, int(__import__("os").environ.get("TI_RING", "2"))))
         bufs = [torch.empty(mx, dtype=torch.uint8, device=self.device) for _ in range(_ring_n)]
         pinned_gb = 0.0
         # Pinned budget. Pinning all 17.9GB of streamed weights starved the expert
