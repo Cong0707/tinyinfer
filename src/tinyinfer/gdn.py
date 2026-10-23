@@ -39,13 +39,15 @@ def step(q, k, v, g, beta, state, l2norm=True):
         # v2 keeps the same arithmetic but gives each thread one dv column and walks dk in
         # a single pass, so the [Dk, Dv] state is touched as whole 128-thread rows instead
         # of 512-byte strided columns: 41.8us -> 32.3us for one layer's 2MB.
-        fn = native.kernel("gdn", "gdn_step_v2")
+        fn = native.kernel("gdn", "gdn_step_v5")
     else:
         out = torch.empty((B, H, Dv), dtype=torch.float32, device=v.device)
         fn = native.kernel("gdn", "gdn_step_f")
         qc, kc, vc = qc.float(), kc.float(), vc.float()
-    native.launch(fn, (B * H,), (128,), [qc, kc, vc, gc, bc, state, out, B, H, Dk, Dv,
-                                       1 if l2norm else 0])
+    # v5 keeps the state column in registers across both passes; 4 warps cover Dk in
+    # slices of 32, each thread owning one dv column.
+    native.launch(fn, (B * H,), (512,), [qc, kc, vc, gc, bc, state, out, B, H, Dk, Dv,
+                                        1 if l2norm else 0])
     return out
 
 
