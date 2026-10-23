@@ -69,6 +69,12 @@ class Engine:
         self._tokenizer = tokenizer
         self.hashes = None
         self.adapter = open_adapter(adapter) if isinstance(adapter, str) else adapter
+        # the architecture family drives the two branches the engine cannot abstract away
+        # (how a layer is built, and how its KV is stored)
+        try:
+            self.family = self.adapter.load_config().arch_family()
+        except Exception:
+            self.family = getattr(self.adapter, "family", "")
         self.cfg = self.adapter.load_config()
         self.store = self.adapter.store
         # tier first: the hardware plan reserves MTP when the tier enables speculation
@@ -107,7 +113,12 @@ class Engine:
                 if _prof is not None:
                     # routing width decides whether the expert pool can cover the experts
                     # a token may route to (planner's coverage/slot decision)
-                    _prof["topk"] = int(getattr(self.cfg, "n_activated_experts", 0) or 0) or None
+                    _prof["topk"] = int(getattr(self.cfg, "n_activated_experts", 0) or 0) or 0
+                    # a tied checkpoint's head IS its embedding: reserving head_bytes
+                    # again costs the plan 1.35GB of residency it never allocates
+                    _prof["tied_head"] = (getattr(self.adapter, "head_key", "x") is None
+                                          or bool(getattr(self.cfg, "tie_word_embeddings",
+                                                          False)))
             except Exception:
                 _prof = None
             # speculation reserves its draft stages up front (tier 2 is the default)
@@ -394,12 +405,25 @@ class Engine:
         # claimed pool too, so no large buffer ever appears outside it.
         if getattr(self, "host_pool", None) is not None:
             self.store.build_pool = self.host_pool
-        _emb = self.store.get("embed.weight")
+        # names come from the adapter: a checkpoint decides what it calls these (DeepSeek
+        # keeps embed/norm/head at the top level, Qwen nests them under
+        # model.language_model and ties the head to the embedding)
+        _emb = self.store.get(self.adapter.embed_key)
         self.embed = _emb if self.embed_on_cpu else _emb.to(device)
-        self.out_norm = self.store.get("norm.weight").to(device)
-        # the 1.3GB output head: off-VRAM it costs ~40ms/token but frees 1.3GB
-        self.head_on_cpu = device != "cpu" and not self.head_gpu
-        self.head = self.store.get("head.weight") if self.head_on_cpu else self.store.get("head.weight").to(device)
+        self.out_norm = self.store.get(self.adapter.norm_key).to(device)
+        # the output head is the largest single tensor: off-VRAM it costs ~40ms/token but
+        # frees 1.3GB. A tied checkpoint has no separate head, so reuse the embedding.
+        head_key = self.adapter.head_key
+        # only a separate head can be pushed off the card: a tied one IS the embedding,
+        # so it has to live wherever the embedding does
+        self.head_on_cpu = (head_key is not None and device != "cpu"
+                            and not self.head_gpu)
+        if head_key is None:
+            self.head = self.embed
+        elif self.head_on_cpu:
+            self.head = self.store.get(head_key)
+        else:
+            self.head = self.store.get(head_key).to(device)
         self.eps = self.cfg.rms_norm_eps
         # Tier >= 2 serves with speculation: load the DSpark stages now so the first
         # request does not pay for them. A missing/incompatible set disables MTP for
@@ -580,6 +604,16 @@ class Engine:
     def block(self, layer_id: int) -> Block:
         b = self._blocks.get(layer_id)
         if b is None:
+            # The adapter decides how a layer is built. DeepSeek layers need the expert
+            # store, quantisation, the compressor runtime and hyper-connection hooks;
+            # Qwen layers need none of that. Keeping the branch here is what lets both
+            # use the engine's streaming, residency and graph without a second engine.
+            if getattr(self.adapter, "family", "") == "qwen3_5":
+                b = self.adapter.build_block(layer_id, self.cfg)
+                self._blocks[layer_id] = b
+                if layer_id < self.gpu_layers and self.device != "cpu":
+                    b.to(self.device)
+                return b
             b = Block(self.store, layer_id, self.cfg, expert_store=self.expert_store,
                       quant=self.tier.keep_weights_quantized, hashes=self.hashes,
                       # resident layers never leave the card, so their fp8 weight dequantisations are worth

@@ -137,6 +137,23 @@ class Plan:
     speculation: bool = False    # the plan actually keeps room for MTP draft stages
 
 
+def _layer_of(name: str) -> int | None:
+    """The layer index a tensor belongs to, whatever the checkpoint's prefix is.
+
+    DeepSeek names layers "layers.N.attn..."; Qwen nests them as
+    "model.language_model.layers.N.self_attn...". Both contain a "layers.<int>" segment,
+    so find that rather than assuming a prefix.
+    """
+    parts = name.split(".")
+    for i, part in enumerate(parts):
+        if part == "layers" and i + 1 < len(parts):
+            try:
+                return int(parts[i + 1])
+            except ValueError:
+                return None
+    return None
+
+
 def model_profile(index: Any) -> dict:
     """Measure what the checkpoint actually costs, per layer and per expert.
 
@@ -155,28 +172,31 @@ def model_profile(index: Any) -> dict:
             return prof
         per_layer: dict[int, int] = {}
         for name in wm:
-            if not name.startswith("layers."):
+            # Layer tensors are "the ones a layer needs per token". Rather than hardcode a
+            # naming scheme (this used to check for attn./ffn.gate./hc_, which is
+            # DeepSeek's layout and matched nothing at all in a Qwen checkpoint, so every
+            # Qwen layer was costed at DeepSeek's 190MB), derive it from the layer index
+            # the checkpoint itself declares.
+            lid = _layer_of(name)
+            if lid is None:
                 continue
             parts = name.split(".")
+            if "experts" in parts:
+                continue          # routed experts are counted per blob, not per layer
+            # Everything else that belongs to a layer IS what the layer streams: the
+            # engine asks the layer for its weight paths, so the planner must count the
+            # same set. This used to filter on DeepSeek's tensor names (attn./ffn./hc_),
+            # which matched nothing in a Qwen checkpoint -- every Qwen layer was costed at
+            # DeepSeek's 190MB and the plan then streamed a model that fits entirely.
             try:
-                lid = int(parts[1])
-            except Exception:
-                continue
-            if len(parts) > 3 and parts[3] == "experts":
-                continue          # routed experts are counted per blob
-            if len(parts) > 3 and parts[2] == "engram" and parts[3] == "embed":
-                continue          # the giant engram lookup tables stay on disk (row reads)
-            # Match exactly the tensors Block._weight_paths() streams: everything the
-            # layer needs on the device, which is attn.* / ffn.gate.* / ffn.shared_experts.*
-            # plus the small norms and HC coefficients. Anything else is not per-token.
-            rest = ".".join(parts[2:])
-            if not (rest.startswith("attn.") or rest.startswith("ffn.gate.")
-                    or rest.startswith("ffn.shared_experts.") or rest.startswith("attn_norm")
-                    or rest.startswith("ffn_norm") or rest.startswith("hc_")):
-                continue
-            try:
-                h = header(wm[name])
-                ent = h.get(name)
+                # _header returns (tensor_dict, data_offset), and it raises when a shard is
+                # incomplete. Treating the tuple as the dict meant every lookup failed and
+                # the whole profile silently stayed at the calibrated defaults -- which
+                # happened to be about right for DeepSeek and wildly wrong for anything
+                # else (a Qwen layer is ~5MB, not 190MB).
+                parsed = header(wm[name])
+                tensors = parsed[0] if isinstance(parsed, tuple) else parsed
+                ent = tensors.get(name)
                 if ent is None:
                     continue
                 n = ent["data_offsets"][1] - ent["data_offsets"][0]
@@ -353,8 +373,11 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     # grouped wo matrix) allocates ~128MB per layer on top of the resident set, and
     # the prompt activations add more. Leaving the plan at zero margin put the peak
     # within 128MB of the card's limit, so the first large dequant OOM'd.
-    runtime_b = (float(model.get("engram_bytes", 0.6 * GB)) * 0.5 + 0.15 * GB
-                 + PREFILL_TEMP)
+    # engram projections are DeepSeek-specific: a model without engram layers must not
+    # reserve a gigabyte for them (Qwen reserved 1GB and streamed 5 of its 24 layers for
+    # a mechanism it does not have)
+    _engram_b = float(model.get("engram_bytes", 0.0) or 0.0)
+    runtime_b = (_engram_b * 0.5 + 0.15 * GB + PREFILL_TEMP)
     if speculation and V < 16 * GB:
         # Drafting pays only when the acceptance rate is high; here it is 0.08 (docs/
         # analysis.md section 2), so the draft stages just cost resident layers and the
@@ -381,8 +404,14 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
             speculation = False
             runtime_b -= float(model.get("mtp_bytes", 0.0)) + 0.35 * GB
 
+    # A tied checkpoint has no separate head: the head IS the embedding, so reserving
+    # head_bytes a second time reserved 1.35GB that is never allocated.
+    _tied_head = bool(model.get("tied_head", False))
+
     def layers_that_fit(embed_gpu, head_gpu, buffers, ws):
-        fixed = ((embed_b if embed_gpu else 0.0) + (head_b if head_gpu else 0.0)
+        # a tied checkpoint has no separate head allocation (see _tied_head below)
+        head_term = head_b if (head_gpu and not _tied_head) else 0.0
+        fixed = ((embed_b if embed_gpu else 0.0) + head_term
                  + buffers * max_layer_b + ws + runtime_b)
         return int(max(0.0, V - fixed) // max(1.0, layer_b * LAYER_SLACK))
 
@@ -414,6 +443,14 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     # resident layers (the prefill path has to free them again, see Engine._forward_impl)
     _force_resident = __import__("os").environ.get("TI_RESIDENT")
     resident = min(n_layers, layers_that_fit(embed_gpu, head_gpu, buffers, ws0))
+    # A model that fits entirely on the card has nothing to trade: pushing the embedding
+    # off it would add a PCIe round trip per token and save memory that is not needed.
+    # The cost model above assumes a streamed model, where one more resident layer is
+    # worth a host lookup; that trade does not exist when nothing streams.
+    if resident >= n_layers and has_gpu:
+        if not embed_gpu:
+            embed_gpu = True
+            resident = min(n_layers, layers_that_fit(embed_gpu, head_gpu, buffers, ws0))
     if _force_resident:
         try:
             resident = max(resident, min(int(_force_resident), n_layers))
@@ -450,9 +487,21 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     # staging pool every expert allocates a fresh 18.8MB device buffer per layer per
     # token. Keep room for two layers' worth of experts (2 x top-k) before trading the
     # remaining VRAM for residency, which is a constraint, not a tier.
-    MIN_SLOTS = 12
+    # Slots are expert staging buffers. A model with no routed experts (Qwen, dense
+    # models) must not reserve any: holding 12 x 18.8MB out of an 8GB card streamed 7 of
+    # Qwen's 24 layers for nothing, and the model fits entirely.
+    has_experts = expert_b > 0.5 * MB and float(model.get("topk", 0) or 0) > 0
+    MIN_SLOTS = 12 if has_experts else 0
+    if not has_experts:
+        expert_b = 0.0
+
+    # A tied checkpoint has no separate head: it IS the embedding, so counting both
+    # reserved 1.35GB that is never allocated.
+    _tied_head = bool(model.get("tied_head", False))
+
     def _used(r):
-        return ((embed_b if embed_gpu else 0.0) + (head_b if head_gpu else 0.0)
+        return ((embed_b if embed_gpu else 0.0)
+                + (head_b if (head_gpu and not _tied_head) else 0.0)
                 + r * layer_b * LAYER_SLACK + buffers * max_layer_b + ws0 + runtime_b)
 
     used = _used(resident)
@@ -464,8 +513,11 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
             resident -= 1
             used = _used(resident)
             spare = max(0.0, V - used)
-    slots = int(spare * SLOT_FRACTION // max(1.0, expert_b))
-    slots = max(slots, 2) if has_gpu else 0
+    if not has_experts:
+        slots = 0
+    else:
+        slots = int(spare * SLOT_FRACTION // max(1.0, expert_b))
+        slots = max(slots, 2) if has_gpu else 0
 
     # ---- expert coverage beats a device-resident table ---------------------------
     # A token can route to topk*n_layers distinct experts. Once the slot pool covers
