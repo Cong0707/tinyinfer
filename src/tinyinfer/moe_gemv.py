@@ -62,13 +62,19 @@ def _check(n_rows: int, k_dim: int) -> None:
 # different projection. The symptom is not a crash but decode collapsing into one
 # repeated token. A pool large enough to cover far more calls than can be in flight is
 # therefore used, and a slot is only ever rewritten after the stream has long passed it.
-_PTR_SLOTS = 1024
-_ptr_pool: dict[tuple, tuple] = {}
+_PTR_RING = 16
+_ptr_pool: dict[tuple, list] = {}
 _ptr_next = [0]
 
 
 def _ptrs(tensors) -> torch.Tensor:
-    """Device pointer array for one launch (staged through pinned memory)."""
+    """Device pointer array for one launch (staged through pinned memory).
+
+    Each slot is its own tensor, not a row of a bigger one: a slice of a pinned tensor
+    loses the pinned flag on the copy path, so ``copy_`` fell back to a synchronising
+    pageable copy. That was measurable -- the n=6 arrays (down projection) cost 923us
+    each while the n=12 ones were 6us, and the difference is exactly one queue drain.
+    """
     dev = tensors[0].device
     n = len(tensors)
     key = (dev, n)
@@ -76,24 +82,17 @@ def _ptrs(tensors) -> torch.Tensor:
     if pool is None:
         if len(_ptr_pool) > 32:
             _ptr_pool.clear()
-        pool = _ptr_pool[key] = (
-            torch.empty((_PTR_SLOTS, n), dtype=torch.int64, pin_memory=True),
-            torch.empty((_PTR_SLOTS, n), dtype=torch.int64, device=dev),
-        )
-    host, gpu = pool
+        pool = _ptr_pool[key] = [
+            (torch.empty(n, dtype=torch.int64, pin_memory=True),
+             torch.empty(n, dtype=torch.int64, device=dev))
+            for _ in range(_PTR_RING)]
     i = _ptr_next[0]
-    _ptr_next[0] = (i + 1) % _PTR_SLOTS
-    row_h = host[i]
+    _ptr_next[0] = (i + 1) % _PTR_RING
+    host, gpu = pool[i]
     for j, t in enumerate(tensors):
-        row_h[j] = t.data_ptr()
-    row_g = gpu[i]
-    row_g.copy_(row_h, non_blocking=True)
-    # the device copy is read by a launch that is still queued: keep it alive
-    try:
-        row_g.record_stream(torch.cuda.current_stream())
-    except Exception:
-        pass
-    return row_g
+        host[j] = t.data_ptr()
+    gpu.copy_(host, non_blocking=True)
+    return gpu
 
 
 def _e8m0_bytes(s: torch.Tensor) -> torch.Tensor:
