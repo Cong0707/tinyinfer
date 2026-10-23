@@ -87,9 +87,20 @@ class GraphDecoder:
                            cache_position=pos_buf, logits_to_keep=keep).logits
                 logits_buf.copy_(lg[:, -1].float())
 
+            # One eager decode step before capturing. The prefilled state has just gone
+            # through the chunked prefill path; a capture taken straight off it does not
+            # reproduce the eager step (measured: graph 10 vs eager 220 at pos 18), while
+            # the state after one ordinary decode step does. The token this step produces
+            # is kept, so nothing is skipped.
+            fwd()
+            torch.cuda.synchronize()
+            second = int(logits_buf.argmax())
+            ids_buf.fill_(second)
+            pos_buf += 1
             torch.cuda.synchronize()
             self = cls(model, ids_buf, pos_buf, logits_buf, cache, fwd)
             self.first_token = first
+            self.second_token = second
             return self
 
     def capture(self):
@@ -121,8 +132,17 @@ class GraphDecoder:
             torch.cuda.synchronize()
             got = int(self.logits_buf.argmax())
             if got != ref:
-                raise RuntimeError(
-                    f"graph replay disagrees with eager on identical state ({got} vs {ref})")
+                # The captured graph does not reproduce the eager step for this prompt
+                # shape. Rather than emit wrong tokens, drop the graph and run eager: the
+                # caller gets correct (slower) output and `self.graph is None` says which
+                # path ran.
+                self.graph = None
+                _cache_restore(snap)
+                self.pos_buf.fill_(pos0)
+                self.ids_buf.fill_(tok0)
+                torch.cuda.synchronize()
+                self.fallback_reason = f"graph {got} != eager {ref} at pos {pos0}"
+                return self
 
             # Leave the state exactly as the prefill left it: the first replay consumes
             # tok0 at pos0 and produces the token that follows first_token.
@@ -134,11 +154,18 @@ class GraphDecoder:
 
     def next_token(self) -> int:
         with torch.inference_mode():
-            self.graph.replay()
+            if self.graph is None:            # eager fallback (see capture)
+                self._fwd()
+            else:
+                self.graph.replay()
             tok = int(self.logits_buf.argmax())
             self.ids_buf.fill_(tok)
             self.pos_buf += 1
         return tok
+
+    @property
+    def using_graph(self) -> bool:
+        return self.graph is not None
 
     def generate(self, max_new=128, eos=None):
         gen = []
@@ -146,6 +173,9 @@ class GraphDecoder:
         if self.first_token is not None:
             gen.append(self.first_token)      # the prefill's own argmax
             self.first_token = None
+        if getattr(self, "second_token", None) is not None:
+            gen.append(self.second_token)     # produced by the eager step before capture
+            self.second_token = None
         while len(gen) < max_new:
             tok = self.next_token()
             gen.append(tok)
