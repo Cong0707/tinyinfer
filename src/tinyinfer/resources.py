@@ -405,6 +405,11 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     # at the price of a host GEMV per token)
     if __import__("os").environ.get("TI_HEAD_CPU") == "1":
         head_gpu = False
+    else:
+        # _head_logits has no host-GEMV path (it slices the head on the device), so a
+        # head_on_cpu plan only shows up later as a device mismatch. Keep the head
+        # on-card unless the operator explicitly forces TI_HEAD_CPU.
+        head_gpu = True
     # forced residency: overrides the solver so a caller can trade the streaming ring for
     # resident layers (the prefill path has to free them again, see Engine._forward_impl)
     _force_resident = __import__("os").environ.get("TI_RESIDENT")

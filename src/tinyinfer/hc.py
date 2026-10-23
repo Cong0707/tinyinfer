@@ -273,5 +273,9 @@ class HCBlockMixin:
                       f"x={tuple(x.shape)} res={tuple(residual.shape)} "
                       f"mean={self._hc_t[0]/self._hc_t[1]:.2f}ms", flush=True)
             return y.type_as(x)
-        y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+        # fp32 coefficients: tier <= 2 keeps the full-precision arithmetic. The bf16
+        # variant is a tier-3 trade (two fewer full-tensor conversions per call, 80 calls
+        # per token).
+        y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(
+            comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
         return y.type_as(x)
