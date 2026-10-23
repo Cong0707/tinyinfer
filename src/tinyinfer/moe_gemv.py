@@ -53,9 +53,47 @@ def _check(n_rows: int, k_dim: int) -> None:
         raise ValueError(f"moe_gemv: unsupported shape n_rows={n_rows} k_dim={k_dim}")
 
 
+# Pointer arrays are staged through pinned memory, because building them with
+# torch.tensor(list, device="cuda") is a pageable H2D that synchronises the stream first:
+# at decode that is 8 arrays per layer (320 per step, measured 441us each, 141ms of an
+# 805ms step). The staging arrays CANNOT be shared or recycled on a short cycle --
+# copy_ from pinned memory only queues the DMA, so a reused host buffer is overwritten
+# while the copy is still pending and the kernel reads a pointer array belonging to a
+# different projection. The symptom is not a crash but decode collapsing into one
+# repeated token. A pool large enough to cover far more calls than can be in flight is
+# therefore used, and a slot is only ever rewritten after the stream has long passed it.
+_PTR_SLOTS = 1024
+_ptr_pool: dict[tuple, tuple] = {}
+_ptr_next = [0]
+
+
 def _ptrs(tensors) -> torch.Tensor:
-    return torch.tensor([t.data_ptr() for t in tensors], dtype=torch.int64,
-                        device=tensors[0].device)
+    """Device pointer array for one launch (staged through pinned memory)."""
+    dev = tensors[0].device
+    n = len(tensors)
+    key = (dev, n)
+    pool = _ptr_pool.get(key)
+    if pool is None:
+        if len(_ptr_pool) > 32:
+            _ptr_pool.clear()
+        pool = _ptr_pool[key] = (
+            torch.empty((_PTR_SLOTS, n), dtype=torch.int64, pin_memory=True),
+            torch.empty((_PTR_SLOTS, n), dtype=torch.int64, device=dev),
+        )
+    host, gpu = pool
+    i = _ptr_next[0]
+    _ptr_next[0] = (i + 1) % _PTR_SLOTS
+    row_h = host[i]
+    for j, t in enumerate(tensors):
+        row_h[j] = t.data_ptr()
+    row_g = gpu[i]
+    row_g.copy_(row_h, non_blocking=True)
+    # the device copy is read by a launch that is still queued: keep it alive
+    try:
+        row_g.record_stream(torch.cuda.current_stream())
+    except Exception:
+        pass
+    return row_g
 
 
 def _e8m0_bytes(s: torch.Tensor) -> torch.Tensor:
