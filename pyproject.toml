@@ -38,7 +38,9 @@ server = ["fastapi>=0.115", "uvicorn>=0.30", "httpx>=0.27"]
 dev = ["pytest>=8", "httpx>=0.27"]
 
 [project.urls]
-Documentation = "https://github.com/tuxKOH/tinyinfer/blob/master/docs/README.md"
+Homepage = "https://github.com/Cong0707/tinyinfer"
+Documentation = "https://github.com/Cong0707/tinyinfer/blob/master/docs/README.md"
+Issues = "https://github.com/Cong0707/tinyinfer/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
