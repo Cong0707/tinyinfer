@@ -659,8 +659,11 @@ class QwenBackend(BaseBackend):
         self._model = None
         self._torch = None
         self._slots: dict[int, Any] = {}
-        self._graphs: dict[int, Any] = {}
-        self._prep: dict[int, list[int]] = {}
+        # keyed by (prompt length, generation budget): the captured graph and its KV window
+        # are shaped by both, so two requests with the same prompt length but a different
+        # max_tokens cannot share one
+        self._graphs: dict[tuple[int, int], Any] = {}
+        self._prep: dict[tuple[int, int], list[int]] = {}
         self._gen_lock = threading.Lock()
         self._lock = threading.Lock()
         self.ready = False
@@ -743,7 +746,7 @@ class QwenBackend(BaseBackend):
         budget = max(1, min(int(params.max_tokens),
                             self.max_context_tokens - prompt_tokens))
         eos = self._tok.eos_token_id
-        dec, fresh = self._decoder_for(request, ids)
+        dec, fresh = self._decoder_for(request, ids, budget)
         sampler = _Sampler(params, torch)
         produced = 0
         text_buf: list[str] = []
@@ -752,7 +755,7 @@ class QwenBackend(BaseBackend):
             # tokens the decoder already produced while preparing the graph
             # the prep tokens (emitted between prefill and the captured step) are the same
             # for every request on this graph shape: _decoder_for recorded them once
-            for tok_id in self._prep.get(int(ids.shape[1]), ()):
+            for tok_id in self._prep.get((int(ids.shape[1]), budget), ()):
                 piece = self._tok.decode([tok_id], skip_special_tokens=False)
                 text_buf.append(piece)
                 produced += 1
@@ -790,7 +793,7 @@ class QwenBackend(BaseBackend):
             usage=Usage.from_counts(prompt_tokens, produced))
 
     # -- capture reuse -----------------------------------------------------
-    def _decoder_for(self, request, ids):
+    def _decoder_for(self, request, ids, budget: int = 256):
         """A captured decoder for this prompt length.
 
         A capture costs ~137ms (it runs the step several times to prove the replay matches
@@ -802,20 +805,25 @@ class QwenBackend(BaseBackend):
         from tinyinfer.hf_graph import GraphDecoder
 
         length = int(ids.shape[1])
-        cached = self._graphs.get(length)
+        # the KV window has to cover prompt + every token this request may generate: the
+        # StaticCache writes with index_copy_ at an absolute position, so a window sized
+        # for the default 256 overflowed on a 312-token answer and tripped a device-side
+        # assert that killed the CUDA context for the rest of the process.
+        key = (length, max(1, int(budget)))
+        cached = self._graphs.get(key)
         if cached is not None:
             # the prep tokens belong to the prompt, not to whichever request happened to
             # trigger the capture: they are what the model emits right after prefill
-            self._prep.setdefault(length, getattr(cached, "prep_tokens", []))
+            self._prep.setdefault(key, getattr(cached, "prep_tokens", []))
             # rewind to the exact state replay expects: the capture advanced the cache by
             # one step, and this decoder has been replayed since
             cached.rewind()
             return cached, False
-        dec = GraphDecoder.from_prompt(self._model, ids).capture()
+        dec = GraphDecoder.from_prompt(self._model, ids, capacity=key[1] + 8).capture()
         if dec.using_graph:
             dec.prep_tokens = dec.drain()
-            self._graphs[length] = dec
-            self._prep[length] = dec.prep_tokens
+            self._graphs[key] = dec
+            self._prep[key] = dec.prep_tokens
             return dec, True
         return dec, True
 
