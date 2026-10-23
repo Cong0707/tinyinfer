@@ -63,6 +63,35 @@ class GraphDecoder:
         self.first_token = None
 
     @classmethod
+    def from_functions(cls, prompt_ids, step_fn, logits_buf, vocab_size, capacity=256):
+        """Capture an arbitrary one-token step.
+
+        from_prompt() assumes the whole model runs as model(input_ids=...), which is not
+        true for a streamed model: those run one layer at a time through engine.block(i).
+        A caller that already owns the step passes it as step_fn(ids_buf, pos_buf) and this
+        handles the capture and the eager-vs-graph proof.
+
+        step_fn must not allocate: it may write the KV buffers it is given, which is what
+        makes a replay legal.
+        """
+        with torch.inference_mode():
+            device = prompt_ids.device
+            ids_buf = torch.zeros(1, 1, dtype=torch.long, device=device)
+            pos_buf = torch.zeros(1, dtype=torch.long, device=device)
+            ids_buf.fill_(int(prompt_ids[0, -1]))
+            pos_buf.fill_(int(prompt_ids.shape[1]))
+
+            def fwd():
+                row = step_fn(ids_buf, pos_buf)
+                logits_buf.copy_(row.reshape(-1).float())
+
+            fwd()
+            torch.cuda.synchronize()
+            dec = cls(None, ids_buf, pos_buf, logits_buf, None, fwd)
+            dec.capacity = int(prompt_ids.shape[1]) + int(capacity)
+            return dec
+
+    @classmethod
     def from_prompt(cls, model, prompt_ids, keep=1, capacity=256, **extra):
         """Prefill, then build the graph for one decode step."""
         if hasattr(prompt_ids, "input_ids"):

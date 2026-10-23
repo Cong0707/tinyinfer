@@ -16,13 +16,15 @@
 | CPU / RAM | Ryzen 9 9955HX (16C) / 47.2 GB |
 | Python | 3.13.7, torch 2.9.0+cu130, transformers 5.20.2 |
 
-| 模型 | 权重 | 驻留 | 速度 |
-| --- | --- | --- | --- |
-| Qwen3.5-0.8B | 1.4 GB bf16 | 24/24 层全在卡上 | **195 tok/s** |
-| DeepSeek-V4.1-Flash-1017 | 510 GB | 10/40 层 | **1.2 tok/s** |
-| Qwen3.8-27B | 51.8 GB | 逐层流式 | 验证中 |
+| 模型 | 权重 | 驻留 | 引擎路径 | 说明 |
+| --- | --- | --- | --- | --- |
+| Qwen3.5-0.8B | 1.4 GB bf16 | 24/24 全在卡上 | **180 tok/s** | CUDA graph，输出与参考逐 token 一致 |
+| DeepSeek-V4.1-Flash-1017 | 510 GB | 10/40 层 | **1.2 tok/s** | 流式 + 专家缓存 |
+| Qwen3.8-27B | 51.8 GB | 1/64 层 | 逐层读入 | 64 层跑通，速度待测 |
 
-Qwen 的 195 tok/s 是复用 CUDA graph 后的稳态（首次请求 77 tok/s，含 137ms 图捕获）。
+Qwen3.5-0.8B 走引擎：同一套代码，`engine.block(i)` 逐层驱动，整步捕获成一张 CUDA graph。
+eager 驱动 49.9 tok/s，捕获后 180.4 tok/s（3.6 倍），十个 token 与 eager 逐位相同。
+
 这台卡实测有效带宽约 343 GB/s，1.4GB ÷ 343GB/s = 4.1ms 是纯带宽下限，即 244 tok/s。
 
 ## 用法
