@@ -66,6 +66,7 @@ def gemv_fp4(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor) -> tor
     if ws.size(0) != n:  # packed [N/32, nb] -> broadcast rows to [N, nb] (ABI wants N)
         ws = ws.view(-1, ws.size(-1)).repeat_interleave(32, 0)[:n]
     gemv_fp4_kernel_v2(n, k)(aq.reshape(-1), asc.reshape(-1).float(), w_fp4, ws, out)
+    _keep(aq, asc, w_fp4, ws, out)
     return out.view(1, n)
 
 
@@ -126,6 +127,7 @@ def gemv_fp4_pq(aq: torch.Tensor, asc: torch.Tensor, w_fp4: torch.Tensor,
     # per decode step
     asc2 = asc if asc.dtype == torch.float32 else asc.float()
     gemv_fp4_kernel_v2(n, k)(aq.reshape(-1), asc2.reshape(-1), w_fp4, ws, out)
+    _keep(aq, asc2, w_fp4, ws, out)
     return out.view(1, n)
 
 
@@ -138,6 +140,7 @@ def gemv_fp4_m8(aq: torch.Tensor, asc: torch.Tensor, w_fp4: torch.Tensor,
     out = torch.empty((m, n), device=aq.device, dtype=torch.bfloat16)
     ws = _scale(w_scale)
     gemv_fp4_m8_kernel(n, k, m)(aq, asc.float(), w_fp4, ws, out)
+    _keep(aq, asc, w_fp4, ws, out)
     return out
 
 
@@ -196,7 +199,32 @@ def gemv_fp4_grouped(aq: torch.Tensor, asc: torch.Tensor, w_fp4: torch.Tensor,
     out = torch.empty((g, n), device=aq.device, dtype=torch.bfloat16)
     ws = _scale(w_scale)
     gemv_fp4_grouped_kernel(n, k, g)(aq, asc.float(), w_fp4, ws, out)
+    _keep(aq, asc, w_fp4, ws, out)
     return out
+
+
+def _keep(*tensors) -> None:
+    """Tell the caching allocator these tensors are still in use by the JIT kernel.
+
+    The tilelang kernels launch through the driver themselves, so nothing marks the
+    expert weights as read by an op. Once moe.py drops its reference the block goes
+    straight back to the pool and the next allocation can overwrite bytes a running
+    GEMV is still reading. That is what made the same prompt decode differently
+    between identical runs, and why it only showed up once enough layers ran to
+    pressure the allocator.
+    """
+    if not torch.cuda.is_available():
+        return
+    try:
+        cur = torch.cuda.current_stream()
+    except Exception:
+        return
+    for t in tensors:
+        if torch.is_tensor(t):
+            try:
+                t.record_stream(cur)
+            except Exception:
+                pass
 
 
 def _scale(s: torch.Tensor) -> torch.Tensor:

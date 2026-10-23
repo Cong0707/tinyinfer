@@ -607,6 +607,9 @@ class Engine:
         # stale entry makes the next forward rank a buffer copy that has not landed yet
         if hasattr(self, "_flat_ev"):
             self._flat_ev.clear()
+        for _a in ("_flat_done", "_flat_slot_owner"):
+            if hasattr(self, _a):
+                getattr(self, _a).clear()
         if self.hashes is not None:
             self.hashes.reset()
         for b in self._blocks.values():
@@ -620,6 +623,11 @@ class Engine:
             idx = getattr(b.attn, "indexer", None)
             if idx is not None and hasattr(idx, "reset"):
                 idx.reset()
+            # the fp8 weight dequant is cached on the attention object; if the first
+            # forward built it while a streamed layer's weights were still moving in,
+            # every later run inherits those bytes
+            if hasattr(b.attn, "_bf16_cache"):
+                b.attn._bf16_cache = None
             b.ffn._expert_cache.clear()
         # Streaming state is per-forward. Dropping it alone would leave every streamed
         # block's weights pointing into a ring buffer that no longer exists, so restore
@@ -1104,12 +1112,18 @@ class Engine:
             print(f"[flat] layer {layer} buf {buf_idx} slab={host is not None and layer in host}",
                   flush=True)
         if host is None or layer not in host:
-            # per-tensor copies from the pinned refs Block already holds (a partial
-            # slab leaves some layers on this path). _cpu_refs is keyed by (owner, name)
-            # now, not positional.
+            # Per-tensor copies from the pinned refs Block already holds (a partial slab
+            # leaves most layers on this path). The refs ARE pinned host memory, so issue
+            # the DMA straight at it: tensor.copy_() costs ~84us of CPU dispatch per call
+            # (measured in the decode trace: 2849 calls per step, 239ms of the step) and
+            # the step is CPU bound -- the GPU kernels are only ~91ms of it.
+            from .loading import _async_h2d
+
             for (owner, name, t), (o, n) in zip(b._weight_paths(), offs):
                 src = b._cpu_refs[Block._wkey(owner, name)]
-                buf[o:o + n].view(t.dtype).view(t.shape).copy_(src, non_blocking=True)
+                dst = buf[o:o + n].view(t.dtype).view(t.shape)
+                if not _async_h2d(dst, src, n):
+                    dst.copy_(src, non_blocking=True)
         else:
             buf[:total].copy_(host[layer], non_blocking=True)
         for (owner, name, t), (o, n) in zip(b._weight_paths(), offs):
@@ -1117,10 +1131,31 @@ class Engine:
         if getattr(b, "engram", None) is not None:
             b.engram.to(self.device)
         b._device = self.device
+    def _flat_slot_guard(self, layer: int, buf_idx: int) -> None:
+        """Stop the copy stream from refilling a ring slot the GPU may still be reading.
+
+        With a three-deep ring and two layers prefetched ahead, layer i+3 lands in the
+        same slot as layer i. The copy stream is independent of the compute stream, so
+        without this the DMA could overwrite layer i's weights while its kernels were
+        still running -- and since the reused memory held a *previous* run's bytes, the
+        damage decayed instead of failing outright: four back-to-back runs of the same
+        prompt produced '<eos>', then gibberish, then nearly right, then the correct
+        answer.
+        """
+        if getattr(self, "_flat_slot_owner", None) is None:
+            self._flat_slot_owner = {}
+            self._flat_done = {}
+        prev = self._flat_slot_owner.get(buf_idx)
+        if prev is not None and prev != layer:
+            done = self._flat_done.pop(prev, None)
+            if done is not None:
+                self._copy_stream.wait_event(done)
+        self._flat_slot_owner[buf_idx] = layer
 
     def _flat_prefetch(self, layer: int, buf_idx: int) -> None:
         if layer not in self._flat_state[0]:
             return
+        self._flat_slot_guard(layer, buf_idx)
         ev = torch.cuda.Event()
         with torch.cuda.stream(self._copy_stream):
             self._flat_apply(layer, buf_idx)
@@ -1138,6 +1173,7 @@ class Engine:
             if ev is not None:
                 torch.cuda.current_stream().wait_event(ev)
             else:
+                self._flat_slot_guard(layer, buf_idx)
                 self._flat_apply(layer, buf_idx)
         finally:
             self._h2d_wait_ms = getattr(self, "_h2d_wait_ms", 0.0) + (_t.perf_counter() - t0) * 1e3
@@ -1421,6 +1457,11 @@ class Engine:
                       f"hc_fn={getattr(b, 'hc_attn_fn', None) is not None and b.hc_attn_fn.device}",
                       flush=True)
                 raise
+            if use_flat and streamed:
+                # the ring slot this layer read is free only once these kernels retire
+                _ev_done = torch.cuda.Event()
+                _ev_done.record()
+                self._flat_done[i] = _ev_done
             if __import__("os").environ.get("TI_DEBUG_NAN"):
                 _fin = bool(torch.isfinite(h).all())
                 if (not _fin) or __import__("os").environ.get("TI_DEBUG_NAN") == "all":

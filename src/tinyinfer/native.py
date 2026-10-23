@@ -78,6 +78,16 @@ def kernel(name: str, func: str):
     return handle
 
 
+def available(name: str, func: str | None = None) -> bool:
+    """True when the cubin is present and, if given, the kernel symbol resolves."""
+    try:
+        if func is not None:
+            kernel(name, func)
+        return (_DIR / f"{name}.cubin").exists()
+    except Exception:
+        return False
+
+
 def launch(fn: int, grid, block, args, stream: int = 0, shared: int = 0) -> None:
     """Launch fn with python args (tensors -> data_ptr, int -> int32, float -> float32)."""
     import torch
@@ -86,9 +96,21 @@ def launch(fn: int, grid, block, args, stream: int = 0, shared: int = 0) -> None
         stream = int(torch.cuda.current_stream().cuda_stream)
     holders = []
     ptrs = (ctypes.c_void_p * len(args))()
+    # torch's caching allocator only knows a tensor is in use when a torch op touches it.
+    # The driver API takes a bare pointer, so once the Python reference is dropped the
+    # block goes straight back to the pool while the kernel may still be reading it. That
+    # showed up as decode garbage that varied with layer depth and between runs (layers
+    # 0-30 bit-stable, 32/34/38/39 flipping) because a later allocation reused the memory
+    # of a weight pointer the launch had already queued.
+    _cur = torch.cuda.current_stream() if torch.cuda.is_available() else None
     for i, a in enumerate(args):
         if torch.is_tensor(a):
             holders.append(ctypes.c_void_p(a.data_ptr()))
+            if _cur is not None:
+                try:
+                    a.record_stream(_cur)
+                except Exception:
+                    pass
         elif isinstance(a, float):
             holders.append(ctypes.c_float(a))
         elif isinstance(a, int):

@@ -1625,7 +1625,21 @@ class ExpertCache:
         return len(self._pinned)
 
     def _is_pinned(self, key: tuple[int, int]) -> bool:
-        return key in self._pinned
+        # A blob that is still leased by a caller must not be evicted and its pool range
+        # released: the caller keeps the bytearray in an ExpertRecord and would then read
+        # a slot another expert had already been loaded into. That is exactly the decode
+        # corruption seen here -- the same prompt decoded to a different answer depending
+        # on how many layers had run before, because eviction rewrote a live blob.
+        return key in self._pinned or self._refs.get(key, 0) > 0
+
+    def lease(self, key: tuple[int, int], delta: int = 1) -> None:
+        """Track that a caller holds this blob (fetch -> release window)."""
+        with self._lock:
+            cur = self._refs.get(key, 0) + int(delta)
+            if cur > 0:
+                self._refs[key] = cur
+            else:
+                self._refs.pop(key, None)
 
     def _evict_locked(self, prefer_layer: int | None = None) -> bool:
         if prefer_layer is not None and getattr(self.policy, "name", "") == "arc":
@@ -2700,6 +2714,7 @@ class ExpertStore:
                 records.append(self._materialize(layer, expert, cache=cache, data=have))
             with self._lock:
                 self._open[(layer, expert)] += 1
+            self.ram.lease((layer, expert), 1)
         return records
 
     def prefetch_to_vram(self, layer: int, experts: Iterable[int], *, cache: bool = True) -> int:
@@ -2797,6 +2812,7 @@ class ExpertStore:
             layer, expert = rec.key
             with self._lock:
                 self._open[(layer, expert)] = max(0, self._open[(layer, expert)] - 1)
+            self.ram.lease((layer, expert), -1)
             if self.slots is not None:
                 self.slots.release(layer, expert)
 
