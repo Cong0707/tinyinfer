@@ -1795,9 +1795,23 @@ class ExpertCache:
         return self._prefill_pool or None
 
     def reset_prefill_pool(self) -> None:
-        """Discard every prefill borrow (called at the end of a chunk)."""
-        if self._prefill_pool:
-            self._prefill_pool.reset()
+        """Discard every prefill borrow (called at the end of a chunk).
+
+        The device copies for these slices are asynchronous, so the region cannot be
+        handed back before they complete: without the sync the next chunk's reads land
+        in the same addresses while the previous DMAs are still reading them (tier 2's
+        prefill logits came out EOS-leading).
+        """
+        if not self._prefill_pool:
+            return
+        try:
+            import torch
+
+            if torch.cuda.is_available() and torch.cuda.is_initialized():
+                torch.cuda.synchronize()
+        except Exception:
+            pass
+        self._prefill_pool.reset()
 
     def _read_pinned(self, blob: ExpertBlob):
         """Read a blob straight into pinned host memory.
@@ -2642,11 +2656,12 @@ class ExpertStore:
                     if _admit_ok:
                         datas = self.ram._read_many_pooled(blobs) if blobs else []
                     else:
-                        # Prefill borrows ~240 x 18.8MB per pass. The dedicated-region
-                        # variant (reserved out of the pool, reset per chunk) is correct in
-                        # principle but the reserved region's DMA source raced the next
-                        # chunk's overwrite: tier 2's prefill logits came out EOS-leading.
-                        # Read through the bytearray reader until that ownership is fixed.
+                        # Prefill borrows ~240 x 18.8MB per pass. The dedicated reserved
+                        # region (added, then removed twice) gets 15-19s vs 23.9s on
+                        # prefill and is correct on tier 3, but tier 2's prefill logits
+                        # come out EOS-leading with it -- with or without a stream sync at
+                        # reset, so it is not a DMA-overwrite race. Prefill stays on the
+                        # bytearray reader until that tier difference is understood.
                         datas = [self.reader.read_blob(b) for b in blobs] if blobs else []
                     self._disk_ms = getattr(self, "_disk_ms", 0.0) + (__import__("time").perf_counter() - _d0) * 1e3
                     for b, d in zip(blobs, datas):
