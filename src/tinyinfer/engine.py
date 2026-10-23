@@ -610,7 +610,11 @@ class Engine:
             # use the engine's streaming, residency and graph without a second engine.
             if getattr(self.adapter, "family", "") == "qwen3_5":
                 b = self.adapter.build_block(layer_id, self.cfg)
-                self._blocks[layer_id] = b
+                # Do NOT keep it in self._blocks. A DeepSeek block is a stub whose weights
+                # are read per tensor from disk, so holding all 40 costs nothing; a Qwen
+                # layer that has been materialised holds its real weights (731MB for the
+                # 27B), and caching all 64 would need 47GB -- which is what filled the
+                # machine's memory. The adapter owns Qwen's bounded cache instead.
                 if layer_id < self.gpu_layers and self.device != "cpu":
                     b.to(self.device)
                 return b
@@ -643,6 +647,33 @@ class Engine:
 
     def _layer_device(self, b: Block) -> str:
         return getattr(b, "_device", "cpu")
+
+    def ensure_layer(self, layer_id: int):
+        """Return the layer, made resident on this engine's device if the plan says so.
+
+        This is the streaming seam for models whose layers are plain modules (Qwen):
+        resident layers stay on the card, everything else is moved in for its turn and
+        evicted after. A model never learns whether it was resident.
+        """
+        b = self.block(layer_id)
+        needs = self.device if layer_id < self.gpu_layers else "cpu"
+        cur = getattr(b, "device", getattr(b, "_device", "cpu"))
+        if cur != needs:
+            b.to(needs)
+        return b
+
+    def release_layer(self, layer_id: int) -> None:
+        """Move a streamed layer back to the host so the next one can use the VRAM."""
+        if layer_id < self.gpu_layers:
+            return
+        b = self._blocks.get(layer_id)
+        if b is None:
+            return
+        cur = getattr(b, "device", getattr(b, "_device", "cpu"))
+        if cur != "cpu":
+            b.to("cpu")
+            if self.device == "cuda":
+                torch.cuda.empty_cache()
 
     def reset(self) -> None:
         self._last_routing.clear()
