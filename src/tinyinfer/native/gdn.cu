@@ -367,3 +367,89 @@ extern "C" __global__ void gdn_norm_gated_v2(const __nv_bfloat16* __restrict__ x
         yr[k] = __float2bfloat16(__bfloat162float(__float2bfloat16(n)) * w[k] * gate);
     }
 }
+
+// gdn_step v5: the state column lives in registers for the whole step.
+//
+// v4 read the state twice from global memory (once to decay + kv_mem, once to update and
+// dot) and was 29-41us for 16 heads of [128,128]. Each thread owns one dv column, so its
+// 128 state values are exactly one register array: load once, do both passes in
+// registers, store once. That halves the global traffic and removes the loop-carried
+// dependency on memory.
+//
+// 128 threads/block covers dv; 8 warps cover dk in slices of 16, so a block is 1024
+// threads with the state held per (thread, dk-slice) as 16 floats.
+
+#include <cuda_bf16.h>
+
+extern "C" __global__ void gdn_step_v5(const __nv_bfloat16* __restrict__ q,
+                                       const __nv_bfloat16* __restrict__ k,
+                                       const __nv_bfloat16* __restrict__ v,
+                                       const float* __restrict__ g,
+                                       const float* __restrict__ beta,
+                                       float* __restrict__ state,   // [H, Dk, Dv]
+                                       __nv_bfloat16* __restrict__ out,
+                                       int B, int H, int Dk, int Dv, int l2norm) {
+    const int bh = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 7;            // 0..3 with 512 threads
+    const int dv = tid & 127;             // 0..127
+    const int dk0 = warp * 32;            // 32 dk per warp (4 warps x 32 = 128)
+    if (dv >= Dv) return;
+    const int b = bh / H, h = bh - b * H;
+    float* st = state + (long)bh * Dk * Dv;
+    const __nv_bfloat16* qh = q + ((long)b * H + h) * Dk;
+    const __nv_bfloat16* kh = k + ((long)b * H + h) * Dk;
+    const __nv_bfloat16* vh = v + ((long)b * H + h) * Dv;
+
+    __shared__ float s_q[256];
+    __shared__ float s_k[256];
+    __shared__ float s_part[4][128];
+    __shared__ float s_beta;
+    if (tid < Dk) {
+        s_q[tid] = __bfloat162float(qh[tid]);
+        s_k[tid] = __bfloat162float(kh[tid]);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float sq = 0.f, sk = 0.f;
+        for (int i = 0; i < Dk; ++i) { sq += s_q[i]*s_q[i]; sk += s_k[i]*s_k[i]; }
+        s_beta = beta[(long)b * H + h];
+        float rq = (l2norm ? rsqrtf(sq + 1e-6f) : 1.f) * rsqrtf((float)Dk);
+        float rk = l2norm ? rsqrtf(sk + 1e-6f) : 1.f;
+        for (int i = 0; i < Dk; ++i) { s_q[i] *= rq; s_k[i] *= rk; }
+    }
+    __syncthreads();
+    const float decay = expf(g[(long)b * H + h]);
+
+    // the 16 state values this thread owns, held in registers
+    float s[32];
+#pragma unroll
+    for (int j = 0; j < 32; ++j)
+        s[j] = st[(long)(dk0 + j) * Dv + dv] * decay;
+    float acc = 0.f;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) acc += s[j] * s_k[dk0 + j];
+    s_part[warp][dv] = acc;
+    __syncthreads();
+    if (tid < Dv) {
+        float tot = 0.f;
+        for (int w = 0; w < 4; ++w) tot += s_part[w][tid];
+        s_part[0][tid] = (__bfloat162float(vh[tid]) - tot) * s_beta;
+    }
+    __syncthreads();
+    const float delta = s_part[0][dv];
+    float sum = 0.f;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        s[j] += s_k[dk0 + j] * delta;
+        sum += s[j] * s_q[dk0 + j];
+        st[(long)(dk0 + j) * Dv + dv] = s[j];
+    }
+    s_part[warp][dv] = sum;
+    __syncthreads();
+    if (warp == 0) {
+        float tot = 0.f;
+        for (int w = 0; w < 4; ++w) tot += s_part[w][dv];
+        out[((long)b * H + h) * Dv + dv] = __float2bfloat16(tot);
+    }
+}
