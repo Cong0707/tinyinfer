@@ -1564,6 +1564,20 @@ class BlobPool:
             self._free.clear()
 
 
+class ThreadKey:
+    """Placeholder tenant marker (kept for symmetry with the slot pool's refcounts)."""
+
+
+class _LoadSlot:
+    """In-flight marker for one (layer, expert) read (single-flight rendezvous)."""
+
+    __slots__ = ("event", "tenant")
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.tenant = None
+
+
 class ExpertCache:
     """RAM cache of raw fp4 expert blobs (18.8 MB each), shared by all sessions.
 
@@ -1592,6 +1606,7 @@ class ExpertCache:
         self.max_pinned = (self.capacity_entries if max_pinned_bytes is None
                            else max(0, int(max_pinned_bytes) // max(1, self.blob_bytes)))
         self._entries: dict[tuple[int, int], bytearray] = {}
+        self._loading: dict[tuple[int, int], _LoadSlot] = {}
         self._pinned: set[tuple[int, int]] = set()
         self._refs: dict[tuple[int, int], int] = defaultdict(int)
         self._freq: dict[tuple[int, int], int] = defaultdict(int)
@@ -1881,17 +1896,47 @@ class ExpertCache:
                 return data
         if not blocking:
             return None
-        blob = self.index.expert_blob(layer, expert)
-        started = time.perf_counter()
-        data = self._read_pinned(blob)
+        # single-flight: one reader per (layer, expert) at a time. Without this the
+        # prefetch thread and the compute thread each pread the same 18.8MB blob (the
+        # fetch used to see a miss while the prefetch was still landing the bytes), and
+        # the read path -- not the GPU -- is what a decode step's wall clock measures.
         with self._lock:
-            self._stats.misses += 1
-            self._stats.disk_reads += 1
-            self._stats.disk_bytes += len(data)
-            self._stats.load_seconds += time.perf_counter() - started
-            self._insert_locked(key, data, admit=admit)
-            self._freq[key] += 1
-        return data
+            slot = self._loading.get(key)
+            leader = slot is None
+            if leader:
+                slot = self._loading[key] = _LoadSlot()
+                slot.tenant = ThreadKey()
+        if not leader:
+            slot.event.wait()
+            with self._lock:
+                data = self._entries.get(key)
+            if data is not None:
+                self._stats.hits += 1
+                return data
+            # the leader failed; fall through and read it ourselves
+            with self._lock:
+                slot = self._loading.get(key)
+                leader = slot is None
+                if leader:
+                    slot = self._loading[key] = _LoadSlot()
+                    slot.tenant = ThreadKey()
+        try:
+            blob = self.index.expert_blob(layer, expert)
+            started = time.perf_counter()
+            data = self._read_pinned(blob)
+            with self._lock:
+                self._stats.misses += 1
+                self._stats.disk_reads += 1
+                self._stats.disk_bytes += len(data)
+                self._stats.load_seconds += time.perf_counter() - started
+                self._insert_locked(key, data, admit=admit)
+                self._freq[key] += 1
+            return data
+        finally:
+            with self._lock:
+                cur = self._loading.pop(key, None)
+            if cur is not None:
+                cur.event.set()
 
     def prefetch(self, layer: int, experts: Iterable[int], *, admit: bool = True) -> Future:
         """Read a set of experts into RAM in the background (deduplicated)."""
@@ -1899,19 +1944,17 @@ class ExpertCache:
         def work() -> int:
             loaded = 0
             for expert in experts:
-                key = (layer, expert)
-                with self._lock:
-                    if key in self._entries:
-                        continue
-                blob = self.index.expert_blob(layer, expert)
-                data = self._read_pinned(blob)
-                with self._lock:
-                    if key not in self._entries:
-                        self._stats.disk_reads += 1
-                        self._stats.disk_bytes += len(data)
-                        self._insert_locked(key, data, admit=admit)
-                        loaded += 1
-                    self._stats.prefetch_issued += 1
+                # go through get() so the prefetch thread and the compute thread rendezvous
+                # on one read instead of issuing a pread each (the dedup that used to be
+                # here only looked at ``_entries``, which an in-flight read has not reached)
+                before = self._stats.disk_reads
+                try:
+                    self.get(layer, expert, blocking=True, admit=admit)
+                except Exception:
+                    continue
+                if self._stats.disk_reads != before:
+                    loaded += 1
+                self._stats.prefetch_issued += 1
             return loaded
 
         if self._closed:
@@ -1923,15 +1966,18 @@ class ExpertCache:
             return (layer, expert) in self._entries
 
     def admit(self, layer: int, expert: int, data: bytearray) -> bytearray:
-        """Insert a pre-read expert (locked insert only; the disk read happened outside)."""
+        """Insert a pre-read expert (locked insert only; the disk read happened outside).
+
+        The bytes were already counted where they were read; counting them again here
+        doubled the reported disk traffic and made the read path look like the step's
+        bottleneck when it was not.
+        """
         key = (layer, expert)
         with self._lock:
             if __import__("os").environ.get("TI_CACHE_TRACE") == "1" and len(self._entries) < 3:
                 print(f"[admit] {key} present={key in self._entries} len={len(data)} "
                       f"type={type(data).__name__}", flush=True)
             if key not in self._entries:
-                self._stats.disk_reads += 1
-                self._stats.disk_bytes += len(data)
                 self._insert_locked(key, data)
         return data
 
@@ -2836,6 +2882,7 @@ class ExpertStore:
         for e in experts:
             self._pending[(int(layer), int(e))] = fut
         return fut
+
 
     def _settle_pending(self, misses: list[tuple[int, int]]) -> list[tuple[int, int]]:
         """Wait for in-flight prefetches of these experts; return the ones still missing.
