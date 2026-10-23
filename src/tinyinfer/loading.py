@@ -2642,17 +2642,12 @@ class ExpertStore:
                     if _admit_ok:
                         datas = self.ram._read_many_pooled(blobs) if blobs else []
                     else:
-                        # Prefill borrows ~240 x 18.8MB per pass. Reading them through a
-                        # dedicated region (reserved out of the pool, reset per chunk) gets
-                        # the pinned 26GB/s without touching the cache's free list -- the
-                        # shared-pool variant fragmented it and decode fell to pageable
-                        # (1.20 -> 1.03 tok/s).
-                        _pp = self._get_prefill_pool()
-                        if _pp is not None and blobs:
-                            datas = self.ram._read_many_pooled(blobs, pool=_pp)
-                        else:
-                            datas = ([self.reader.read_blob(b) for b in blobs]
-                                     if blobs else [])
+                        # Prefill borrows ~240 x 18.8MB per pass. The dedicated-region
+                        # variant (reserved out of the pool, reset per chunk) is correct in
+                        # principle but the reserved region's DMA source raced the next
+                        # chunk's overwrite: tier 2's prefill logits came out EOS-leading.
+                        # Read through the bytearray reader until that ownership is fixed.
+                        datas = [self.reader.read_blob(b) for b in blobs] if blobs else []
                     self._disk_ms = getattr(self, "_disk_ms", 0.0) + (__import__("time").perf_counter() - _d0) * 1e3
                     for b, d in zip(blobs, datas):
                         if _admit_ok and d is not None:
