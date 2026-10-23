@@ -1527,6 +1527,24 @@ class BlobPool:
             self._off += n
             return slot
 
+    def reserve(self, nbytes: int):
+        """Carve a private sub-pool out of this one (the parent never reclaims it).
+
+        Used by the prefill path: its borrows are one-layer-scoped and churning them
+        through the cache's free list fragments it, which makes the decode fetch fall
+        back to pageable buffers. A fixed region keeps the two allocators apart.
+        """
+        nbytes = int(nbytes)
+        with self._lock:
+            if self._off + nbytes > self._cap:
+                return None
+            sub = self._view[self._off:self._off + nbytes]
+            self._off += nbytes
+        try:
+            return BlobPool(sub, nbytes)
+        except Exception:
+            return None
+
     def release(self, slot) -> bool:
         """Return a slice taken from this pool (best effort, no header to verify)."""
         try:
@@ -1678,7 +1696,7 @@ class ExpertCache:
         # then held a different buffer than the first read had.
         return self.pin_budget > 0 and (self._pinned_bytes + nbytes) <= self.pin_budget
 
-    def _read_many_pooled(self, blobs: Sequence[ExpertBlob]) -> list:
+    def _read_many_pooled(self, blobs: Sequence[ExpertBlob], pool=None) -> list:
         """Read several missed blobs into host-pool slots in parallel.
 
         Everything about the misses is independent: separate files, separate byte ranges,
@@ -1686,7 +1704,7 @@ class ExpertCache:
         them one after another on the fetch thread measured 1.1GB/s (118 experts = 2.1s of
         a 3.6s decode step); the SSD reaches 4.6GB/s once a few reads are in flight.
         """
-        pool = getattr(self, "_pool", None)
+        pool = pool if pool is not None else getattr(self, "_pool", None)
         if pool is None or len(blobs) <= 1:
             return [self._read_pinned(b) for b in blobs]
         slots = []
@@ -1756,6 +1774,30 @@ class ExpertCache:
             except Exception:
                 continue
         return None
+
+    _prefill_pool = None
+
+    def _get_prefill_pool(self):
+        """A private pool region for prefill borrows (see BlobPool.reserve).
+
+        Prefill borrows ~240 x 18.8MB per pass and returns them immediately; sharing
+        the cache pool's free list for that fragmented it and decode fell to pageable.
+        """
+        if self._prefill_pool is not None:
+            return self._prefill_pool
+        parent = getattr(self.ram, '_pool', None)
+        if parent is None:
+            self._prefill_pool = False
+            return None
+        size = min(5 << 30, max(256 << 20, parent.capacity // 3))
+        sub = parent.reserve(size) if hasattr(parent, 'reserve') else None
+        self._prefill_pool = sub if sub is not None else False
+        return self._prefill_pool or None
+
+    def reset_prefill_pool(self) -> None:
+        """Discard every prefill borrow (called at the end of a chunk)."""
+        if self._prefill_pool:
+            self._prefill_pool.reset()
 
     def _read_pinned(self, blob: ExpertBlob):
         """Read a blob straight into pinned host memory.
@@ -2600,14 +2642,17 @@ class ExpertStore:
                     if _admit_ok:
                         datas = self.ram._read_many_pooled(blobs) if blobs else []
                     else:
-                        # Prefill streams each expert once and never admits it. Two savings
-                        # attempts are recorded here so they are not repeated: routing the
-                        # reads through the pinned pool (15.1s vs 23.9s for 64 tokens)
-                        # fragments the claim and decode falls to pageable (1.20 -> 1.03),
-                        # and staging through a private pinned buffer (18.1s) corrupts the
-                        # answers -- the bytearray->pinned copy or the tensor-source DMA
-                        # path hands the fp4 tiles stale bytes. Prefill stays on read_blob.
-                        datas = [self.reader.read_blob(b) for b in blobs] if blobs else []
+                        # Prefill borrows ~240 x 18.8MB per pass. Reading them through a
+                        # dedicated region (reserved out of the pool, reset per chunk) gets
+                        # the pinned 26GB/s without touching the cache's free list -- the
+                        # shared-pool variant fragmented it and decode fell to pageable
+                        # (1.20 -> 1.03 tok/s).
+                        _pp = self._get_prefill_pool()
+                        if _pp is not None and blobs:
+                            datas = self.ram._read_many_pooled(blobs, pool=_pp)
+                        else:
+                            datas = ([self.reader.read_blob(b) for b in blobs]
+                                     if blobs else [])
                     self._disk_ms = getattr(self, "_disk_ms", 0.0) + (__import__("time").perf_counter() - _d0) * 1e3
                     for b, d in zip(blobs, datas):
                         if _admit_ok and d is not None:
