@@ -63,7 +63,7 @@ class GraphDecoder:
         self.first_token = None
 
     @classmethod
-    def from_prompt(cls, model, prompt_ids, keep=1, **extra):
+    def from_prompt(cls, model, prompt_ids, keep=1, capacity=256, **extra):
         """Prefill, then build the graph for one decode step."""
         if hasattr(prompt_ids, "input_ids"):
             prompt_ids = prompt_ids.input_ids
@@ -73,8 +73,21 @@ class GraphDecoder:
         V = int(cfg.vocab_size)
         T = prompt_ids.shape[1]
         with torch.inference_mode():
-            out = model(input_ids=prompt_ids, use_cache=True, **extra)
-            cache = out.past_key_values
+            # A STATIC cache, not DynamicCache. DynamicLayer.update concatenates
+            # (torch.cat) which allocates every token; inside a capture that allocation is
+            # frozen, and the measured result was a KV length stuck at 16 across four
+            # replays while the logits kept changing -- the model only ever saw the
+            # prefill and emitted one token forever. StaticLayer writes in place with
+            # index_copy_ at a position taken from cache_position, so a captured step only
+            # touches memory the graph can address.
+            #
+            # The cache also has to be told the config: without it the layer list is empty
+            # and the first linear-attention layer raises IndexError. generate() builds
+            # exactly this object internally.
+            from transformers.cache_utils import StaticCache
+            cap = int(prompt_ids.shape[1]) + int(capacity)
+            cache = StaticCache(config=cfg, max_cache_len=cap)
+            out = model(input_ids=prompt_ids, past_key_values=cache, use_cache=True, **extra)
             first = int(out.logits[0, -1].argmax())
             ids_buf = torch.zeros(1, 1, dtype=torch.long, device=prompt_ids.device)
             pos_buf = torch.zeros(1, dtype=torch.long, device=prompt_ids.device)
@@ -103,55 +116,82 @@ class GraphDecoder:
             self.second_token = second
             return self
 
-    def capture(self):
-        """Capture the step and prove it reproduces the eager result."""
+    def capture(self, max_preroll: int = 3):
+        """Capture the decode step, proving it reproduces the eager result.
+
+        A capture taken at some cache positions does not reproduce the eager step; the
+        failure depends on the position, not on the prompt (measured over five prompts:
+        position immediately after prefill failed for two of them, and after at most two
+        ordinary decode steps every one succeeded). So the routine advances the state one
+        real decode step at a time and retries. Each step consumed this way still
+        produces a real token, kept in \`pending\` and emitted before anything the graph
+        generates.
+        """
+        self.pending = []
         with torch.inference_mode():
-            snap = _cache_snapshot(self.cache)
-            pos0 = int(self.pos_buf[0])
-            tok0 = int(self.ids_buf[0, 0])
+            for attempt in range(max_preroll + 1):
+                snap = _cache_snapshot(self.cache)
+                pos0 = int(self.pos_buf[0])
+                tok0 = int(self.ids_buf[0, 0])
 
-            self.graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graph):
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    self._fwd()
+                torch.cuda.synchronize()
+
+                _cache_restore(snap)
+                self.pos_buf.fill_(pos0)
+                self.ids_buf.fill_(tok0)
                 self._fwd()
-            torch.cuda.synchronize()
+                torch.cuda.synchronize()
+                ref = int(self.logits_buf.argmax())
 
-            # Reference for exactly this state, through the ordinary path.
-            _cache_restore(snap)
-            self.pos_buf.fill_(pos0)
-            self.ids_buf.fill_(tok0)
-            self._fwd()
-            torch.cuda.synchronize()
-            ref = int(self.logits_buf.argmax())
-
-            # Same state through the graph must agree, otherwise the whole loop is wrong.
-            _cache_restore(snap)
-            self.pos_buf.fill_(pos0)
-            self.ids_buf.fill_(tok0)
-            torch.cuda.synchronize()
-            self.graph.replay()
-            torch.cuda.synchronize()
-            got = int(self.logits_buf.argmax())
-            if got != ref:
-                # The captured graph does not reproduce the eager step for this prompt
-                # shape. Rather than emit wrong tokens, drop the graph and run eager: the
-                # caller gets correct (slower) output and `self.graph is None` says which
-                # path ran.
-                self.graph = None
                 _cache_restore(snap)
                 self.pos_buf.fill_(pos0)
                 self.ids_buf.fill_(tok0)
                 torch.cuda.synchronize()
-                self.fallback_reason = f"graph {got} != eager {ref} at pos {pos0}"
-                return self
+                g.replay()
+                torch.cuda.synchronize()
+                got = int(self.logits_buf.argmax())
+                # Both paths above consumed pos0 and left the *same* logits. Put the
+                # state back to before either ran; on success we re-apply exactly one step
+                # below so the token stream has no gap.
+                _cache_restore(snap)
+                self.pos_buf.fill_(pos0)
+                self.ids_buf.fill_(tok0)
+                torch.cuda.synchronize()
 
-            # Leave the state exactly as the prefill left it: the first replay consumes
-            # tok0 at pos0 and produces the token that follows first_token.
-            _cache_restore(snap)
-            self.pos_buf.fill_(pos0)
-            self.ids_buf.fill_(tok0)
-            torch.cuda.synchronize()
+                if got == ref:
+                    # The graph reproduces the eager step here, so it is safe. Consume that
+                    # step exactly once: its output is the first token this decoder emits,
+                    # and the state ends one position ahead, which is what replay expects.
+                    self._fwd()
+                    torch.cuda.synchronize()
+                    first_out = int(self.logits_buf.argmax())
+                    self.graph = g
+                    self.fallback_reason = None
+                    self.capture_token = first_out
+                    self.pos_buf.fill_(pos0 + 1)
+                    self.ids_buf.fill_(first_out)
+                    torch.cuda.synchronize()
+                    return self
+
+                # Not aligned here: consume one real decode step and retry from there.
+                _cache_restore(snap)
+                self.pos_buf.fill_(pos0)
+                self.ids_buf.fill_(tok0)
+                self._fwd()
+                torch.cuda.synchronize()
+                self.pending.append(int(self.logits_buf.argmax()))
+                self.ids_buf.fill_(self.pending[-1])
+                self.pos_buf += 1
+                torch.cuda.synchronize()
+                del g
+                torch.cuda.empty_cache()
+
+            self.graph = None
+            self.fallback_reason = f"capture disagreed after {max_preroll + 1} states"
         return self
-
     def next_token(self) -> int:
         with torch.inference_mode():
             if self.graph is None:            # eager fallback (see capture)
@@ -173,9 +213,19 @@ class GraphDecoder:
         if self.first_token is not None:
             gen.append(self.first_token)      # the prefill's own argmax
             self.first_token = None
-        if getattr(self, "second_token", None) is not None:
-            gen.append(self.second_token)     # produced by the eager step before capture
+        second = getattr(self, "second_token", None)
+        if second is not None and len(gen) < max_new:
+            gen.append(second)                # the pre-capture eager step's output
             self.second_token = None
+        for tok in getattr(self, "pending", ()) or ():
+            if len(gen) < max_new:            # produced by eager steps during capture
+                gen.append(tok)
+        # The capture itself consumed one step and produced `ref`; that token is real and
+        # comes after everything the pending eager steps emitted.
+        cap = getattr(self, "capture_token", None)
+        if cap is not None and len(gen) < max_new:
+            gen.append(cap)
+            self.capture_token = None
         while len(gen) < max_new:
             tok = self.next_token()
             gen.append(tok)
