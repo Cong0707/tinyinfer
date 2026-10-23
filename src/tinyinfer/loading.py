@@ -2412,6 +2412,36 @@ def _async_h2d(dst, src, nbytes: int) -> bool:
         return False
 
 
+# Reusable staging buffers for expert blobs on the device. Every decode step renders
+# 240 experts (40 layers x top-6) and each one used to allocate a fresh 18.8MB tensor,
+# only to drop it as soon as the layer's GEMV had been launched: 240 allocations and 240
+# sets of six views per step, none of which were reused. A ring of these is enough
+# because the DMA and the kernels that read it all run on the same stream, so a slot can
+# be rewritten as soon as the previous layer's launches have been queued. A deeper ring
+# would only cost VRAM this card does not have.
+_BLOB_RING = 8
+_blob_pool: dict[tuple, tuple] = {}
+_blob_next = [0]
+
+
+def _blob_stage(nbytes: int, device) -> "torch.Tensor | None":
+    import torch
+
+    if not torch.cuda.is_available() or str(device).startswith("cpu"):
+        return None
+    key = (str(device), int(nbytes))
+    pool = _blob_pool.get(key)
+    if pool is None:
+        if len(_blob_pool) > 8:
+            _blob_pool.clear()
+        pool = _blob_pool[key] = (
+            torch.empty((_BLOB_RING, nbytes), dtype=torch.uint8, device=device), nbytes)
+    bufs, size = pool
+    i = _blob_next[0]
+    _blob_next[0] = (i + 1) % _BLOB_RING
+    return bufs[i]
+
+
 class ExpertRecord:
     """One materialized expert; tensor(name) returns a zero-copy view."""
 
@@ -2465,12 +2495,16 @@ class ExpertRecord:
         if torch.is_tensor(self.buffer):
             buf = self.buffer
             nbytes = int(buf.numel())
-            dev = torch.empty(nbytes, dtype=torch.uint8, device=device)
+            dev = _blob_stage(nbytes, device)
+            if dev is None:
+                dev = torch.empty(nbytes, dtype=torch.uint8, device=device)
             if not _async_h2d(dev, buf, nbytes):
                 dev.copy_(buf, non_blocking=True)
             return view_of(dev)
         nbytes = len(self.buffer)
-        dev = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        dev = _blob_stage(nbytes, device)
+        if dev is None:
+            dev = torch.empty(nbytes, dtype=torch.uint8, device=device)
         if not _async_h2d(dev, self.buffer, nbytes):
             dev.copy_(torch.frombuffer(self.buffer, dtype=torch.uint8), non_blocking=True)
         return view_of(dev)
