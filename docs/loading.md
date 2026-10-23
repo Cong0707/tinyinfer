@@ -38,7 +38,7 @@ eng = Engine.from_hf("E:/Models/DeepSeek-V4.1-Flash-1017", device="cuda", tokeni
 → 本地 hub `models--*/snapshots/*` 兜底；找不到时报清晰 FileNotFoundError（不联网）。
 engine 侧 `open_adapter` 对 `deepseek_v41` 架构自动挂 HFDeepSeekV41Adapter，其余架构需注册。
 
-end-to-end 验证脚本：`scripts/e2e_models.py <model_dir> [n_tokens]`。
+end-to-end 验证脚本：`scripts/check.ps1 <model_dir> [n_tokens]`。
 
 ## 0.2 Engram 行读验证（2026-10-22）
 

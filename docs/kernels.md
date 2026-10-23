@@ -685,9 +685,9 @@ shape 各不相同，所以冷启动的 20-30s 几乎全是编译。编译产物
 
 | 脚本 | 覆盖 | 实测（一次性） |
 |---|---|---|
-| `scripts/warm_prefill.py` | decode M=1 + prefill M=8/16/32/64/128 | M=8 467s、M=16 122s、M=32 195s、M=64 278s |
-| `scripts/precompile.py` | prefill M=8..64 + decode + MTP stage 链 | 874s |
-| `scripts/precompile_long.py` | Engine.prefill_chunk=2048 的长上下文 chunk | 后台编译，供几百 K 上下文 |
+| `(已移出仓库；scripts/bench.py 的 warm_prefill 阶段覆盖同一测量)` | decode M=1 + prefill M=8/16/32/64/128 | M=8 467s、M=16 122s、M=32 195s、M=64 278s |
+| `(已移出仓库；首次 prefill 需要编译，见 scripts/build_native.ps1)` | prefill M=8..64 + decode + MTP stage 链 | 874s |
+| `(已移出仓库；长上下文首次 prefill 前需要预热)` | Engine.prefill_chunk=2048 的长上下文 chunk | 后台编译，供几百 K 上下文 |
 
 **部署**：把编译好的 `.tilelang` 缓存随镜像发布（或 bootstrap 跑一次），生产冷启动从
 分钟级降到秒级。**长上下文**首次 prefill 前必须先跑 `precompile_long.py`，否则第一个长
@@ -709,6 +709,6 @@ prompt 会卡在编译（实测 M=32 未预编译时 prefill 228s）。
 | `MTPBlock.forward_head` | `DFlash.sample_drafts` | post_norm → 主 head logits → markov_w1/w2 修正 → confidence（sigmoid）|
 
 实测（cache/weights 40 层）：
-- 全链跑通：`e2e_mtp.py` 输出 logits [1,5,129280] + confidence [0.263,0.084,0.034]。
-- 投机解码：`e2e_spec.py` draft_len=2 跑通但 **accept_rate=0%**、比常规 decode 慢——**draft 分布未对齐**，需按官方 dflash 数值逐项校验。当前投机默认不启用。
+- 全链跑通：`(已移出仓库)` 输出 logits [1,5,129280] + confidence [0.263,0.084,0.034]。
+- 投机解码：`(已移出仓库)` draft_len=2 跑通但 **accept_rate=0%**、比常规 decode 慢——**draft 分布未对齐**，需按官方 dflash 数值逐项校验。当前投机默认不启用。
 - VRAM：3 stage 权重常驻 + verify 会使峰值到 10.7GB（>8GB）；投机路径需要 stage 权重按需加载。
