@@ -252,7 +252,14 @@ class MLACompressedAttention:
                 from .nn import apply_rope as _apply_rope
                 from .official_kernel_ref import fp4_act_quant
                 if start_pos == 0:
-                    fr = self.freqs_cis[: s - s % self.ratio : self.ratio]
+                    # One row per latent group, and the number of groups comes from the
+                    # latent itself: a prompt chunk that is not a multiple of ``ratio``
+                    # (the last chunk of a 120-token prompt through chunk=8 is 5 tokens)
+                    # made the old ``s - s % ratio`` slice produce fewer rows than the
+                    # latent had groups, and apply_rope then failed with
+                    # "shape '[1, 5, 32]' is invalid for input of size 128".
+                    _groups = int(latent.size(1))
+                    fr = self.freqs_cis[:_groups * self.ratio : self.ratio]
                 else:
                     # one row per latent group: a group stands for the first token of its
                     # window, so group j rotates at position (start_group + j) * ratio.

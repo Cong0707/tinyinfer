@@ -2428,7 +2428,7 @@ def _async_h2d(dst, src, nbytes: int) -> bool:
 # because the DMA and the kernels that read it all run on the same stream, so a slot can
 # be rewritten as soon as the previous layer's launches have been queued. A deeper ring
 # would only cost VRAM this card does not have.
-_BLOB_RING = 8
+_BLOB_RING = 4
 _blob_pool: dict[tuple, tuple] = {}
 _blob_next = [0]
 
