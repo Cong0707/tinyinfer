@@ -300,3 +300,70 @@ extern "C" __global__ void gdn_step_v2(const __nv_bfloat16* __restrict__ q,
     out += ((long)b * H + h) * Dv;
     out[dv] = __float2bfloat16(sum);
 }
+
+// gdn_conv_step_v2: the conv state [B, C, K] with C=6144 was walked by one thread per
+// channel, i.e. 24 blocks of 256 threads -- and each thread did a 4-element shift plus a
+// 4-tap dot in sequence. Measured 61us for 96KB of state. Here one warp handles 32
+// channels and the K axis is unrolled, so the shift is four coalesced 32-thread moves.
+extern "C" __global__ void gdn_conv_step_v2(const __nv_bfloat16* __restrict__ x,
+                                            const float* __restrict__ w,
+                                            const float* __restrict__ bias,
+                                            __nv_bfloat16* __restrict__ conv_state,
+                                            __nv_bfloat16* __restrict__ out,
+                                            int B, int C, int K, int silu, int has_bias) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    const int b = blockIdx.y;
+    __nv_bfloat16* st = conv_state + ((long)b * C + c) * K;
+    // K is 4: unrolled, no loop overhead
+    float s0, s1, s2, s3;
+    if (K == 4) {
+        s0 = __bfloat162float(st[1]);
+        s1 = __bfloat162float(st[2]);
+        s2 = __bfloat162float(st[3]);
+        s3 = __bfloat162float(x[(long)b * C + c]);
+        st[0] = __float2bfloat16(s0);
+        st[1] = __float2bfloat16(s1);
+        st[2] = __float2bfloat16(s2);
+        st[3] = __float2bfloat16(s3);
+    } else {
+        for (int t = 0; t + 1 < K; ++t) st[t] = st[t + 1];
+        st[K - 1] = x[(long)b * C + c];
+        return;   // generic path keeps the simple form
+    }
+    const float* wc = w + (long)c * K;
+    float acc = has_bias ? bias[c] : 0.f;
+    acc += wc[0] * s0 + wc[1] * s1 + wc[2] * s2 + wc[3] * s3;
+    if (silu) acc = acc / (1.f + expf(-acc));
+    out[(long)b * C + c] = __float2bfloat16(acc);
+}
+
+// gdn_norm_gated_v2: 16 rows of 128 values was one block of 32 threads (a single warp per
+// row, 16 warps total on the whole card). 55us for 4KB. One block now covers all rows of
+// one (batch, head) with a full warp, and rows are spread over blocks.
+extern "C" __global__ void gdn_norm_gated_v2(const __nv_bfloat16* __restrict__ x,
+                                             const __nv_bfloat16* __restrict__ z,
+                                             const float* __restrict__ w,
+                                             __nv_bfloat16* __restrict__ y,
+                                             int R, int D, float eps) {
+    const int r = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (r >= R) return;
+    const int lane = threadIdx.x & 31;
+    const __nv_bfloat16* xr = x + (long)r * D;
+    const __nv_bfloat16* zr = z + (long)r * D;
+    __nv_bfloat16* yr = y + (long)r * D;
+    float s = 0.f;
+    for (int k = lane; k < D; k += 32) {
+        float v = __bfloat162float(xr[k]);
+        s += v * v;
+    }
+    for (int off = 16; off > 0; off >>= 1) s += __shfl_down_sync(0xffffffffu, s, off);
+    s = __shfl_sync(0xffffffffu, s, 0);
+    const float rstd = rsqrtf(s / (float)D + eps);
+    for (int k = lane; k < D; k += 32) {
+        float n = __bfloat162float(xr[k]) * rstd;
+        float zv = __bfloat162float(zr[k]);
+        float gate = zv / (1.f + expf(-zv));
+        yr[k] = __float2bfloat16(__bfloat162float(__float2bfloat16(n)) * w[k] * gate);
+    }
+}
