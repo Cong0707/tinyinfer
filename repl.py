@@ -106,6 +106,13 @@ def chat(messages, max_tokens: int = 2048, sampling: dict | None = None,
                     obj = json.loads(payload)
                 except json.JSONDecodeError:
                     continue
+                if obj.get("error"):
+                    # the server reports a failed generation as an error frame; without
+                    # this the REPL just printed nothing and looked like it hung
+                    err = obj["error"]
+                    msg = err.get("message") if isinstance(err, dict) else err
+                    print(f"[server error] {msg}")
+                    return ""
                 if obj.get("usage"):
                     usage = obj["usage"]
                 for choice in obj.get("choices") or []:
@@ -120,6 +127,14 @@ def chat(messages, max_tokens: int = 2048, sampling: dict | None = None,
                     sys.stdout.flush()
     except urllib.error.URLError as exc:
         print(f"\n[error] {exc} (is the server running? start.ps1 -Bg)")
+        return ""
+    if not parts:
+        # A stream that produced nothing is a failure, not an empty answer. The usual
+        # cause is a dead CUDA context on the server: after one request trips a
+        # device-side assert, the process keeps answering 200 while every generation
+        # fails, so the client has to say so instead of printing a blank line.
+        print("\n[no output] the server returned no tokens; check serve.err.log "
+              "(a CUDA error there means the server must be restarted)")
         return ""
     elapsed = time.perf_counter() - started
     first = first or 0.0
