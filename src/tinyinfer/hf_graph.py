@@ -173,6 +173,13 @@ class GraphDecoder:
                     self.capture_token = first_out
                     self.pos_buf.fill_(pos0 + 1)
                     self.ids_buf.fill_(first_out)
+                    # Keep the state the step started from, plus the token it read. A
+                    # later request rewinds to exactly this point and replays the step, so
+                    # it reproduces the same first token instead of skipping it, and no
+                    # second capture is needed (one costs ~137ms).
+                    self.ready_state = _cache_snapshot(self.cache)
+                    self.ready_pos = pos0 + 1
+                    self.ready_token = first_out
                     torch.cuda.synchronize()
                     return self
 
@@ -206,6 +213,69 @@ class GraphDecoder:
     @property
     def using_graph(self) -> bool:
         return self.graph is not None
+
+    def rewind(self) -> None:
+        """Put the cache back to the state the capture left it in, ready for replay.
+
+        A capture runs the step to prove the graph matches eager, so the cache ends one
+        token ahead with that token sampled. Replaying from there is correct once; a second
+        request must start from the same point, and re-running capture would cost ~137ms
+        per completion.
+        """
+        state = getattr(self, "ready_state", None)
+        if state is None:
+            return
+        with torch.inference_mode():
+            # ready_state is the cache *before* the step the capture consumed, paired with
+            # the token that step read. Restoring both and leaving pos at pre-step means the
+            # next replay executes that same step, so its output is produced rather than
+            # skipped -- which is what a fresh decoder emits via drain().
+            _cache_restore(state)
+            self.pos_buf.fill_(self.ready_pos)
+            self.ids_buf.fill_(self.ready_token)
+
+    def replay_step(self) -> None:
+        """Advance one step and leave the logits in logits_buf, without choosing a token.
+
+        next_token() argmaxes; a sampling backend has to see the distribution, so this
+        splits the step in two.
+        """
+        with torch.inference_mode():
+            if self.graph is None:
+                self._fwd()
+            else:
+                self.graph.replay()
+
+    def set_token(self, tok: int) -> None:
+        """Feed the token the caller sampled back in, and advance the position."""
+        self.ids_buf.fill_(int(tok))
+        self.pos_buf += 1
+
+    def drain(self) -> list[int]:
+        """Tokens produced while preparing the graph, in emission order.
+
+        Capturing consumes real decode steps (the pre-roll and the captured step itself),
+        and each produced a genuine token. They come before anything a replay yields, so
+        a streaming caller emits these first; the stream then has no gap and no repeat.
+        """
+        out: list[int] = []
+        first = getattr(self, "first_token", None)
+        if first is not None:
+            out.append(first)
+            self.first_token = None
+        second = getattr(self, "second_token", None)
+        if second is not None:
+            out.append(second)
+            self.second_token = None
+        for tok in getattr(self, "pending", ()) or ():
+            out.append(tok)
+        self.pending = []
+        cap = getattr(self, "capture_token", None)
+        if cap is not None:
+            out.append(cap)
+            self.capture_token = None
+        return out
+
 
     def generate(self, max_new=128, eos=None):
         gen = []

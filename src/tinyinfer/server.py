@@ -521,11 +521,26 @@ def resolve_tier(tier: str):
 
 
 def detect_adapter_kind(model_dir: str | Path | None) -> str:
-    """Best-effort checkpoint layout detection, without loading any weights."""
+    """Best-effort checkpoint layout detection, without loading any weights.
+
+    Both the layout and the architecture are decided here, from config.json, so the
+    runtime path is the engine's choice -- a client only ever names a model id.
+    """
     if model_dir is None:
         return "unknown"
     directory = Path(model_dir)
-    if (directory / "model.safetensors.index.json").is_file():
+    index = directory / "model.safetensors.index.json"
+    cfg_file = directory / "config.json"
+    if index.is_file():
+        if cfg_file.is_file():
+            try:
+                cfg = json.loads(cfg_file.read_text(encoding="utf-8"))
+            except Exception:
+                cfg = {}
+            mt = str(cfg.get("model_type")
+                     or (cfg.get("text_config") or {}).get("model_type") or "")
+            if mt.startswith("qwen3_5") or mt.startswith("qwen3.5"):
+                return "hf_qwen3_5"
         return "hf_deepseek_v41"
     if any(directory.glob("*.gguf")):
         return "gguf"
@@ -535,6 +550,8 @@ def detect_adapter_kind(model_dir: str | Path | None) -> str:
 def _adapter_support(adapter: str, model_dir: str | Path | None) -> tuple[bool, str | None]:
     kind = detect_adapter_kind(model_dir) if adapter in ("auto", "", None) else str(adapter)
     if kind == "hf_deepseek_v41":
+        return True, None
+    if kind == "hf_qwen3_5":
         return True, None
     if kind == "gguf":
         return False, "GGUF adapter is reserved (see tinyinfer.adapters.open_adapter)"
@@ -547,6 +564,250 @@ def _adapter_support(adapter: str, model_dir: str | Path | None) -> tuple[bool, 
 # tinyinfer backend (adapter-driven reference path)
 # ---------------------------------------------------------------------------
 
+
+class _Sampler:
+    """Greedy / temperature / top-p / top-k sampling over one logits row.
+
+    Kept device-side apart from the final choice: the row is 248320 wide for Qwen, so the
+    sort and the cumulative sum stay on the card and only the chosen id round-trips.
+    """
+
+    def __init__(self, params: SamplingParams, torch_module) -> None:
+        self.torch = torch_module
+        self.temperature = float(params.temperature or 0.0)
+        self.top_p = float(params.top_p or 1.0)
+        self.top_k = int(params.top_k or 0)
+        self.repetition_penalty = float(params.repetition_penalty or 1.0)
+        self.generator = None
+        if params.seed is not None:
+            self.generator = torch_module.Generator(device="cuda")
+            self.generator.manual_seed(int(params.seed))
+        self._seen: list[int] = []
+
+    def pick(self, logits: Any, generated: int) -> int:
+        torch = self.torch
+        row = logits[0]
+        if self.repetition_penalty != 1.0 and self._seen:
+            ids = torch.tensor(self._seen, dtype=torch.long, device=row.device).unique()
+            picked = row[ids]
+            row = row.clone()
+            row[ids] = torch.where(picked > 0, picked / self.repetition_penalty,
+                                   picked * self.repetition_penalty)
+        if self.temperature <= 0.0:
+            tok = int(row.argmax())
+            self._seen.append(tok)
+            return tok
+        scores = row.float() / self.temperature
+        if self.top_k > 0:
+            k = min(self.top_k, scores.numel())
+            thresh = torch.topk(scores, k).values[-1]
+            scores = torch.where(scores < thresh, float("-inf"), scores)
+        if 0.0 < self.top_p < 1.0:
+            ordered, order = torch.sort(scores, descending=True)
+            probs = torch.softmax(ordered, dim=-1)
+            cumulative = torch.cumsum(probs, dim=-1)
+            cut = cumulative - probs > self.top_p
+            ordered = torch.where(cut, float("-inf"), ordered)
+            scores = torch.full_like(scores, float("-inf")).scatter(0, order, ordered)
+        probs = torch.softmax(scores, dim=-1)
+        tok = int(torch.multinomial(probs, 1, generator=self.generator))
+        self._seen.append(tok)
+        return tok
+
+
+class QwenBackend(BaseBackend):
+    """Qwen3.5 through the engine: hybrid linear/full attention, driven by a CUDA graph.
+
+    The architecture is nothing like DeepSeek V4.1 (no MLA, no compressor, no engram, no
+    hyper-connections, no MoE), so it gets its own backend rather than a branch inside
+    TinyModelBackend. What it shares is the contract: the HTTP layer only sees
+    GenerationRequest in and TokenEvent out.
+
+    Layers 0..23 alternate GatedDeltaNet (18) with ordinary GQA attention (6). The
+    hand-written kernels in tinyinfer.gdn/native cover the delta rule, the depthwise conv
+    and the gated norm, because the reference kernels (causal_conv1d, flash-linear-
+    attention) cannot be built in this environment. Decode runs from a captured CUDA
+    graph over a static KV cache -- DynamicCache concatenates, and inside a capture that
+    allocation is frozen, which silently pins the KV length and makes the model repeat
+    one token forever.
+    """
+
+    def __init__(
+        self,
+        model_dir: str | Path,
+        *,
+        model_id: str | None = None,
+        max_context_tokens: int = 8192,
+    ) -> None:
+        self.model_dir = Path(model_dir)
+        self.model_id = model_id or self.model_dir.name
+        self.aliases: tuple[str, ...] = (self.model_id,)
+        self.max_context_tokens = int(max_context_tokens)
+        self._tok = None
+        self._model = None
+        self._torch = None
+        self._slots: dict[int, Any] = {}
+        self._graphs: dict[int, Any] = {}
+        self._prep: dict[int, list[int]] = {}
+        self._lock = threading.Lock()
+        self.ready = False
+
+    # -- lifecycle -----------------------------------------------------
+    def warmup(self) -> None:
+        import torch
+        import tinyinfer.torch_compat  # noqa: F401  (must precede transformers import)
+        from tinyinfer import gdn_patch, qwen_elt, qwen_norm
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        gdn_patch.install()
+        qwen_norm.install()
+        self._tok = AutoTokenizer.from_pretrained(str(self.model_dir),
+                                                  trust_remote_code=True)
+        self._model = AutoModelForCausalLM.from_pretrained(
+            str(self.model_dir), dtype=torch.bfloat16,
+            trust_remote_code=True).eval().to("cuda")
+        qwen_elt.install(self._model)
+        self._torch = torch
+        self.ready = True
+
+    def close(self) -> None:
+        self._slots.clear()
+        self._model = None
+        self._tok = None
+        self.ready = False
+
+    def reset_slot(self, slot_id: int) -> None:
+        with self._lock:
+            self._slots.pop(slot_id, None)
+
+    # -- prompt handling -----------------------------------------------
+    def render_prompt(self, request: GenerationRequest) -> str:
+        if request.prompt is not None:
+            return request.prompt
+        return self._render_messages(list(request.messages or []))
+
+    def _render_messages(self, messages: Sequence[dict[str, Any]]) -> str:
+        if self._tok is None:
+            return BaseBackend.format_messages(messages)
+        return self._tok.apply_chat_template(list(messages), tokenize=False,
+                                             add_generation_prompt=True)
+
+    def _encode(self, request: GenerationRequest):
+        if request.prompt is not None:
+            return self._tok(request.prompt, return_tensors="pt").input_ids
+        text = self._render_messages(list(request.messages or []))
+        return self._tok(text, return_tensors="pt").input_ids
+
+    def count_prompt_tokens(self, request: GenerationRequest) -> int:
+        if request.prompt_tokens is not None:
+            return int(request.prompt_tokens)
+        return int(self._encode(request).shape[1])
+
+    def count_tokens(self, text: str) -> int:
+        return len(self._tok(text).input_ids)
+
+    def context_limit(self, request: GenerationRequest | None = None) -> int:
+        return self.max_context_tokens
+
+    # -- generation -----------------------------------------------------
+    def generate(self, request: GenerationRequest) -> Iterator[TokenEvent]:
+        with self._torch.inference_mode():
+            yield from self._generate(request)
+
+    def _generate(self, request: GenerationRequest) -> Iterator[TokenEvent]:
+        from tinyinfer.hf_graph import GraphDecoder
+
+        torch = self._torch
+        params = request.sampling
+        ids = self._encode(request).to("cuda")
+        prompt_tokens = int(ids.shape[1])
+        budget = max(1, min(int(params.max_tokens),
+                            self.max_context_tokens - prompt_tokens))
+        eos = self._tok.eos_token_id
+        dec, fresh = self._decoder_for(request, ids)
+        sampler = _Sampler(params, torch)
+        produced = 0
+        text_buf: list[str] = []
+        stops = tuple(s for s in (params.stop or ()) if s)
+        with torch.inference_mode():
+            # tokens the decoder already produced while preparing the graph
+            # the prep tokens (emitted between prefill and the captured step) are the same
+            # for every request on this graph shape: _decoder_for recorded them once
+            for tok_id in self._prep.get(int(ids.shape[1]), ()):
+                piece = self._tok.decode([tok_id], skip_special_tokens=False)
+                text_buf.append(piece)
+                produced += 1
+                yield TokenEvent(text=piece, token_id=tok_id)
+                if any("".join(text_buf).endswith(s) for s in stops):
+                    yield TokenEvent(
+                        finish_reason="stop",
+                        usage=Usage.from_counts(prompt_tokens, produced))
+                    return
+                if produced >= budget:
+                    yield TokenEvent(
+                        finish_reason="length",
+                        usage=Usage.from_counts(prompt_tokens, produced))
+                    return
+            while produced < budget:
+                dec.replay_step()
+                tok_id = sampler.pick(dec.logits_buf, produced)
+                dec.set_token(tok_id)
+                piece = self._tok.decode([tok_id], skip_special_tokens=False)
+                text_buf.append(piece)
+                produced += 1
+                yield TokenEvent(text=piece, token_id=tok_id)
+                if eos is not None and tok_id == eos:
+                    yield TokenEvent(
+                        finish_reason="stop",
+                        usage=Usage.from_counts(prompt_tokens, produced))
+                    return
+                if any("".join(text_buf).endswith(s) for s in stops):
+                    yield TokenEvent(
+                        finish_reason="stop",
+                        usage=Usage.from_counts(prompt_tokens, produced))
+                    return
+        yield TokenEvent(
+            finish_reason="length",
+            usage=Usage.from_counts(prompt_tokens, produced))
+
+    # -- capture reuse -----------------------------------------------------
+    def _decoder_for(self, request, ids):
+        """A captured decoder for this prompt length.
+
+        A capture costs ~137ms (it runs the step several times to prove the replay matches
+        eager). Building one per request puts that on top of every completion, which is
+        where the 174 tok/s of the raw decode loop collapses to tens. The graph depends on
+        the cache *shape*, not its contents, so it is cached by prompt length; GraphDecoder
+        .rewind() puts the state back to what replay expects before each use.
+        """
+        from tinyinfer.hf_graph import GraphDecoder
+
+        length = int(ids.shape[1])
+        cached = self._graphs.get(length)
+        if cached is not None:
+            # the prep tokens belong to the prompt, not to whichever request happened to
+            # trigger the capture: they are what the model emits right after prefill
+            self._prep.setdefault(length, getattr(cached, "prep_tokens", []))
+            # rewind to the exact state replay expects: the capture advanced the cache by
+            # one step, and this decoder has been replayed since
+            cached.rewind()
+            return cached, False
+        dec = GraphDecoder.from_prompt(self._model, ids).capture()
+        if dec.using_graph:
+            dec.prep_tokens = dec.drain()
+            self._graphs[length] = dec
+            self._prep[length] = dec.prep_tokens
+            return dec, True
+        return dec, True
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "backend": "QwenBackend",
+            "model": self.model_id,
+            "model_dir": str(self.model_dir),
+            "ready": self.ready,
+            "context_limit": self.max_context_tokens,
+        }
 
 class TinyModelBackend(BaseBackend):
     """Backend that drives tinyinfer.model.TinyModel through an adapter.
@@ -1767,6 +2028,13 @@ def build_backend(
             if spec.adapter in ("auto", "", None)
             else spec.adapter
         )
+        if hint == "hf_qwen3_5":
+            # Decided here, from the checkpoint: a client names a model id, the engine
+            # picks the runtime path.
+            return QwenBackend(
+                spec.model_dir,
+                model_id=spec.model_id or Path(spec.model_dir).name,
+            )
         supported, note = _adapter_support(hint, spec.model_dir)
 
         def factory(spec: ModelSpec = spec, device: str = device):

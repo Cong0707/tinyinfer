@@ -73,12 +73,18 @@ class TinyConfig:
     scale_fmt: str = "ue8m0"
     rms_norm_eps: float = 1e-20
     tie_word_embeddings: bool = False
+    # architecture family; selects the adapter in tinyinfer.adapters.open_adapter().
+    # Empty means "deepseek_v41", which is what every earlier checkpoint was.
+    family: str = ""
 
     @classmethod
     def from_hf(cls, model_dir: str | Path) -> "TinyConfig":
         cfg = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
         tc = cfg.get("text_config", cfg)
         qc = cfg.get("quantization_config", {})
+        mt = str(cfg.get("model_type") or tc.get("model_type") or "")
+        if mt.startswith("qwen3_5") or mt.startswith("qwen3.5"):
+            return cls._from_hf_qwen(cfg, tc)
         vc = cfg.get("vision_config", {})
         rs = tc.get("rope_scaling") or None
         return cls(
@@ -142,9 +148,85 @@ class TinyConfig:
             tie_word_embeddings=bool(tc.get("tie_word_embeddings", False)),
         )
 
+    @classmethod
+    def _from_hf_qwen(cls, cfg: dict, tc: dict) -> "TinyConfig":
+        """Qwen3.5: hybrid linear-attention (GatedDeltaNet) + full attention, MoE-free.
+
+        The DeepSeek-only fields keep their defaults; nothing reads them on this path.
+        layer_types is the one field the runtime needs that DeepSeek has no analogue for:
+        it decides whether a layer is a delta-rule layer or a KV-cache layer.
+        """
+        def gi(d, k, default=0):
+            return int(d.get(k, default) or 0)
+
+        rope = tc.get("rope_parameters") or {}
+        return cls(
+            vocab_size=int(tc["vocab_size"]),
+            dim=int(tc["hidden_size"]),
+            moe_inter_dim=int(tc.get("intermediate_size", 0)),
+            n_layers=int(tc["num_hidden_layers"]),
+            n_heads=int(tc["num_attention_heads"]),
+            head_dim=int(tc.get("head_dim", 0)),
+            q_lora_rank=0,
+            o_lora_rank=0,
+            o_groups=gi(tc, "num_key_value_heads"),
+            qk_rope_head_dim=int(
+                int(tc.get("head_dim", 0)) * float(rope.get("partial_rotary_factor", 1.0)))
+            if tc.get("head_dim") else 0,
+            rope_theta=float(rope.get("rope_theta", tc.get("rope_theta", 10000.0))),
+            rope_scaling=tc.get("rope_scaling") or None,
+            max_position_embeddings=int(tc.get("max_position_embeddings", 32768)),
+            compress_ratios=(),
+            compress_rope_theta=float(rope.get("rope_theta", 10000.0)),
+            sliding_window=gi(tc, "sliding_window"),
+            kv_source_layer_ids=(),
+            index_source_layer_ids=(),
+            index_n_heads=0,
+            index_head_dim=0,
+            index_topk=0,
+            candidate_source_layer_id=-1,
+            candidate_topk_blocks=0,
+            candidate_block_size=0,
+            n_routed_experts=0,
+            n_shared_experts=0,
+            n_activated_experts=0,
+            scoring_func="softmax",
+            norm_topk_prob=False,
+            route_scale=1.0,
+            swiglu_limit=0.0,
+            hc_mult=1,
+            hc_sinkhorn_iters=0,
+            hc_eps=0.0,
+            engram_layer_ids=(),
+            engram_num_embeddings=(),
+            engram_max_ngram_size=0,
+            engram_vocab_size=0,
+            engram_n_heads=0,
+            engram_head_dim=0,
+            engram_pad_id=0,
+            engram_compressed_vocab_size=0,
+            n_mtp_layers=gi(tc, "num_nextn_predict_layers"),
+            dspark_block_size=0,
+            dspark_target_layer_ids=(),
+            dspark_noise_token_id=0,
+            dspark_markov_rank=0,
+            dspark_n_routed_experts=0,
+            dspark_n_activated_experts=0,
+            vision_enabled=False,
+            vision_cfg={},
+            image_token_id=gi(cfg, "image_token_id"),
+            dtype=str(cfg.get("dtype", "bfloat16")),
+            expert_dtype="bf16",
+            weight_block_size=(0, 0),
+            scale_fmt="",
+            rms_norm_eps=float(tc.get("rms_norm_eps", 1e-6)),
+            tie_word_embeddings=bool(tc.get("tie_word_embeddings", False)),
+            family="qwen3_5",
+        )
+
     def arch_family(self) -> str:
         """Architecture family used by tinyinfer.adapters.open_adapter()."""
-        return "deepseek_v41"
+        return self.family or "deepseek_v41"
 
     def summary(self) -> str:
         return (

@@ -69,7 +69,7 @@ def _post(messages, max_tokens: int, temperature: float, session_id: str | None 
     return urllib.request.urlopen(req, timeout=900)
 
 
-def chat(messages, max_tokens: int = 64, temperature: float = 1.0,
+def chat(messages, max_tokens: int = 64, temperature: float = 0.0,
          session_id: str | None = None) -> str:
     """Stream one completion to stdout, print the counters, return the text."""
     started = time.perf_counter()
@@ -126,7 +126,24 @@ def main() -> int:
             stream.reconfigure(encoding="utf-8")
         except Exception:
             pass
-    one_shot = " ".join(sys.argv[1:]).strip()
+    argv = sys.argv[1:]
+    temperature = 0.0
+    max_tokens = 64
+    rest: list[str] = []
+    i = 0
+    while i < len(argv):
+        if argv[i] in ("-t", "--temperature") and i + 1 < len(argv):
+            temperature = float(argv[i + 1]); i += 2; continue
+        if argv[i] in ("-n", "--max-tokens") and i + 1 < len(argv):
+            max_tokens = int(argv[i + 1]); i += 2; continue
+        if argv[i] in ("-h", "--help"):
+            print(__doc__.strip())
+            print()
+            print("  -t, --temperature F   sampling temperature (default 0 = greedy)")
+            print("  -n, --max-tokens N    cap on generated tokens (default 64)")
+            return 0
+        rest.append(argv[i]); i += 1
+    one_shot = " ".join(rest).strip()
     messages: list[dict[str, str]] = []
     # interactive mode: the session is keyed by the FIRST user message, so quitting and
     # restarting the REPL, then asking the same opening question, resumes that
@@ -135,7 +152,8 @@ def main() -> int:
     if one_shot:
         # same question -> same session -> the server resumes its KV from .kvcache
         sid = session_for(hashlib.sha1(one_shot.encode("utf-8")).hexdigest())
-        chat([{"role": "user", "content": one_shot}], session_id=sid)
+        chat([{"role": "user", "content": one_shot}], max_tokens=max_tokens,
+             temperature=temperature, session_id=sid)
         return 0
     while True:
         try:
@@ -151,7 +169,8 @@ def main() -> int:
         if session is None:
             session = session_for("interactive:" + hashlib.sha1(user.encode("utf-8")).hexdigest())
         messages.append({"role": "user", "content": user})
-        reply = chat(messages, session_id=session)
+        reply = chat(messages, max_tokens=max_tokens,
+                    temperature=temperature, session_id=session)
         if reply:
             messages.append({"role": "assistant", "content": reply})
 
