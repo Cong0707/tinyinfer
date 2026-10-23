@@ -208,7 +208,8 @@ def _kern(name: str):
 
 def _launch(fn, grid, block, args):
     from . import native
-    native.launch(fn, grid, block, args, 0)
+    # no explicit stream: use torch's current one so graph capture sees the kernel
+    native.launch(fn, grid, block, args)
 
 
 class HCBlockMixin:

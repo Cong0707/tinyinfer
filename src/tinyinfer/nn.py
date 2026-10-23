@@ -43,7 +43,7 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
             wf = weight.float().contiguous()
             y = torch.empty((rows, d), dtype=torch.bfloat16, device=x.device)
             native.launch(native.kernel("rms_norm", "rms_norm_kernel"), (rows,), (32,),
-                          [xc, wf, y, rows, d, float(eps)], 0)
+                          [xc, wf, y, rows, d, float(eps)])
             return y.view(*shape)
         except Exception:
             pass

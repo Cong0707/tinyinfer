@@ -88,8 +88,15 @@ def available(name: str, func: str | None = None) -> bool:
         return False
 
 
-def launch(fn: int, grid, block, args, stream: int = 0, shared: int = 0) -> None:
-    """Launch fn with python args (tensors -> data_ptr, int -> int32, float -> float32)."""
+def launch(fn: int, grid, block, args, stream=None, shared: int = 0) -> None:
+    """Launch fn with python args (tensors -> data_ptr, int -> int32, float -> float32).
+
+    The stream defaults to torch's CURRENT stream rather than 0. Legacy stream 0 is not
+    captured by torch.cuda.graph_capture, so a kernel launched there executes for real
+    during capture and is absent from every replay -- the graph comes out empty and the
+    recurrent state it was supposed to advance stays frozen (observed as NaN logits on
+    the second replay of Qwen3.5's GatedDeltaNet).
+    """
     import torch
 
     if stream is None:
