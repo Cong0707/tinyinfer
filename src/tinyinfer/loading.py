@@ -1965,6 +1965,15 @@ class ExpertCache:
         with self._lock:
             return (layer, expert) in self._entries
 
+    def contains_many(self, layer: int, experts) -> dict:
+        """Which of these experts are cached, under one acquisition of the lock.
+
+        A decode layer asks about six experts and each check took the lock separately,
+        on the same path as the routing sync that the layer is already waiting on.
+        """
+        with self._lock:
+            return {int(e): (layer, int(e)) in self._entries for e in experts}
+
     def admit(self, layer: int, expert: int, data: bytearray) -> bytearray:
         """Insert a pre-read expert (locked insert only; the disk read happened outside).
 
@@ -2716,7 +2725,8 @@ class ExpertStore:
         if len(experts) > 1:
             # single-expert fetches go to the bytearray reader; the pinned path costs
             # an 18.8MB cudaHostAlloc per blob and measured 2x slower for that case
-            misses = [e for e in experts if not self.ram.contains(layer, e)]
+            _have = self.ram.contains_many(layer, experts)
+            misses = [e for e in experts if not _have.get(e)]
             if __import__("os").environ.get("TI_CACHE_TRACE") == "1" and layer == 0:
                 print(f"[fetch] layer0 experts={experts} misses={misses}", flush=True)
             if misses:
