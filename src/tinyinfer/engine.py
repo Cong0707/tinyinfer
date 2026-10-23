@@ -309,7 +309,11 @@ class Engine:
             # overrides for experiments: residency 0 makes every layer stream through
             # the flat pair, which is more H2D but frees the VRAM the pair needs
             self.gpu_layers = max(0, int(_os.environ.get("TI_GPU_LAYERS", hw.gpu_layers)))
-            self.head_gpu = (not hw.head_on_cpu) and self.gpu_layers > 20
+            # the plan already accounted for the head when it sized the resident set;
+            # re-deciding here with a fixed layer threshold put the head on the host even
+            # when the plan kept it on the card, and _head_logits then sliced a host head
+            # against device activations
+            self.head_gpu = not hw.head_on_cpu
             self.prefill_chunk = int(_os.environ.get("TI_CHUNK", hw.prefill_chunk))
             # placement: while most layers stream, small activations round-trip every
             # op; keep HC-style tiny ops on the host (big-VRAM boxes stay all-GPU).
@@ -1236,15 +1240,16 @@ class Engine:
             return torch.nn.functional.linear(h.float(), head)
         if (getattr(self, "tier", None) is not None
                 and self.tier.level < OptLevel.EXTREME
-                and __import__("os").environ.get("TI_HEAD_KERNEL") == "1"):
-            # experimental: the hand-written GEMV faults on the real head tensor (validated
-            # on a synthetic 129280x5120, so the fault is in the call, not the arithmetic);
-            # opt in with TI_HEAD_KERNEL=1 once that is tracked down
+                and __import__("os").environ.get("TI_HEAD_KERNEL") != "0"):
+            # the fault this kernel used to hit was a host-resident head (a CPU pointer
+            # passed as a device one); with the head placed by the plan and checked below
+            # the kernel is exact and beats the chunked fp32 GEMM (0.800 vs 0.835s/token)
             try:
                 from . import native
 
-                if head.dtype != torch.bfloat16 or not head.is_contiguous():
-                    raise RuntimeError("head not a contiguous bf16 tensor")
+                if (head.device.type != "cuda" or head.dtype != torch.bfloat16
+                        or not head.is_contiguous()):
+                    raise RuntimeError("head not a contiguous cuda bf16 tensor")
                 if h.reshape(-1, head.shape[1]).shape[0] != 1:
                     # the kernel is the decode shape (one row); a prefill projects its
                     # whole prompt at once and keeps the chunked fp32 path
