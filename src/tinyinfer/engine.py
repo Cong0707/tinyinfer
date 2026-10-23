@@ -243,7 +243,16 @@ class Engine:
                     # remaining layers pay 30 per-tensor copy_ calls per token.
                     # Measured at the decode step: 12GB cache + slab 30/30 = 1.58 tok/s,
                     # 16GB cache + slab 10/30 = 1.61 tok/s. Cache wins by a hair.
-                    _pool_avail = min(_pool_avail, 16 << 30)
+                    # Cache vs slab: they share the pinned pool and are built in this
+                    # order, so whatever the cache claims here is unavailable to the slab
+                    # below. The slab is worth more per GB -- a slab layer replaces its
+                    # 178MB of per-tensor H2D every token, while a cache slot only avoids
+                    # a read when the same expert is reused. Measured: 16GB cache leaves
+                    # the slab 8 of 30 layers and decode sits at 519ms/step with 88% hit;
+                    # 12GB lets the slab cover every streamed layer. TI_CACHE_CAP_GB
+                    # exposes the split.
+                    _cap_gb = float(__import__("os").environ.get("TI_CACHE_CAP_GB", "16"))
+                    _pool_avail = min(_pool_avail, int(_cap_gb * (1 << 30)))
                     _cache_bytes = min(_ov_bytes, _pool_avail) if _ov_bytes else _pool_avail
                     _slot = self.host_pool.alloc(_cache_bytes)
                     if _slot is not None:
@@ -956,7 +965,14 @@ class Engine:
         # layers on the slow per-tensor path. The invariant that matters is
         # weights(17GB) + slab + expert cache <= RAM - OS, and the planner already sized
         # the cache from the same budget, so the slab takes its share of the total.
-        _slab_cap = int(_hb.total * 0.28)
+        # The slab and the expert cache are carved from the same pinned pool, and at
+        # decode it is the cache that pays: a larger slab means more streamed layers get
+        # their weights pre-staged, while a larger cache means fewer 18.8MB expert reads
+        # per token. Measured steady-state decode (0.66 -> 0.75 hit rate takes the step
+        # from 574ms to 519ms), so the cache is worth more than the slab. TI_SLAB_FRAC
+        # lets the split be measured instead of argued.
+        _slab_frac = float(__import__("os").environ.get("TI_SLAB_FRAC", "0.28"))
+        _slab_cap = int(_hb.total * _slab_frac)
         if slab_total > _slab_cap:
             slab_total = _slab_cap
         host_slab = None
