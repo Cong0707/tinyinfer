@@ -69,7 +69,7 @@ def _post(messages, max_tokens: int, temperature: float, session_id: str | None 
     return urllib.request.urlopen(req, timeout=900)
 
 
-def chat(messages, max_tokens: int = 64, temperature: float = 0.0,
+def chat(messages, max_tokens: int = 64, temperature: float = 1.0,
          session_id: str | None = None) -> str:
     """Stream one completion to stdout, print the counters, return the text."""
     started = time.perf_counter()
@@ -128,7 +128,10 @@ def main() -> int:
             pass
     one_shot = " ".join(sys.argv[1:]).strip()
     messages: list[dict[str, str]] = []
-    session = session_for("interactive-" + uuid.uuid4().hex[:8])
+    # interactive mode: the session is keyed by the FIRST user message, so quitting and
+    # restarting the REPL, then asking the same opening question, resumes that
+    # conversation's KV instead of re-prefilling it
+    session: str | None = None
     if one_shot:
         # same question -> same session -> the server resumes its KV from .kvcache
         sid = session_for(hashlib.sha1(one_shot.encode("utf-8")).hexdigest())
@@ -145,6 +148,8 @@ def main() -> int:
             continue
         if user in ("/exit", "/quit"):
             return 0
+        if session is None:
+            session = session_for("interactive:" + hashlib.sha1(user.encode("utf-8")).hexdigest())
         messages.append({"role": "user", "content": user})
         reply = chat(messages, session_id=session)
         if reply:

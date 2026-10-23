@@ -1234,9 +1234,45 @@ class Engine:
         head = self.head
         if head.dtype == torch.float32:
             return torch.nn.functional.linear(h.float(), head)
-        # bf16 projection against the checkpoint's bf16 head directly: the old chunked
-        # fp32 copy moved 2.65GB through the allocator every token (and needed 336MB of
-        # temporary) to change the logits by ~1e-2 relative -- below sampling resolution
+        if (getattr(self, "tier", None) is not None
+                and self.tier.level < OptLevel.EXTREME
+                and __import__("os").environ.get("TI_HEAD_KERNEL") == "1"):
+            # experimental: the hand-written GEMV faults on the real head tensor (validated
+            # on a synthetic 129280x5120, so the fault is in the call, not the arithmetic);
+            # opt in with TI_HEAD_KERNEL=1 once that is tracked down
+            try:
+                from . import native
+
+                if head.dtype != torch.bfloat16 or not head.is_contiguous():
+                    raise RuntimeError("head not a contiguous bf16 tensor")
+                if h.reshape(-1, head.shape[1]).shape[0] != 1:
+                    # the kernel is the decode shape (one row); a prefill projects its
+                    # whole prompt at once and keeps the chunked fp32 path
+                    raise RuntimeError("multi-row projection")
+                hf = h.reshape(-1).float().contiguous()
+                out = torch.empty(head.shape[0], dtype=torch.float32, device=head.device)
+                if __import__("os").environ.get("TI_HEAD_DEBUG") == "1":
+                    print(f"[head] shape={tuple(head.shape)} dtype={head.dtype} "
+                          f"contig={head.is_contiguous()} dev={head.device} "
+                          f"stride={head.stride()} hshape={tuple(h.shape)}",
+                          flush=True)
+                fn = native.kernel("head_gemv", "head_gemv")
+                native.launch(fn, ((head.shape[0] + 7) // 8,), (256,),
+                              [hf, head, out, head.shape[0], head.shape[1]])
+                return out.view(*h.shape[:-1], head.shape[0])
+            except Exception as _exc:
+                if __import__("os").environ.get("TI_HEAD_DEBUG"):
+                    print(f"[head] kernel path unavailable: {_exc!r}", flush=True)
+            hf = h.float()
+            step = 32768
+            out = None
+            for start in range(0, head.shape[0], step):
+                chunk = torch.nn.functional.linear(hf, head[start:start + step].float())
+                if out is None:
+                    out = torch.empty(*chunk.shape[:-1], head.shape[0],
+                                      dtype=chunk.dtype, device=chunk.device)
+                out[..., start:start + step] = chunk
+            return out
         return torch.nn.functional.linear(h.to(head.dtype), head)
 
     def _forward_chunk(self, ids: torch.Tensor, start_pos: int):
