@@ -128,6 +128,10 @@ class Engine:
             self.hw_plan = None
         if self.hw_plan is not None:
             print(f"[tinyinfer] {self.hw_plan.reason}", flush=True)
+            # a model that keeps materialised layers needs its ceiling now, not on the
+            # first block() call: the plan already knows the host budget
+            if getattr(self.adapter, "family", "") == "qwen3_5":
+                self._size_qwen_cache()
             if not getattr(self.hw_plan, "fits", True) and self.device != "cpu":
                 # Refuse loudly instead of OOMing after the first prefill chunk. The
                 # streaming skeleton alone (ring + workspace + tables) does not fit.
@@ -609,6 +613,11 @@ class Engine:
             # Qwen layers need none of that. Keeping the branch here is what lets both
             # use the engine's streaming, residency and graph without a second engine.
             if getattr(self.adapter, "family", "") == "qwen3_5":
+                # Tell the adapter how many materialised layers this machine can keep.
+                # The plan already solved for the host budget; without this the adapter
+                # would either hold every layer (47GB for the 27B, more than the box has)
+                # or re-read each one from disk on every token.
+                self._size_qwen_cache()
                 b = self.adapter.build_block(layer_id, self.cfg)
                 # Do NOT keep it in self._blocks. A DeepSeek block is a stub whose weights
                 # are read per tensor from disk, so holding all 40 costs nothing; a Qwen
@@ -648,18 +657,43 @@ class Engine:
     def _layer_device(self, b: Block) -> str:
         return getattr(b, "_device", "cpu")
 
-    def ensure_layer(self, layer_id: int):
-        """Return the layer, made resident on this engine's device if the plan says so.
+    def _size_qwen_cache(self) -> None:
+        if getattr(self, "_qwen_cache_sized", False):
+            return
+        self._qwen_cache_sized = True
+        model = getattr(self.adapter, "model", None)
+        if model is None or not hasattr(model, "set_ram_budget"):
+            return
+        # the model knows its per-layer size from the checkpoint
+        n = int(getattr(model, "n_layers", 0) or 0)
+        per_layer = 0.0
+        try:
+            prof = model.per_layer_bytes()
+            per_layer = prof / (1 << 30)
+        except Exception:
+            per_layer = 0.0
+        if per_layer <= 0 or n <= 0:
+            return
+        # the host budget the plan left for caching: everything not pinned by the
+        # streaming ring and not needed for the KV/activation working set
+        budget = float(getattr(self.hw_plan, "cache_bytes", 0) or 0) / (1 << 30)
+        if budget <= 0:
+            # no plan (CPU machine): keep the default the adapter was built with
+            return
+        model.set_ram_budget(budget, per_layer)
 
-        This is the streaming seam for models whose layers are plain modules (Qwen):
-        resident layers stay on the card, everything else is moved in for its turn and
-        evicted after. A model never learns whether it was resident.
+    def ensure_layer(self, layer_id: int):
+        """Return the layer, positioned for this turn.
+
+        Resident layers live on the card. Everything else is brought in for its turn and
+        must be released afterwards (release_layer), so at most one streamed layer is on
+        the device at a time: a 27B layer is 737MB of weights but ~2.4GB of VRAM once its
+        slack and buffers are counted, and two of those do not fit in 6.9GB.
         """
         b = self.block(layer_id)
-        needs = self.device if layer_id < self.gpu_layers else "cpu"
-        cur = getattr(b, "device", getattr(b, "_device", "cpu"))
-        if cur != needs:
-            b.to(needs)
+        if layer_id < self.gpu_layers:
+            if getattr(b, "device", getattr(b, "_device", "cpu")) != self.device:
+                b.to(self.device)
         return b
 
     def release_layer(self, layer_id: int) -> None:

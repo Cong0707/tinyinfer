@@ -21,6 +21,25 @@ from typing import Any
 import torch
 
 
+class _LayerKv:
+    """One layer's KV view on whichever device that layer runs on."""
+
+    __slots__ = ("base", "layer_id", "device")
+
+    def __init__(self, base, layer_id: int, device: str):
+        self.base, self.layer_id, self.device = base, layer_id, device
+
+    def layer(self, layer_id: int):
+        return self.base.layer(layer_id)
+
+    def get_seq_length(self):
+        return self.base.get_seq_length()
+
+    def update(self, keys, values, layer_id, kwargs=None):
+        # the layer works on its own device; the cache stores where it is told to
+        return self.base.update(keys, values, layer_id, kwargs)
+
+
 class _LayerView:
     """One layer's slice of the cache, moved to the device the layer runs on."""
 
@@ -34,6 +53,15 @@ class _LayerView:
 
     def update(self, keys, values, layer_id, kwargs=None):
         return self.base.update(keys, values, layer_id, kwargs)
+
+
+def _layer_belongs(name: str) -> bool:
+    """True for a decoder-layer tensor, whatever the checkpoint's prefix is."""
+    parts = name.split(".")
+    for i, part in enumerate(parts):
+        if part == "layers" and i + 1 < len(parts) and parts[i + 1].isdigit():
+            return True
+    return False
 
 
 class QwenLayer:
@@ -191,7 +219,8 @@ class QwenModel:
         self._lock = threading.Lock()
         # how many layers may hold real weights at once; the engine sets this from what
         # the machine can actually keep (a 27B layer is 731MB of host memory)
-        self._cache_cap = 2
+        # how many materialised layers the host keeps; set from the plan's RAM budget
+        self._resident_layers = 0
         self._order: list[int] = []
 
     @classmethod
@@ -261,10 +290,68 @@ class QwenModel:
         # that buffer on every token (measured: 47 tok/s -> 2.6 tok/s).
         layer = self._layers.get(layer_id)
         if layer is None:
+            # Before building a new one, give room back: a materialised 27B layer holds
+            # 731MB of real weights, so the ceiling is what the host can actually keep.
+            # Evicting drops the module back to the meta device, and the next use re-reads
+            # it from the checkpoint -- which is why the ceiling matters more than the
+            # cache hit rate: 64 layers would need 47GB of RAM, and there is 30.
+            self._make_room()
             module = self._skeleton().model.language_model.layers[layer_id]
             prefix = f"model.language_model.layers.{layer_id}."
             layer = self._layers[layer_id] = QwenLayer(module, self.store, layer_id, prefix)
+        self._order.append(layer_id)
         return layer
+
+    def per_layer_bytes(self) -> int:
+        """Bytes one materialised layer holds, from the checkpoint's own tensors."""
+        cache = getattr(self, "_per_layer_bytes", None)
+        if cache is not None:
+            return cache
+        total = 0
+        headers: dict[str, dict] = {}
+        for name in self.store.weight_map:
+            if _layer_belongs(name):
+                shard = self.store.weight_map[name]
+                h = headers.get(shard)
+                if h is None:
+                    parsed = self.store._header(shard)
+                    h = parsed[0] if isinstance(parsed, tuple) else parsed
+                    headers[shard] = h
+                ent = h.get(name)
+                if ent is not None:
+                    total += ent["data_offsets"][1] - ent["data_offsets"][0]
+                if len(headers) > 2:
+                    headers.clear()
+        self._per_layer_bytes = total // max(1, self.n_layers)
+        return self._per_layer_bytes
+
+    def set_ram_budget(self, gb: float, per_layer_gb: float) -> None:
+        """How many materialised layers the host can hold, from a byte budget."""
+        if per_layer_gb <= 0:
+            self._resident_layers = 0
+            return
+        self._resident_layers = max(1, int(gb / per_layer_gb))
+
+    def _make_room(self) -> None:
+        cap = getattr(self, "_resident_layers", 0)
+        if not cap:
+            return
+        live = [i for i in dict.fromkeys(self._order) if getattr(
+            self._layers.get(i), "_loaded", False)]
+        while len(live) >= cap:
+            victim = live.pop(0)
+            layer = self._layers.pop(victim, None)
+            if layer is None:
+                continue
+            module = self._skeleton().model.language_model.layers[victim]
+            for name, child in list(module.named_children()):
+                try:
+                    child.to("meta")
+                except Exception:
+                    pass
+            layer._loaded = False
+            layer._stream_flat = None
+            layer._cpu_refs = None
 
     def _touch(self, layer_id: int) -> None:
         order = getattr(self, "_order", None)
@@ -450,23 +537,21 @@ class QwenModel:
         text_pos = self.text_positions(position)
         for i in range(self.n_layers):
             layer = engine.ensure_layer(i)
-            layer_dev = layer.device if hasattr(layer, "device") else "cuda"
-            # a streamed layer computes where the engine put it, so the activation
-            # follows it and comes back; a resident layer touches nothing
-            work = h if layer_dev == "cuda" else h.to(layer_dev)
-            pos_i = text_pos if layer_dev == "cuda" else text_pos.to(layer_dev)
-            rope_i = rope if layer_dev == "cuda" else tuple(
-                t.to(layer_dev) for t in rope)
-            # the KV slots also have to be where the layer is; a streamed layer on the
-            # host cannot read a device-resident cache
-            kv_i = kv if layer_dev == "cuda" else self._host_kv(kv, layer_dev)
-            mask = self.attention_mask(work, pos_i, cache=kv_i, layer_id=i)
+            dev = getattr(layer, "device", "cuda")
+            # A streamed layer runs on the host (it was never made resident), so the
+            # activation, the rotary table and this layer's KV slots follow it and come
+            # back. A resident layer touches nothing.
+            if dev == "cuda":
+                work, pos_i, rope_i, kv_i = h, text_pos, rope, kv
+            else:
+                work = h.to(dev)
+                pos_i = text_pos.to(dev)
+                rope_i = tuple(t.to(dev) for t in rope)
+                kv_i = _LayerKv(kv, i, dev)
             out = layer.forward(work, cache=kv_i, position=pos_i,
-                                position_embeddings=rope_i, attention_mask=mask)
+                                position_embeddings=rope_i, attention_mask=None)
             h = out[0] if isinstance(out, tuple) else out
-            if work is not h and h.device != work.device:
-                pass
-            if layer_dev != "cuda":
+            if dev != "cuda":
                 h = h.to(engine.device)
             engine.release_layer(i)
         return F.linear(self.final_norm(h[:, -1:]), engine.head)
