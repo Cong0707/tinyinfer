@@ -235,14 +235,15 @@ class Engine:
                     # capacity larger than the backing slab makes every take() fail and the
                     # read path silently falls back (measured: TI_CACHE_GB=14 with a 6GB
                     # slab -> 555 fallbacks, decode 1.1s -> 1.9s)
-                    # Hard ceiling on the host cache: the slab (5.3GB of streamed layer
-                    # weights) must still fit in the same claim. Without it the cache took
-                    # the whole pool (measured: used=28.00GB free=0.00GB) and the slab
-                    # silently fell back to per-tensor copies, which is +0.35s per token.
-                    # 13GB leaves the pool enough to build the full 30-layer slab (5.3GB);
-                    # at 14GB the slab came back partial (18/30) and the remaining layers
-                    # paid 30 per-tensor copy_ calls per token
-                    _pool_avail = min(_pool_avail, 12 << 30)
+                    # Hard ceiling on the host cache. Two costs trade here: a bigger cache
+                    # keeps decode off the SSD (40 layers x top-6 = 240 experts/token, so
+                    # a small claim spills and the direct reader showed ~180ms/token),
+                    # while a smaller one leaves the pool enough for the full 30-layer
+                    # slab (5.3GB) -- below that the slab comes back partial and the
+                    # remaining layers pay 30 per-tensor copy_ calls per token.
+                    # Measured at the decode step: 12GB cache + slab 30/30 = 1.58 tok/s,
+                    # 16GB cache + slab 10/30 = 1.61 tok/s. Cache wins by a hair.
+                    _pool_avail = min(_pool_avail, 16 << 30)
                     _cache_bytes = min(_ov_bytes, _pool_avail) if _ov_bytes else _pool_avail
                     _slot = self.host_pool.alloc(_cache_bytes)
                     if _slot is not None:
