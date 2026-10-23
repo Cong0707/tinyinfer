@@ -69,7 +69,7 @@ def _post(messages, max_tokens: int, temperature: float, session_id: str | None 
     return urllib.request.urlopen(req, timeout=900)
 
 
-def chat(messages, max_tokens: int = 2048, temperature: float = 0.0,
+def chat(messages, max_tokens: int = 2048, temperature: float = 1.0,
          session_id: str | None = None) -> str:
     """Stream one completion to stdout, print the counters, return the text."""
     started = time.perf_counter()
@@ -127,7 +127,7 @@ def main() -> int:
         except Exception:
             pass
     argv = sys.argv[1:]
-    temperature = 0.0
+    temperature = 1.0
     max_tokens = 2048
     rest: list[str] = []
     i = 0
@@ -139,7 +139,7 @@ def main() -> int:
         if argv[i] in ("-h", "--help"):
             print(__doc__.strip())
             print()
-            print("  -t, --temperature F   sampling temperature (default 0 = greedy)")
+            print("  -t, --temperature F   sampling temperature (default 1.0; 0 = greedy)")
             print("  -n, --max-tokens N    safety cap only; generation runs to EOS")
             return 0
         rest.append(argv[i]); i += 1
