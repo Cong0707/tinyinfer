@@ -1,9 +1,16 @@
-"""Synthetic tests for MLACompressedAttention (layer 2 topology)."""
+"""Synthetic tests for MLACompressedAttention (layer 2 topology).
+
+The attention backend compiles TileLang kernels on first use, which takes minutes and
+needs a real card; those cases are marked slow and run with --runslow.
+"""
 import sys
 from pathlib import Path
 
 import pytest
 import torch
+
+# these cases compile TileLang kernels on first use (minutes, gigabytes of compiler memory)
+pytestmark = pytest.mark.kernel
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))

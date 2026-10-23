@@ -10,8 +10,13 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL = Path("E:/Models/DeepSeek-V4.1-Flash-1017")
-pytestmark = pytest.mark.skipif(not (MODEL / "config.json").exists(),
-                                reason="checkpoint not present")
+# These build a real Engine from the 510GB checkpoint (tens of seconds, most of VRAM).
+# They are opt-in with --runslow so a routine gate never loads the model.
+pytestmark = [
+    pytest.mark.skipif(not (MODEL / "config.json").exists(),
+                        reason="checkpoint not present"),
+    pytest.mark.slow,
+]
 
 
 def _engine():

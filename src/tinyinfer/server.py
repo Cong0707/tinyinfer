@@ -1220,10 +1220,21 @@ class TinyModelBackend(BaseBackend):
             self._slot_prefix[key] = blob["prefix"]
         return blob.get("kv")
 
+    @staticmethod
+    def _slot_key(slot_id: int, session_id: str | None = None) -> str:
+        """The one place that decides how a slot is keyed.
+
+        _bind_slot and _stash_slot share a slot through this key, and they used to build
+        it differently -- an int in one, the string "slotN" in the other -- so a slot
+        never found the state it had just written. The string form is also the .kvcache
+        file name for requests that carry no session.
+        """
+        return session_id if session_id else f"slot{slot_id}"
+
     def _bind_slot(self, slot_id: int, session_id: str | None = None) -> None:
         if self._model is None:
             return
-        key = session_id or slot_id
+        key = self._slot_key(slot_id, session_id)
         state = self._slot_kv.get(key)
         if state is None:
             state = self._load_slot_disk(slot_id, session_id)
@@ -1252,7 +1263,7 @@ class TinyModelBackend(BaseBackend):
     def _stash_slot(self, slot_id: int, session_id: str | None = None) -> None:
         if self._model is None:
             return
-        key = session_id or f"slot{slot_id}"
+        key = self._slot_key(slot_id, session_id)
         t = self._torch
 
         def to_host(v):
@@ -1291,7 +1302,8 @@ class TinyModelBackend(BaseBackend):
     def reset_slot(self, slot_id: int) -> None:
         """Drop the KV snapshot and bounded expert cache for one slot."""
         with self._gen_lock:
-            self._slot_kv.pop(slot_id, None)
+            # same key as _bind_slot/_stash_slot, otherwise the entry survives the reset
+            self._slot_kv.pop(self._slot_key(slot_id), None)
             if self._model is not None:
                 self._model.reset()
                 self._trim_expert_cache()

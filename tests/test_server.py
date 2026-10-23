@@ -903,6 +903,9 @@ def test_multi_model_endpoint_and_routing():
 
 def test_tiny_slot_kv_ownership():
     class FakeEngine:
+        # _bind_slot moves restored tensors to self._model.device
+        device = "cpu"
+
         def __init__(self):
             self.kv = {}
             self.resets = 0
@@ -921,15 +924,27 @@ def test_tiny_slot_kv_ownership():
     engine = FakeEngine()
     backend._model = engine
     backend._cfg = SimpleNamespace(max_position_embeddings=128)
+    # the slot helpers first look for .kvcache/slot3.pt on disk, so a machine that has
+    # served a real request would make this test depend on leftover local state
+    for leftover in (backend._kv_path("slot3"), backend._kv_path("slot4")):
+        leftover.unlink(missing_ok=True)
+    # warmup() is what normally binds the torch module; the slot helpers call
+    # self._torch.is_tensor when moving tensors, so a stub needs it too
+    import torch as _torch
+    backend._torch = _torch
     sentinel_three = object()
     sentinel_four = object()
+
+    # the slot map is keyed by session id, which falls back to the string "slot<N>" for
+    # requests that carry no session -- the same key the on-disk .kvcache file uses
+    k3, k4 = "slot3", "slot4"
 
     backend._bind_slot(3)
     assert engine.kv == {} and engine.resets == 1
     engine.kv[0] = sentinel_three
     backend._stash_slot(3)
-    assert backend._slot_kv[3][0] is sentinel_three
-    assert 4 not in backend._slot_kv
+    assert backend._slot_kv[k3][0] is sentinel_three
+    assert k4 not in backend._slot_kv
 
     backend._bind_slot(4)
     assert engine.kv == {}
@@ -940,9 +955,9 @@ def test_tiny_slot_kv_ownership():
     assert engine.kv[0] is sentinel_three
 
     backend.reset_slot(3)
-    assert 3 not in backend._slot_kv
+    assert k3 not in backend._slot_kv
     assert engine.kv == {}
-    assert backend._slot_kv[4][0] is sentinel_four
+    assert backend._slot_kv[k4][0] is sentinel_four
 
 
 # ---------------------------------------------------------------------------
