@@ -42,8 +42,8 @@ def step(q, k, v, g, beta, state, l2norm=True):
         fn = native.kernel("gdn", "gdn_step_f")
         qc, kc, vc = qc.float(), kc.float(), vc.float()
     native.launch(fn, (B * H,), (128,), [qc, kc, vc, gc, bc, state, out, B, H, Dk, Dv,
-                                       1 if l2norm else 0], 0,
-                  shared=256 * 4)
+                                       1 if l2norm else 0],
+                  shared=max(256, Dv) * 4)
     return out
 
 
@@ -63,7 +63,7 @@ def conv_step(x, w, bias, conv_state, silu=True):
     fn = native.kernel("gdn", "gdn_conv_step_bf" if bf_state else "gdn_conv_step_f")
     native.launch(fn, ((B * C + 255) // 256,), (256,),
                   [xc if bf_state else xc.float(), wc, bc, conv_state, out,
-                   B, C, K, 1 if silu else 0, 0 if bias is None else 1], 0)
+                   B, C, K, 1 if silu else 0, 0 if bias is None else 1])
     return out
 
 
@@ -79,5 +79,5 @@ def norm_gated(x, z, w, eps=1e-6):
     wf = w.float().contiguous()
     y = torch.empty((R, D), dtype=torch.bfloat16, device=x.device)
     native.launch(native.kernel("gdn", "gdn_norm_gated_bf"), (R,), (32,),
-                  [xc, zc, wf, y, R, D, float(eps)], 0)
+                  [xc, zc, wf, y, R, D, float(eps)])
     return y.view(*shape)
