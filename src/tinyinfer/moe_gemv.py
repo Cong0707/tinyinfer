@@ -77,14 +77,19 @@ def _ptrs(tensors) -> torch.Tensor:
     """
     dev = tensors[0].device
     n = len(tensors)
-    key = (dev, n)
+    # Pad to a 16-element (128-byte) multiple. A 6-element array is 48 bytes, and the
+    # copy of it was measured at 923us against 6us for the 12-element one -- a
+    # sub-DMA-granularity async copy is not a fast path. The kernels index the array by
+    # expert, so the padding is never read; only the transfer width changes.
+    width = ((n + 15) // 16) * 16
+    key = (dev, width)
     pool = _ptr_pool.get(key)
     if pool is None:
         if len(_ptr_pool) > 32:
             _ptr_pool.clear()
         pool = _ptr_pool[key] = [
-            (torch.empty(n, dtype=torch.int64, pin_memory=True),
-             torch.empty(n, dtype=torch.int64, device=dev))
+            (torch.empty(width, dtype=torch.int64, pin_memory=True),
+             torch.empty(width, dtype=torch.int64, device=dev))
             for _ in range(_PTR_RING)]
     i = _ptr_next[0]
     _ptr_next[0] = (i + 1) % _PTR_RING
