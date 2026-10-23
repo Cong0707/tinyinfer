@@ -47,27 +47,12 @@ def stream(tok, model, prompt, max_new=512, history=None):
     ids = tok(text, return_tensors="pt").input_ids.to("cuda")
     dec = GraphDecoder.from_prompt(model, ids).capture()
     eos = tok.eos_token_id
-    first = dec.first_token
-    dec.first_token = None
-    pending = [first]
-    n = 0
-    t0 = time.perf_counter()
-    if first is not None and first != eos:
-        n += 1
-        yield tok.decode([first])
-    while n < max_new:
-        piece_ids = pending if pending else [dec.next_token()]
-        pending = []
-        stop = False
-        for tid in piece_ids:
-            if tid == eos:
-                stop = True
-                break
-            n += 1
-            yield tok.decode([tid])
-        if stop:
-            break
-    dt = time.perf_counter() - t0
+    gen, dt = dec.generate(max_new=max_new, eos=eos)
+    # GraphDecoder already accounts for the tokens produced by its prefill/pre-roll, so
+    # the list is exactly the generated stream.
+    for tid in gen:
+        yield tok.decode([tid])
+    n = len(gen)
     yield f"\n[{n} tok, {dt:.2f}s, {n / dt:.1f} tok/s]"
 
 
