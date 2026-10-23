@@ -22,21 +22,22 @@ import torch
 
 
 class _LayerKv:
-    """One layer's KV view on whichever device that layer runs on."""
+    """One layer's KV view on whichever device that layer runs on.
+
+    A streamed layer runs on the host, so its KV slots have to be there too. Everything
+    else about the cache -- capacity, bookkeeping, the methods a layer asks for -- is the
+    base object's, forwarded through __getattr__ rather than reimplemented.
+    """
 
     __slots__ = ("base", "layer_id", "device")
 
     def __init__(self, base, layer_id: int, device: str):
         self.base, self.layer_id, self.device = base, layer_id, device
 
-    def layer(self, layer_id: int):
-        return self.base.layer(layer_id)
-
-    def get_seq_length(self):
-        return self.base.get_seq_length()
+    def __getattr__(self, name):
+        return getattr(self.base, name)
 
     def update(self, keys, values, layer_id, kwargs=None):
-        # the layer works on its own device; the cache stores where it is told to
         return self.base.update(keys, values, layer_id, kwargs)
 
 
