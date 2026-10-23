@@ -2600,11 +2600,12 @@ class ExpertStore:
                     if _admit_ok:
                         datas = self.ram._read_many_pooled(blobs) if blobs else []
                     else:
-                        # Prefill streams each expert once and never admits it. Measured:
-                        # routing these reads through the pinned pool (4.2 vs 2.7 tok/s
-                        # prefill) fragments the claim badly enough that the next decode
-                        # step's pooled fetch falls back to pageable buffers -- decode went
-                        # 1.20 -> 1.03 tok/s. Prefill stays on the bytearray reader.
+                        # Prefill streams each expert once and never admits it. A pool read
+                        # here (15.1s vs 23.9s for 64 tokens) fragments the claim -- decode
+                        # then falls back to pageable (1.20 -> 1.03 tok/s). A private pinned
+                        # staging buffer was tried next and produced wrong answers (the wave
+                        # reuse raced the in-flight DMAs); prefill stays on the bytearray
+                        # reader until that is understood.
                         datas = [self.reader.read_blob(b) for b in blobs] if blobs else []
                     self._disk_ms = getattr(self, "_disk_ms", 0.0) + (__import__("time").perf_counter() - _d0) * 1e3
                     for b, d in zip(blobs, datas):
