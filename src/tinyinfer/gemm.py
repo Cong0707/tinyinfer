@@ -127,4 +127,14 @@ def fp4_linear(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor, act_
                 pass
     with _bf16_default():
         x_fp8, x_s = _k.act_quant(x, act_block, SCALE_FMT, SCALE_DTYPE)
-        return _k.fp4_gemm(x_fp8, x_s, w_fp4, w_scale, SCALE_DTYPE, act_block_size=act_block)
+        out = _k.fp4_gemm(x_fp8, x_s, w_fp4, w_scale, SCALE_DTYPE, act_block_size=act_block)
+    # same story as gemv_fp4._keep: the tilelang GEMM launches itself, so the allocator
+    # has no record of the expert weights it is still reading
+    if x_fp8.is_cuda:
+        try:
+            _cur = torch.cuda.current_stream()
+            for _t in (x_fp8, x_s, w_fp4, w_scale, out):
+                _t.record_stream(_cur)
+        except Exception:
+            pass
+    return out

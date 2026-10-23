@@ -210,6 +210,7 @@ class MoE:
         self._expert_cache: dict[int, Expert] = {}
         self._last_ids: list[int] | None = None
         self.swiglu_limit = cfg.swiglu_limit
+        self._fused_ok: bool | None = None
 
     def _expert_from(self, get) -> Expert:
         """Build an Expert from a name->tensor accessor, packed fp4 when on CUDA."""
@@ -387,7 +388,33 @@ class MoE:
         # Flare's rule is explicit ("offload never blocks the model worker thread");
         # we had the opposite order, which serialised the two.
         served = []
-        cached_hits = [i for i in active if self._expert_cache.get(i) is not None] if limit > 0 else []
+        # Decode can serve the whole routed set in four hand-written launches (see
+        # .moe_gemv): the fp4 weights, the e8m0 scales and the fp8 activation are decoded
+        # inside the kernel, so the per-expert tilelang GEMV and the fp32 scale copies it
+        # needed both disappear. Only a single-token forward has that shape. The expert
+        # cache is consulted inside the fused path too, so the cache pass is skipped here
+        # rather than splitting one layer's experts across two code paths.
+        _fused = False
+        if _single and use_fp4_kernel and _aq is not None and active:
+            _ok = self._fused_ok
+            if _ok is None:
+                from . import moe_gemv
+
+                _ok = (moe_gemv.available()
+                       and moe_gemv.supported_shape(self.cfg.moe_inter_dim, self.cfg.dim)
+                       and moe_gemv.supported_shape(self.cfg.dim, self.cfg.moe_inter_dim))
+                self._fused_ok = _ok
+            _fused = bool(_ok)
+            if _os0.environ.get("TI_FUSED_STATS") == "1":
+                import sys as _sys
+                print(f"[moe] layer {self.layer_id}: fused={_fused} "
+                      f"single={_single} kernel={use_fp4_kernel} aq={_aq is not None}",
+                      file=_sys.stderr, flush=True)
+        # the fused path has to hand every routed expert to one set of launches, so it
+        # fetches the whole active set rather than splitting off cache hits (reusing a
+        # cached Expert there measured WRONG output -- see the note in the fused branch)
+        cached_hits = [] if _fused else (
+            [i for i in active if self._expert_cache.get(i) is not None] if limit > 0 else [])
         to_fetch = [i for i in active if i not in cached_hits]
         _pre_fetch = None
         _prefetch_ids: list[int] = list(to_fetch)
@@ -449,6 +476,61 @@ class MoE:
                             _tt.cuda.current_stream().wait_event(_rec.event)
                             _rec.event = None
                     rec_by_id = {rec.key[1]: rec for rec in recs}
+                    if _fused:
+                        from . import moe_gemv
+
+                        _ids = [i for i in ids_batch if i in rec_by_id]
+                        _exps = []
+                        for i in _ids:
+                            _e = self._expert_cache.get(i)
+                            if _e is None or _e.fp4 is None:
+                                _e = self._expert_from_rec(rec_by_id[i])
+                                if limit > 0:
+                                    if len(self._expert_cache) >= limit:
+                                        self._expert_cache.pop(next(iter(self._expert_cache)))
+                                    self._expert_cache[i] = _e
+                            _exps.append(_e)
+                        if _exps:
+                            _fp = [e.fp4 for e in _exps]
+                            _wv = _tt.stack([_wsum[i].reshape(()) for i in _ids]).float()
+                            _gu = moe_gemv.gate_up(_aq, _asc,
+                                                   [f[0] for f in _fp], [f[1] for f in _fp],
+                                                   [f[4] for f in _fp], [f[5] for f in _fp])
+                            _aq2, _asc2 = moe_gemv.act_quant(_gu, _wv,
+                                                            float(self.swiglu_limit))
+                            _dn = moe_gemv.down(_aq2, _asc2,
+                                                [f[2] for f in _fp], [f[3] for f in _fp])
+                            moe_gemv.acc(_dn, y, len(_ids))
+                            served.extend(_ids)
+                            if (_os0.environ.get("TI_FUSED_CHECK") == "1"
+                                    and not getattr(self, "_fused_checked", False)):
+                                self._fused_checked = True
+                                import sys as _sys
+
+                                from .gemv_fp4 import gemv_fp4_pq
+
+                                _e0 = _exps[0]
+                                _f0 = _e0.fp4
+                                _gr = gemv_fp4_pq(_aq, _asc, _f0[0], _f0[1])[0]
+                                _ur = gemv_fp4_pq(_aq, _asc, _f0[4], _f0[5])[0]
+                                _dn_ref = _tt.stack([
+                                    _exps[_k].forward_fp4_pq(_aq, _asc, _wsum[_ids[_k]])
+                                    .reshape(-1).float() for _k in range(len(_ids))])
+                                _n = self.cfg.moe_inter_dim
+                                print(f"[check] L{self.layer_id} shapes w={tuple(_f0[0].shape)} "
+                                      f"s={tuple(_f0[1].shape)} w2={tuple(_f0[2].shape)} "
+                                      f"s2={tuple(_f0[3].shape)} n_exp={len(_ids)} "
+                                      f"aq={tuple(_aq.shape)} asc={tuple(_asc.shape)}",
+                                      file=_sys.stderr, flush=True)
+                                print(f"[check] gate {(_gu[0, :_n].float()-_gr.float()).abs().max().item():.3e} "
+                                      f"up {(_gu[0, _n:].float()-_ur.float()).abs().max().item():.3e} "
+                                      f"|g| {_gr.float().abs().max().item():.3e} "
+                                      f"accdown {(_dn[:, :self.cfg.dim].float()-_dn_ref).abs().max().item():.3e} "
+                                      f"|dref| {_dn_ref.abs().max().item():.3e} "
+                                      f"w={_wsum[_ids[0]].reshape(()).item():.4f} "
+                                      f"y={y.abs().max().item():.3e}",
+                                      file=_sys.stderr, flush=True)
+                        return
                     # Accumulate the batch and scatter once: six separate y[idx] += ops
                     # are six read-modify-write passes over the same rows, and at T=1
                     # each is a launch that cannot overlap the expert GEMVs.
@@ -533,6 +615,10 @@ class MoE:
                 try:
                     _s0 = _tp.perf_counter() if _prof else 0.0
                     _bs = max(1, int(__import__("os").environ.get("TI_SERVE_BATCH", "3")))
+                    if _fused:
+                        # the fused kernels are indexed by expert, so they need the whole
+                        # routed set in one call rather than three-expert slices
+                        _bs = max(1, len(keys))
                     for _i in range(0, len(keys), _bs):
                         batch = keys[_i:_i + _bs]
                         if not batch:
