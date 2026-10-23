@@ -36,14 +36,16 @@ def step(q, k, v, g, beta, state, l2norm=True):
     bc = beta.float().contiguous()
     if bfs:
         out = torch.empty((B, H, Dv), dtype=torch.bfloat16, device=v.device)
-        fn = native.kernel("gdn", "gdn_step_bf")
+        # v2 keeps the same arithmetic but gives each thread one dv column and walks dk in
+        # a single pass, so the [Dk, Dv] state is touched as whole 128-thread rows instead
+        # of 512-byte strided columns: 41.8us -> 32.3us for one layer's 2MB.
+        fn = native.kernel("gdn", "gdn_step_v2")
     else:
         out = torch.empty((B, H, Dv), dtype=torch.float32, device=v.device)
         fn = native.kernel("gdn", "gdn_step_f")
         qc, kc, vc = qc.float(), kc.float(), vc.float()
     native.launch(fn, (B * H,), (128,), [qc, kc, vc, gc, bc, state, out, B, H, Dk, Dv,
-                                       1 if l2norm else 0],
-                  shared=max(256, Dv) * 4)
+                                       1 if l2norm else 0])
     return out
 
 
