@@ -232,3 +232,35 @@ extern "C" __global__ void qwen_gemv_layer2(const __nv_bfloat16* __restrict__ W,
         if (lane == 0) out[ooff + r] = acc[0];
     }
 }
+
+// SwiGLU in one kernel: v = silu(clamp(gate)) * clamp(up). Three torch kernels -> one.
+extern "C" __global__ void qwen_swiglu(const float* __restrict__ gate_up,
+                                       __nv_bfloat16* __restrict__ out,
+                                       int inter, float limit) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= inter) return;
+    float g = gate_up[i];
+    float u = gate_up[inter + i];
+    if (limit > 0.f) {
+        u = fminf(fmaxf(u, -limit), limit);
+        g = fminf(g, limit);
+    }
+    out[i] = __float2bfloat16((g / (1.f + expf(-g))) * u);
+}
+
+// Residual add in bf16: out = a + b, one kernel instead of aten::add.
+extern "C" __global__ void qwen_residual_add(const __nv_bfloat16* __restrict__ a,
+                                             const __nv_bfloat16* __restrict__ b,
+                                             __nv_bfloat16* __restrict__ out,
+                                             int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __float2bfloat16(__bfloat162float(a[i]) + __bfloat162float(b[i]));
+}
+
+// bf16 -> fp32 widening for the lm-head input.
+extern "C" __global__ void qwen_bf16_to_f32(const __nv_bfloat16* __restrict__ x,
+                                            float* __restrict__ out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __bfloat162float(x[i]);
+}
+
