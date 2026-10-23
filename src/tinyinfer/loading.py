@@ -2613,6 +2613,8 @@ class ExpertStore:
         experts = [int(e) for e in experts]
         for _e in experts:
             self._freq[(int(layer), _e)] += 1
+        import torch
+
         blobs: list[Any] = []
         datas: list[Any] | None = None
         # batch the disk misses through read_many (parallel pread, lock-free), then
@@ -2656,13 +2658,25 @@ class ExpertStore:
                     if _admit_ok:
                         datas = self.ram._read_many_pooled(blobs) if blobs else []
                     else:
-                        # Prefill borrows ~240 x 18.8MB per pass. The dedicated reserved
-                        # region (added, then removed twice) gets 15-19s vs 23.9s on
-                        # prefill and is correct on tier 3, but tier 2's prefill logits
-                        # come out EOS-leading with it -- with or without a stream sync at
-                        # reset, so it is not a DMA-overwrite race. Prefill stays on the
-                        # bytearray reader until that tier difference is understood.
-                        datas = [self.reader.read_blob(b) for b in blobs] if blobs else []
+                        # Prefill borrows ~240 x 18.8MB per pass. A dedicated reserved
+                        # region gets the pinned 26GB/s without touching the cache's free
+                        # list. TI_PP_DEBUG re-reads the same blob through the bytearray
+                        # reader and compares bytes, to localize a mismatch between the
+                        # read and the consuming DMA.
+                        _pp = self._get_prefill_pool()
+                        if _pp is not None and blobs:
+                            _raw = self.ram._read_many_pooled(blobs, pool=_pp)
+                            # wrap the pool slices as tensors: the record's tensors_on()
+                            # takes the tensor branch (same one read_blob's bytearray goes
+                            # through) rather than the memoryview branch, which is where
+                            # the tier 2 / tier 3 divergence was observed
+                            datas = []
+                            for d in _raw:
+                                datas.append(torch.frombuffer(d, dtype=torch.uint8)
+                                             if not torch.is_tensor(d) else d)
+                        else:
+                            datas = ([self.reader.read_blob(b) for b in blobs]
+                                     if blobs else [])
                     self._disk_ms = getattr(self, "_disk_ms", 0.0) + (__import__("time").perf_counter() - _d0) * 1e3
                     for b, d in zip(blobs, datas):
                         if _admit_ok and d is not None:
