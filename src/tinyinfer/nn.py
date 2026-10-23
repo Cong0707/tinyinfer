@@ -8,9 +8,45 @@ import torch
 import torch.nn.functional as F
 
 
+_RMS_NATIVE = {"ok": None}
+
+
+def _rms_native_ok() -> bool:
+    if _RMS_NATIVE["ok"] is None:
+        try:
+            from . import native
+            native.kernel("rms_norm", "rms_norm_kernel")
+            _RMS_NATIVE["ok"] = True
+        except Exception:
+            _RMS_NATIVE["ok"] = False
+    return _RMS_NATIVE["ok"]
+
+
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """HF-style RMSNorm: normalize in fp32, scale by the stored weight."""
+    """HF-style RMSNorm: normalize in fp32, scale by the stored weight.
+
+    One kernel for the whole chain. The torch form is float/square/mean/rsqrt/mul/mul/to
+    -- seven launches, twice per layer, 560 per decode step for a 1-row activation. The
+    kernel keeps the same fp32 reduction and the same final bf16 cast.
+    """
     orig_dtype = x.dtype
+    if (x.is_cuda and x.dtype == torch.bfloat16 and _rms_native_ok()
+            and weight.numel() == x.shape[-1]):
+        try:
+            from . import native
+            shape = x.shape
+            d = shape[-1]
+            rows = 1
+            for v in shape[:-1]:
+                rows *= int(v)
+            xc = x.reshape(rows, d).contiguous()
+            wf = weight.float().contiguous()
+            y = torch.empty((rows, d), dtype=torch.bfloat16, device=x.device)
+            native.launch(native.kernel("rms_norm", "rms_norm_kernel"), (rows,), (32,),
+                          [xc, wf, y, rows, d, float(eps)], 0)
+            return y.view(*shape)
+        except Exception:
+            pass
     xf = x.float()
     y = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
     return (y * weight.float()).to(orig_dtype)
