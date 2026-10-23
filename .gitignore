@@ -19,3 +19,6 @@ cache/
 # 本地配置
 .env
 config.local.*
+# 本地临时脚本（bench/prof 之类，不入库）
+_*.py
+_*.txt

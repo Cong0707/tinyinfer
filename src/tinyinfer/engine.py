@@ -1713,14 +1713,13 @@ class Engine:
         # showed up as garbage first tokens. Keep short prompts in one chunk; long ones
         # still step so an 8GB card cannot OOM.
         step = chunk or max(self.prefill_chunk, 32)
-        # Measured on this card: a 63-token prompt at chunk=8 runs the allocator past
-        # physical VRAM (17GB "allocated" through WDDM shared memory) and OOMs, while the
-        # same prompt at chunk=1 completes. Long prompts therefore step through in small
-        # pieces; short ones keep the fast chunk. The growth is per-layer and linear in
-        # the chunk length, so 16 is a safe bound below the blow-up.
-        if chunk is None and T > 16:
-            step = max(1, min(step, 16 // max(1, T // 16)))
-            step = max(1, step)
+        # Measured now (64-token prompt): peak allocation is flat at 5.5GB for every chunk
+        # from 64 to 512, and chunked prefill is bit-identical to single-chunk (maxdiff
+        # 0.0), so the old 16//(T//16) bound was both stale and the reason long prompts
+        # crawled one token at a time (~1.1 tok/s). A chunk that keeps the batch wide
+        # keeps the SMs busy; 256 is the fastest measured point (3.5x chunk=8).
+        if chunk is None and T > 256:
+            step = max(1, min(step, 256))
         if T <= step:
             return self._forward_chunk(ids, start_pos)
         logits = None
