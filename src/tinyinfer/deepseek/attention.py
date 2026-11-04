@@ -113,6 +113,18 @@ class MLAWindowAttention:
                 return ql
             return shard_quant_linear(ql.weight, ql.scale, plan)
 
+        # A plan of one card means one range per tensor, which is what the layer already
+        # is: nothing to split and nothing to rebuild. Returning early is not just an
+        # optimisation -- rebuilding the stacked projection below produces a NEW
+        # QuantLinear with freshly concatenated (and therefore differently laid out)
+        # storage, so an unnecessary rebuild changed the GEMM selection and with it the
+        # engine output on a single card.
+        if not any(len(plan_fn(n, int(getattr(self, n).weight.shape[0])) or ()) > 1
+                   for n in ("wq_a", "wq_b", "wkv", "wo_b")
+                   if hasattr(getattr(self, n, None), "weight")
+                   and getattr(self, n).weight.dim() == 2):
+            return
+
         # Order matters: the stacked projection has to be built from the *whole* weights,
         # so it happens before anything is split (after a split, .weight is only the
         # first card's slice and the concatenation would silently use a fragment).

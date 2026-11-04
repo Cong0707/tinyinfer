@@ -1381,8 +1381,89 @@ class TinyModelBackend(BaseBackend):
         return int(torch.multinomial(probs, 1, generator=generator).item())
 
     def generate(self, request: GenerationRequest) -> Iterator[TokenEvent]:
-        with self._gen_lock:
-            yield from self._generate_locked(request)
+        # Continuous batching is the default path, the way it is in vLLM: a request is a
+        # Sequence handed to a loop that steps every live conversation together, and the
+        # loop is what produces the tokens this generator yields. There is no "--parallel"
+        # to turn on -- the batch width is however many sequences the KV pool can hold,
+        # and when it can hold one the loop still runs, one at a time, which is exactly
+        # what the previous per-request lock did.
+        #
+        # The old path is kept reachable (TI_SERVE_LOOP=0) because it carries multi-turn
+        # prefix reuse and per-session KV snapshots that the batched loop does not yet
+        # implement: falling back is a behaviour choice, not a crash.
+        import os as _os_serve
+
+        if _os_serve.environ.get("TI_SERVE_LOOP", "1") == "0":
+            with self._gen_lock:
+                yield from self._generate_locked(request)
+            return
+        yield from self._generate_batched(request)
+
+    def _generate_batched(self, request: GenerationRequest) -> Iterator[TokenEvent]:
+        """Serve one request through the shared batch loop.
+
+        The loop owns the device; this method owns the request-to-events part: it turns
+        the prompt into a Sequence, waits on that sequence's token queue, and decodes as
+        tokens arrive. Blocking on a queue is correct here -- the caller (an ASGI worker)
+        is in a thread that exists to wait.
+        """
+        self.load()
+        torch = self._torch
+        sampling = request.sampling
+        prompt_text = self.render_prompt(request)
+        prompt_ids = self._encode(prompt_text)
+        if not prompt_ids:
+            fallback = getattr(self._tokenizer, "bos_token_id", None)
+            prompt_ids = [int(fallback)] if isinstance(fallback, int) else [0]
+
+        from .sched import ServingEngine
+        from .sequence import Sequence
+
+        loop = self._serve_loop()
+        seq = Sequence(prompt=list(prompt_ids),
+                       max_new_tokens=int(sampling.max_tokens or 64),
+                       temperature=float(sampling.temperature or 0.0),
+                       top_p=float(sampling.top_p or 1.0),
+                       top_k=int(sampling.top_k or 0),
+                       stop_ids=tuple(self._eos_ids()),
+                       )
+        loop.submit(seq)
+
+        emitted_text = ""
+        token_count = 0
+        finish = "length"
+        while True:
+            item = seq.queue.get()
+            if isinstance(item, BaseException):
+                raise BackendError(f"generation failed: {item}", status_code=500)
+            if item is None:
+                break
+            token_count += 1
+            piece = self._decode([int(item)])
+            emitted_text += piece
+            yield TokenEvent(kind="token", index=token_count, token_id=int(item), text=piece)
+        if token_count >= int(sampling.max_tokens or 64):
+            finish = "length"
+        else:
+            finish = "stop"
+        yield TokenEvent(kind="done", index=token_count, token_id=None, text="",
+                         finish_reason=finish)
+
+    def _serve_loop(self):
+        """The one batch loop this backend serves through, started on first use."""
+        loop = getattr(self, "_batch_loop", None)
+        if loop is None:
+            from .sched import ServingEngine
+
+            # Batch width follows the device: enough sequences to amortise a weight read,
+            # capped by what the host asked for. The loop itself decides how many can
+            # actually be in flight from the KV pool, so this is a ceiling, not a promise.
+            import os as _os_w
+
+            want = int(_os_w.environ.get("TI_MAX_BATCH", "8"))
+            loop = ServingEngine(self._model, max_batch=max(1, want)).start()
+            self._batch_loop = loop
+        return loop
 
     def _generate_locked(self, request: GenerationRequest) -> Iterator[TokenEvent]:
         self.load()

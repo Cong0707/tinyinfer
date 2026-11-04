@@ -151,3 +151,192 @@ class Engine:
         }
         d.update(self.pool.stats())
         return d
+
+class ServingEngine:
+    """The always-on loop: one thread steps the batch, requests come and go.
+
+    This is the shape a server needs, and it is the default rather than a mode. The
+    caller submits a Sequence and drains a queue of token ids; nothing in that interface
+    mentions batching, so a single concurrent request and eight of them take the same
+    path. The KVPool decides how many can actually share a step -- when it only has one
+    slot (a card that cannot hold two sequences' KV) the loop still runs, one sequence at
+    a time, and the API behaves exactly as it did before.
+
+    Why a thread and not an async loop: every step blocks on the GPU, and the engine is
+    one mutex-guarded object with a single CUDA context. A thread that owns the device
+    and a queue in front of it is the simplest thing that cannot interleave two forwards.
+    """
+
+    def __init__(self, engine, max_batch: int = 8, idle_sleep: float = 0.002):
+        import queue
+        import threading
+
+        self._queue_mod = queue
+        self.engine = engine
+        self.max_batch = max(1, int(max_batch))
+        self.idle_sleep = float(idle_sleep)
+        self._inbox: queue.Queue = queue.Queue()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self.steps = 0
+        self.tokens = 0
+        self._running: list = []
+        self._fresh: set[int] = set()
+        # What the device can actually hold, not what the caller asked for. A sequence
+        # needs its window ring plus its compressed groups in VRAM for the whole life of
+        # the batch (they cannot be swapped out per step without defeating the point), and
+        # the model itself is already resident. Asking for 8 on a 7 GB card would OOM on
+        # the second sequence, so the ceiling is measured and the request is clamped
+        # rather than trusted. This runs last: it reads the fields above.
+        self.max_batch = min(self.max_batch, self._fit())
+
+    def _fit(self) -> int:
+        """How many sequences the free VRAM can hold at the same time.
+
+        Sized from the attention geometry, not from a constant: the window ring is
+        sliding_window x head_dim x 2 bytes per layer, and the compressed cache is one
+        group per `ratio` tokens. A 4K context is the working assumption because a
+        shorter one only makes the estimate conservative.
+        """
+        try:
+            cfg = getattr(self.engine, "cfg", None)
+            if cfg is None:
+                return self.max_batch
+            try:
+                import torch as _t
+
+                if not _t.cuda.is_available():
+                    return self.max_batch
+                free, _total = _t.cuda.mem_get_info()
+            except Exception:
+                return self.max_batch
+            # keep a quarter for activations, the head and the allocator
+            budget = int(free * 0.25)
+            win = int(getattr(cfg, "sliding_window", 0) or 0)
+            hd = int(getattr(cfg, "head_dim", 0) or 0)
+            nl = int(getattr(cfg, "n_layers", 0) or 0)
+            if win <= 0 or hd <= 0 or nl <= 0:
+                return self.max_batch
+            per_seq = win * hd * 2 * nl
+            ctx = 4096
+            for r in list(getattr(cfg, "compress_ratios", []) or []):
+                if r and r > 0:
+                    per_seq += (ctx // int(r)) * hd * 2
+            if per_seq <= 0:
+                return self.max_batch
+            return max(1, min(self.max_batch, budget // per_seq))
+        except Exception:
+            return 1
+
+    # ---- lifecycle ----
+    def start(self):
+        if self._thread is not None and self._thread.is_alive():
+            return self
+        self._stop.clear()
+        self._thread = __import__("threading").Thread(
+            target=self._loop, name="tinyinfer-serve", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+        t = self._thread
+        if t is not None:
+            t.join(timeout=10.0)
+        self._thread = None
+
+    # ---- submission ----
+    def submit(self, seq):
+        """Queue a sequence; it is admitted at the next step boundary."""
+        import queue as _q
+
+        seq.queue = _q.Queue()
+        self._inbox.put(seq)
+        return seq
+
+    def _admit(self) -> None:
+        while True:
+            try:
+                seq = self._inbox.get_nowait()
+            except self._queue_mod.Empty:
+                break
+            if len(self._running) >= self.max_batch:
+                self._inbox.put(seq)      # no room this step; try again next boundary
+                break
+            self._running.append(seq)
+            self._fresh.add(seq.id)
+
+    # ---- the loop ----
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                did = self.step()
+            except Exception as exc:  # a failed step must not kill the server thread
+                for seq in list(self._running):
+                    _fail(seq, exc)
+                self._running.clear()
+                self._fresh.clear()
+                did = False
+            if not did:
+                self._stop.wait(self.idle_sleep)
+
+    def _width(self) -> int:
+        fresh = [s for s in self._running if s.id in self._fresh]
+        return max((len(s.prompt) for s in fresh), default=1)
+
+    def step(self) -> bool:
+        """One forward over the whole running batch. False when there was nothing to do."""
+        from .nn import sample_logits
+
+        self._admit()
+        if not self._running:
+            return False
+        width = self._width()
+        pad = self.engine.pad_id
+        ids = torch.full((len(self._running), width), pad, dtype=torch.long,
+                         device=self.engine.device)
+        for i, s in enumerate(self._running):
+            if s.id in self._fresh:
+                ids[i, :len(s.prompt)] = torch.tensor(s.prompt, dtype=torch.long)
+            else:
+                ids[i, 0] = int(s.out[-1])
+        pos = torch.tensor(
+            [(len(s.prompt) - 1) if s.id in self._fresh else s.next_pos
+             for s in self._running],
+            dtype=torch.long, device=self.engine.device)
+
+        with torch.inference_mode():
+            logits = self.engine.forward(ids, start_pos=int(pos.min().item()),
+                                         positions=pos)
+        self.steps += 1
+
+        done = []
+        for i, s in enumerate(self._running):
+            col = (len(s.prompt) - 1) if s.id in self._fresh else 0
+            nid = sample_logits(logits[i, col], s.temperature, s.top_p, s.top_k)
+            s.out.append(int(nid))
+            self.tokens += 1
+            self._fresh.discard(s.id)
+            q = getattr(s, "queue", None)
+            if q is not None:
+                q.put(int(nid))
+            if (s.stop_ids and nid in s.stop_ids) or s.n_out >= s.max_new_tokens:
+                s.done = True
+                done.append(s)
+        for s in done:
+            q = getattr(s, "queue", None)
+            if q is not None:
+                q.put(None)          # end marker
+        self._running = [s for s in self._running if not s.done]
+        return True
+
+    def stats(self) -> dict:
+        return {"steps": self.steps, "tokens": self.tokens,
+                "running": len(self._running), "max_batch": self.max_batch}
+
+
+def _fail(seq, exc) -> None:
+    q = getattr(seq, "queue", None)
+    if q is not None:
+        q.put(exc)

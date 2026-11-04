@@ -46,11 +46,36 @@ def _bf16_default():
     return cm()
 
 
+def _fp8_native() -> bool:
+    """True when e4m3 conversion is one hardware instruction (SM 89 and up).
+
+    Probed once and cached: the classification never changes for a process, and asking
+    torch on every linear layer would put a property lookup on the decode path.
+    """
+    global _FP8_NATIVE
+    if _FP8_NATIVE is None:
+        try:
+            from .caps import caps
+
+            _FP8_NATIVE = bool(caps().fp8_native)
+        except Exception:
+            _FP8_NATIVE = True          # unknown: keep the fast path, it is correct anyway
+    return _FP8_NATIVE
+
+
+_FP8_NATIVE = None
+
+
 def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, block: int = 32) -> torch.Tensor:
     if (x.is_cuda and x.dim() == 2 and x.size(0) == 1
             and block == 32 and w_fp8.shape[1] % 512 == 0
             and w_fp8.shape[0] % 32 == 0
-            and __import__("os").environ.get("TI_FP8_NEW", "1") != "0"):
+            and __import__("os").environ.get("TI_FP8_NEW", "1") != "0"
+            # fp8_gemv_bs decodes e4m3 with the hardware converter. On a card without
+            # one (SM < 89, i.e. Turing and Ampere) that call becomes a software
+            # sequence per element and this kernel loses to the plain GEMM it replaces,
+            # so the gate is the capability, not the shape.
+            and _fp8_native()):
         # kernels/cuda/fp8_gemv_bs.cu: 16 output rows x 32 lanes per block, one LDG.E.128
         # per lane, so a warp reads 512 consecutive k. Measured 25.2 us vs 45.5 for the
         # block_M=32 tilelang path on [2304, 5120] (1.8x, bit-identical). This is the

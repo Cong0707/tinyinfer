@@ -326,6 +326,12 @@ def fp4_swiglu_quant_cuda(aq, asc, w1, s1, w3, s3, limit=10.0):
     n, k = w1.shape[0], aq.shape[1]
     if not aq.is_cuda or k % 32 or n % 32:
         return None
+    # This kernel decodes fp4 through a shared-memory LUT, not through an fp8 convert,
+    # so it does not need SM 89 to be fast. It only needs the fp8 OUTPUT quantiser,
+    # which uses __nv_cvt_float_to_fp8 -- emulated below SM 89 but at ONE place per
+    # element in the epilogue rather than in the inner loop, so it stays the better path.
+    # (Gating this on fp8_native was wrong: it silently fell back to the tilelang chain
+    # and changed the engine output.)
     try:
         hq = torch.empty(n, device=aq.device, dtype=torch.float8_e4m3fn)
         hs = torch.empty(n // 32, device=aq.device, dtype=torch.float8_e8m0fnu)
