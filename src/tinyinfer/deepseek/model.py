@@ -274,6 +274,19 @@ class Block(HCBlockMixin):
         return self
 
     def forward(self, x: torch.Tensor, start_pos: int, pre_mix: torch.Tensor):
+        # Device alignment. With weights placed across cards (engine._gpu_for_layer) the
+        # incoming activation still lives on the previous layer's card, so it has to move
+        # before any of this layer's kernels run. On a single GPU the comparison is
+        # torch.device("cuda") == cuda:0, i.e. always equal, so nothing is copied and the
+        # path is identical to before. non_blocking keeps the copy async; the first
+        # consumer is a kernel on the same stream, so ordering is already guaranteed.
+        _dev = getattr(self, "_device", "cpu")
+        if _dev != "cpu":
+            _tdev = torch.device(_dev)
+            if x.device != _tdev:
+                x = x.to(_tdev, non_blocking=True)
+            if pre_mix is not None and pre_mix.device != _tdev:
+                pre_mix = pre_mix.to(_tdev, non_blocking=True)
         import os as _os
         _wt = _os.environ.get("TI_WALL_PROF") == "1"
         if _wt:

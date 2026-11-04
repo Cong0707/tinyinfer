@@ -91,6 +91,7 @@ class Engine:
                     print(f"[tinyinfer] multi-GPU pool: {desc}", flush=True)
             except Exception as _tp_exc:
                 print(f"[tinyinfer] multi-GPU probe skipped ({_tp_exc!r})", flush=True)
+        self._layer_dev: dict[int, int] = {}
         self._tokenizer = tokenizer
         self.hashes = None
         self.adapter = open_adapter(adapter) if isinstance(adapter, str) else adapter
@@ -747,6 +748,27 @@ class Engine:
         cache[layer_id] = rt
         return rt
 
+    def _gpu_for_layer(self, layer_id: int, nbytes: int = 200 << 20):
+        """Which device this layer's weights belong on.
+
+        Single GPU: the configured device, exactly as before. Multi-GPU: booked through
+        Placement on first use, so the cards fill proportionally to their real free VRAM
+        without anyone specifying a split. The byte estimate only drives the *booking*,
+        not the copy: if a card runs out the layer falls back to device 0 rather than
+        failing the run, because a suboptimal placement still works and a failed startup
+        does not.
+        """
+        if not self._multi_gpu or self.placement is None:
+            return self.device
+        dev = self._layer_dev.get(layer_id)
+        if dev is None:
+            try:
+                dev = self.placement.place(f"layer.{layer_id}", int(nbytes))
+            except Exception:
+                dev = 0
+            self._layer_dev[layer_id] = dev
+        return f"cuda:{dev}" if str(self.device).startswith("cuda") else self.device
+
     def block(self, layer_id: int) -> Block:
         b = self._blocks.get(layer_id)
         if b is None:
@@ -767,7 +789,7 @@ class Engine:
                 # 27B), and caching all 64 would need 47GB -- which is what filled the
                 # machine's memory. The adapter owns Qwen's bounded cache instead.
                 if layer_id < self.gpu_layers and self.device != "cpu":
-                    b.to(self.device)
+                    b.to(self._gpu_for_layer(layer_id))
                 return b
             b = Block(self.store, layer_id, self.cfg, expert_store=self.expert_store,
                       quant=self.tier.keep_weights_quantized, hashes=self.hashes,
@@ -796,7 +818,7 @@ class Engine:
                     ffn.ep_world = self.tp.world
                     ffn.ep_rank = self.tp.rank
             if layer_id < self.gpu_layers and self.device != "cpu":
-                b.to(self.device)
+                b.to(self._gpu_for_layer(layer_id))
             self._blocks[layer_id] = b
         return b
 
@@ -838,8 +860,9 @@ class Engine:
         """
         b = self.block(layer_id)
         if layer_id < self.gpu_layers:
-            if getattr(b, "device", getattr(b, "_device", "cpu")) != self.device:
-                b.to(self.device)
+            want = self._gpu_for_layer(layer_id)
+            if getattr(b, "device", getattr(b, "_device", "cpu")) != want:
+                b.to(want)
         return b
 
     def release_layer(self, layer_id: int) -> None:
