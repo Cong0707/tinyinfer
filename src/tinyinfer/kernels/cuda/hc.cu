@@ -43,47 +43,61 @@ extern "C" __global__ void hc_pre_bf(const __nv_bfloat16* __restrict__ x,
 }
 
 // out is [M, hc, hc, D]: a and b are the two HC axes.
-extern "C" __global__ void hc_post_f(const float* __restrict__ x,        // [M, hc, D]
+// out[m, o, d] = post[m, o] * x[m, o, d] + sum_i comb[m, i, o] * resid[m, i, d]
+//
+// This is the Hyper-Connection residual update, and it is the same arithmetic as the
+// reference mhc_post_fwd:
+//     x_out[n, o, h] = c[n, o] * d[n, h] + sum_i a[n, i, o] * b[n, i, h]
+// Note the index order on comb: the sum runs over the *source* hyper-connection index i
+// and o is the destination, which is why it is comb[m, i, o] and not comb[m, o, i].
+// An earlier version of this kernel carried a fourth output dimension (b), treating post
+// as [M, hc, hc] and reading x[m, b, d] -- that matches neither the caller's [M, hc]
+// post nor the reference, and the resulting reshape threw on every call, so the fast
+// path was dead and every token fell through to the torch expression in hc.py.
+// x is the layer output BEFORE it is broadcast into hyper-connection space: it has shape
+// [M, D], not [M, hc, D]. residual is the [M, hc, D] one. The caller's guard used to
+// require residual.shape == x.shape, which can never hold for these two, so the fast path
+// was unreachable on top of the index bug fixed here.
+extern "C" __global__ void hc_post_f(const float* __restrict__ x,        // [M, D]
                                      const float* __restrict__ resid,    // [M, hc, D]
-                                     const float* __restrict__ post,     // [M, hc, hc]
+                                     const float* __restrict__ post,     // [M, hc]
                                      const float* __restrict__ comb,     // [M, hc, hc]
-                                     float* __restrict__ out,            // [M, hc, hc, D]
+                                     float* __restrict__ out,            // [M, hc, D]
                                      int M, int hc, int D) {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= (long)M * hc * hc * D) return;
+    if (i >= (long)M * hc * D) return;
     int d = (int)(i % D);
     long t = i / D;
-    int b = (int)(t % hc);
-    t /= hc;
-    int a = (int)(t % hc);
+    int o = (int)(t % hc);
     int m = (int)(t / hc);
-    const float* xm = x + ((long)m * hc + b) * D + d;
-    const float* rm = resid + (long)m * hc * D + d;
-    const float* cm = comb + ((long)m * hc + a) * hc;
-    float acc = post[((long)m * hc + a) * hc + b] * xm[0];
-    for (int j = 0; j < hc; ++j) acc += cm[j] * rm[(long)j * D];
+    float acc = post[(long)m * hc + o] * x[(long)m * D + d];
+    // Mix the hyper-connection states: out[m,o] += comb[m,i,o] * resid[m,i], summed over
+    // the SOURCE index i. This matches the reference mhc_post_fwd
+    // (a[n,i_mhci,i_mhco] * b[n,i_mhci,h]) and is what "residual update" has to mean --
+    // the transpose reading (sum over the destination) leaves every o multiplying only its
+    // own residual, which is not a mixing operation at all.
+    for (int i_src = 0; i_src < hc; ++i_src)
+        acc += comb[((long)m * hc + i_src) * hc + o] *
+               resid[((long)m * hc + i_src) * D + d];
     out[i] = acc;
 }
 
-extern "C" __global__ void hc_post_bf(const __nv_bfloat16* __restrict__ x,
-                                      const __nv_bfloat16* __restrict__ resid,
-                                      const float* __restrict__ post,
-                                      const float* __restrict__ comb,
-                                      __nv_bfloat16* __restrict__ out,
+extern "C" __global__ void hc_post_bf(const __nv_bfloat16* __restrict__ x,        // [M, D]
+                                      const __nv_bfloat16* __restrict__ resid,    // [M, hc, D]
+                                      const float* __restrict__ post,             // [M, hc]
+                                      const float* __restrict__ comb,             // [M, hc, hc]
+                                      __nv_bfloat16* __restrict__ out,            // [M, hc, D]
                                       int M, int hc, int D) {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= (long)M * hc * hc * D) return;
+    if (i >= (long)M * hc * D) return;
     int d = (int)(i % D);
     long t = i / D;
-    int b = (int)(t % hc);
-    t /= hc;
-    int a = (int)(t % hc);
+    int o = (int)(t % hc);
     int m = (int)(t / hc);
-    const __nv_bfloat16* xm = x + ((long)m * hc + b) * D + d;
-    const __nv_bfloat16* rm = resid + (long)m * hc * D + d;
-    const float* cm = comb + ((long)m * hc + a) * hc;
-    float acc = post[((long)m * hc + a) * hc + b] * __bfloat162float(xm[0]);
-    for (int j = 0; j < hc; ++j) acc += cm[j] * __bfloat162float(rm[(long)j * D]);
+    float acc = post[(long)m * hc + o] * __bfloat162float(x[(long)m * D + d]);
+    for (int i_src = 0; i_src < hc; ++i_src)
+        acc += comb[((long)m * hc + i_src) * hc + o] *
+               __bfloat162float(resid[((long)m * hc + i_src) * D + d]);
     out[i] = __float2bfloat16(acc);
 }
 // hc_mixes: row-normalised Hyper-Connection coefficient projection.

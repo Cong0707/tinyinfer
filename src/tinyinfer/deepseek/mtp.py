@@ -225,8 +225,11 @@ class MTPBlock:
         return y.to(x.dtype)
 
     def hc_post(self, x, residual, post, comb):
-        y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
-        return y.type_as(x)
+        # same arithmetic as HCBlockMixin.hc_post; see _hc_post_ref for why the broadcast
+        # form that used to be here was wrong
+        from .hc import _hc_post_ref
+
+        return _hc_post_ref(x, residual, post, comb).type_as(x)
 
     # -- official DFlash.projection / project_norm -------------------------
     def main_hiddens(self, target_hiddens: list[torch.Tensor]) -> torch.Tensor:

@@ -1,4 +1,4 @@
-﻿"""Hyper-Connections: Sinkhorn-normalized mix coefficients, collapse/expand of hc copies."""
+"""Hyper-Connections: Sinkhorn-normalized mix coefficients, collapse/expand of hc copies."""
 from __future__ import annotations
 
 import torch
@@ -212,6 +212,25 @@ def _launch(fn, grid, block, args):
     native.launch(fn, grid, block, args)
 
 
+def _hc_post_ref(x: torch.Tensor, residual: torch.Tensor,
+                 post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
+    """out[m,o] = post[m,o] * x[m] + sum_i comb[m,i,o] * residual[m,i]
+
+    This is the reference mhc_post_fwd arithmetic (a[n,i,o] * b[n,i,h]). The previous
+    expression here,
+        post.unsqueeze(-1) * x.unsqueeze(-2) + sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), 2)
+    broadcasts residual's hyper-connection axis against comb's OWN axis instead of the
+    reduction axis, so what it actually computes is
+        post[m,o] * x[m] + residual[m,o] * sum_j comb[m,o,j]
+    -- every output multiplies only its own residual and only scales it by a row sum.
+    Verified numerically: on N(0,1) inputs that formula reproduces the old expression to
+    1e-6 while the correct mixing one is off by ~10. That made the torch fallback, which
+    was the ONLY reachable path (both fast paths were broken), silently wrong.
+    """
+    return post.unsqueeze(-1) * x.unsqueeze(-2) + torch.matmul(
+        comb.transpose(-1, -2), residual.float()).to(x.dtype)
+
+
 class HCBlockMixin:
     """The coefficient machinery every Block uses (official Block.hc_mixes/hc_pre/hc_post)."""
 
@@ -312,21 +331,33 @@ class HCBlockMixin:
         # Deterministic native fast path: post*x + comb@residual, one thread per output
         # element with the same fp32 accumulation order the eager expression uses. The
         # eager form is 6 launches (unsqueeze x2, mul x2, sum, type_as) twice per layer.
+        # x is the layer output [b, s, d]; residual is the hyper-connection state
+        # [b, s, hc, d]. They are different shapes by construction, so the old guard
+        # `residual.shape == x.shape` made this branch unreachable.
         if (x.is_cuda and x.dtype in (torch.bfloat16, torch.float32)
-                and residual.shape == x.shape and _native_ok()):
+                and residual.dim() == x.dim() + 1
+                and residual.shape[:2] == x.shape[:2]
+                and residual.shape[-1] == x.shape[-1] and _native_ok()):
             try:
-                b, s, hc, d = x.shape
-                xc = x.reshape(b * s, hc, d).contiguous()
+                b, s, d = x.shape
+                hc = residual.shape[-2]
+                xc = x.reshape(b * s, d).contiguous()
                 rc = residual.reshape(b * s, hc, d).contiguous()
-                pc = post.reshape(b * s, hc, hc).float().contiguous()
+                # post arrives as [b, s, hc] -- one coefficient per hyper-connection --
+                # not [b, s, hc, hc]. Reshaping it to hc*hc threw on every call, so this
+                # fast path never ran; the pool below then refused as well
+                # ("RES shape[0] expected 4, got 1") and every token paid the six-launch
+                # torch expression at the bottom of this method. The kernel's output is
+                # [M, hc, D] for the same reason.
+                pc = post.reshape(b * s, hc).float().contiguous()
                 cc = comb.reshape(b * s, hc, hc).float().contiguous()
                 bfs = x.dtype == torch.bfloat16
-                out = torch.empty((b * s, hc, hc, d), dtype=x.dtype, device=x.device)
-                n = b * s * hc * hc * d
+                out = torch.empty((b * s, hc, d), dtype=x.dtype, device=x.device)
+                n = b * s * hc * d
                 _launch(_kern("hc_post_bf" if bfs else "hc_post_f"),
                         ((n + 255) // 256,), (256,),
                         [xc, rc, pc, cc, out, b * s, hc, d])
-                return out.view(b, s, hc, hc, d)
+                return out.view(b, s, hc, d)
             except Exception:
                 pass
         import os as _os
@@ -353,7 +384,7 @@ class HCBlockMixin:
         if _os.environ.get("TI_HC_T") == "1":
             import time as _t
             _t0 = _t.perf_counter()
-            y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+            y = _hc_post_ref(x, residual, post, comb)
             _dt = (_t.perf_counter() - _t0) * 1e3
             self._hc_t = getattr(self, "_hc_t", [0.0, 0])
             self._hc_t[0] += _dt
@@ -367,6 +398,5 @@ class HCBlockMixin:
         # fp32 coefficients: tier <= 2 keeps the full-precision arithmetic. The bf16
         # variant is a tier-3 trade (two fewer full-tensor conversions per call, 80 calls
         # per token).
-        y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(
-            comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+        y = _hc_post_ref(x, residual, post, comb)
         return y.type_as(x)
