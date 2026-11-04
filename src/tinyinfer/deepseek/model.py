@@ -8,12 +8,17 @@ from .compressed_attention import MLACompressedAttention
 from ..config import TinyConfig
 from .hc import HCBlockMixin, hc_pre_rms_norm
 
-# Fused hc_pre + rms_norm. Off by default: the fused kernel is bit-identical to the pair
-# on every shape and layer tested, but wiring it in changed the end-to-end output, so it
-# stays behind a switch until that is understood. TI_FUSE=1 enables it.
+# Fused hc_pre + rms_norm: one kernel instead of two, 160 launches per decode token.
+# Verified bit-identical across all 40 layers (first-difference probe over the whole
+# stack), so it is the default; TI_FUSE=0 forces the original two-step pair for A/B.
+#
+# Getting it bit-identical required copying the unfused rms_norm's reduction structure
+# (8-wide vectors, thread i owns vector i, same shuffle tree, same block size) rather than
+# writing an equivalent reduction: one bf16 ulp per layer compounded into a different
+# argmax by layer 5.
 import os as _os_fuse
 
-_FUSE_HC_PRE = _os_fuse.environ.get("TI_FUSE") == "1"
+_FUSE_HC_PRE = _os_fuse.environ.get("TI_FUSE") != "0"
 from .moe import MoE
 from ..nn import rms_norm
 from ..weights import ShardStore

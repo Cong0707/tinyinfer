@@ -243,17 +243,25 @@ def hc_pre_rms_norm(x: torch.Tensor, pre_mix: torch.Tensor,
             try:
                 from ..kernels import native
 
+                if _os.environ.get("TI_FUSE_SYNC") == "1":
+                    # temporary probe: streamed layers publish their weights on the copy
+                    # stream, and fusing the two kernels removes the gap the unfused pair
+                    # gave the compute stream to catch up
+                    torch.cuda.current_stream().synchronize()
                 b, s, hc, d = x.shape
                 if x.dtype == torch.bfloat16 and x.is_cuda and d <= _PRE_NORM_MAX_D:
                     xc = x.reshape(b * s, hc, d).contiguous()
                     pc = pre_mix.reshape(b * s, hc).float().contiguous()
                     w = weight.contiguous()
                     out = torch.empty((b * s, d), dtype=x.dtype, device=x.device)
+                    # same block size the unfused rms_norm picks (vllm_ops.py):
+                    # min(hidden/8, 1024 for a single row), so the reduction tree matches
+                    _blk = min(d // 8, 1024 if b * s < 256 else 256)
                     native.launch(
                         native.kernel("hc_pre_rms_norm", "hc_pre_rms_norm_bf"),
-                        (b * s,), (256,),
+                        (b * s,), (_blk,),
                         [xc, pc, w, out, b * s, hc, d, float(eps)],
-                        shared=d * 4)
+                        shared=(d + 32 + 1) * 4)   # row + warp scratch + variance
                     return out.view(b, s, d)
             except Exception:
                 _FUSED_PRE_NORM = False
