@@ -324,3 +324,68 @@ def plan_for(n: int, pool: Pool, align: int = SHARD_BLOCK) -> list:
             break
         out.append((dev, ranges.pop(0)))
     return out
+
+class ShardedLinear:
+    """A linear layer whose output dimension is split across cards.
+
+    Row-parallel: each card holds whole rows of W (W[lo:hi, :]) and computes that slice
+    of the output. Nothing has to be reduced -- the slices are disjoint -- so the only
+    traffic is the activation broadcast in and the result copy back. That is what makes
+    8xH200 behave like 38.4 TB/s of VRAM bandwidth instead of one card's 4.8: the N x K
+    bytes get read in parallel, and a decode token is bounded by that read, not by any
+    collective.
+
+    Each part is a real layer object on its own device, so the fp8/fp4 kernels and the
+    per-block scales stay exactly as they are; this class only routes and stitches.
+    """
+
+    def __init__(self, parts: list):
+        # parts: [(device_index, layer_on_that_device), ...] in output order
+        if not parts:
+            raise ValueError("ShardedLinear needs at least one part")
+        self.parts = parts
+
+    @property
+    def out_features(self) -> int:
+        return sum(int(getattr(p, "out_features", 0)) for _, p in self.parts)
+
+    def to(self, device):
+        # each part lives on its own card by construction; moving the whole thing to one
+        # device is what a single-GPU build does, and it keeps the object usable there
+        for dev, _p in self.parts:
+            del dev
+        self.parts = [(dev, p.to(f"cuda:{dev}")) for dev, p in self.parts]
+        return self
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if len(self.parts) == 1:
+            dev, p = self.parts[0]
+            tgt = torch.device(f"cuda:{dev}") if x.is_cuda else x.device
+            xs = x if x.device == tgt else x.to(tgt, non_blocking=True)
+            return p.forward(xs)
+        outs = []
+        xdev = x.device
+        for dev, p in self.parts:
+            tgt = torch.device(f"cuda:{dev}") if x.is_cuda else x.device
+            xs = x if x.device == tgt else x.to(tgt, non_blocking=True)
+            y = p.forward(xs)
+            if y.device != xdev:
+                y = y.to(xdev, non_blocking=True)
+            outs.append(y)
+        return torch.cat(outs, dim=-1)
+
+    # the engine calls layers both ways (w(x) and w.forward(x)), so support both
+    __call__ = forward
+
+
+def build_sharded(w_factory, plan: list):
+    """Build a ShardedLinear from per-device factories.
+
+    w_factory(dev, lo, hi) must return the layer object holding rows [lo, hi) of the
+    output dimension on device `dev` -- that is where the checkpoint slicing lives, so
+    this module never has to know whether the weights are fp8 blocks or fp4 experts.
+    """
+    parts = []
+    for dev, (lo, hi) in plan:
+        parts.append((dev, w_factory(dev, lo, hi)))
+    return ShardedLinear(parts)
