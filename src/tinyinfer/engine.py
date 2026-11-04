@@ -795,6 +795,35 @@ class Engine:
             self._layer_dev[layer_id] = dev
         return f"cuda:{dev}" if str(self.device).startswith("cuda") else self.device
 
+    def _expert_route(self):
+        """How the routed experts are spread over the cards, or None for one card.
+
+        Built once from the same device list that drives placement, so the expert split
+        and the weight split cannot disagree about how many ranks exist. One card means
+        nothing to split and this returns None -- the caller then leaves ep_world at 1 and
+        the per-layer filter is a no-op, not a special case.
+        """
+        cached = getattr(self, "_ep_route", None)
+        if cached is not None:
+            return cached if getattr(cached, "world", 1) > 1 else None
+        if self.pool is None or not self.devices or len(self.devices) < 2:
+            self._ep_route = None
+            return None
+        try:
+            from .ep import ExpertRoute
+
+            n = int(getattr(self.cfg, "n_routed_experts", 0) or 0)
+            if n <= 0:
+                return None
+            caps = [int(d.free) for d in self.devices]
+            route = ExpertRoute(n, [f"cuda:{d.index}" for d in self.devices], caps)
+            self._ep_route = route
+            print(f"[tinyinfer] {route.summary()}", flush=True)
+            return route
+        except Exception as exc:
+            print(f"[tinyinfer] expert-parallel routing skipped ({exc!r})", flush=True)
+            return None
+
     def _tensor_plan(self, name: str, out_features: int):
         """Where the output rows of one projection go, in the multi-GPU case.
 
@@ -908,6 +937,15 @@ class Engine:
             b.hc_post_on_cpu = getattr(self, "small_ops_on_cpu", False)
             ffn = getattr(b, "ffn", None)
             if ffn is not None:
+                # Expert parallelism, from the device list rather than a rank count: the
+                # ranks are the cards this engine probed, so a one-card machine gets
+                # world=1 and the filters below are no-ops. The legacy tp.rank path is
+                # still honoured when a distributed group is actually initialised.
+                _epr = self._expert_route()
+                if _epr is not None:
+                    ffn.ep_world = _epr.world
+                    ffn.ep_rank = 0
+                    ffn._ep_route = _epr
                 # DEFAULT OFF: the background fetch races the main-thread reads and made
                 # the same MoE layer produce different values for different sequence
                 # lengths (T=8 vs T=11 differed 4% on identical inputs), which showed up

@@ -394,7 +394,16 @@ class MoE:
         _world = int(getattr(self, "ep_world", 1) or 1)
         _rank = int(getattr(self, "ep_rank", 0) or 0)
         if _world > 1:
-            active = [i for i in active if (i % _world) == _rank]
+            # Ownership comes from the route table when there is one (contiguous blocks
+            # proportional to each card's free VRAM), and falls back to the historic
+            # modulo split only for the legacy distributed path. The distinction
+            # matters: modulo scatters each rank's expert blobs across the whole file,
+            # so every rank's reads are strided where contiguous blocks are sequential.
+            _route = getattr(self, "_ep_route", None)
+            if _route is not None:
+                active = [i for i in active if _route.rank_of(i) == _rank]
+            else:
+                active = [i for i in active if (i % _world) == _rank]
         self._last_ids = list(active)  # already the unique routed set (one host sync total)
         target = xf.device
         # Decode (one token) reads each expert's packed fp4 tiles directly through the
@@ -732,10 +741,20 @@ class MoE:
                 else:
                     y[idx] += self._to_acc(e.forward(xf[idx], weights[idx, top, None]), y)
 
-        # the shared expert was already accumulated above (rank 0 only, so the all-reduce
-        # lands it once instead of once per rank)
-        if _world > 1:
-            from ..tp import all_reduce_sum
+        # Expert parallelism: each rank computed a DISJOINT subset of the experts, so the
+        # layer output is the sum of the ranks' partial outputs -- not a concatenation
+        # (that would double the rows) and not any single one (that would drop every
+        # expert another rank owned, which is what this used to do: the filter above
+        # narrowed `active` to the rank's own experts and nothing ever added the ranks
+        # back together, so world>1 returned a silently incomplete answer).
+        #
+        # The old call went through torch.distributed because the only mode was one
+        # process per rank; the ranks here are devices inside one process, so the sum is
+        # a device-to-device add. _ep_partials is filled by the caller that drives the
+        # per-rank passes; a single rank simply has nothing to add.
+        _partials = getattr(self, "_ep_partials", None)
+        if _partials:
+            from ..ep import reduce_partials
 
-            y = all_reduce_sum(y)
+            y = reduce_partials(list(_partials) + [y], target_device=y.device)
         return y.to(x.dtype).view(shape)
