@@ -113,3 +113,170 @@ def available() -> bool:
         return bool(dist.is_available())
     except Exception:
         return False
+# ---------------------------------------------------------------------------
+# Multi-GPU placement: asymmetric sharding, VRAM pooling, automatic addressing
+# ---------------------------------------------------------------------------
+#
+# The pieces above assume ranks of equal size, which is what torch.distributed wants.
+# A machine assembled from whatever cards were available is not that: a 96 GB PRO 6000
+# next to a 32 GB 5090 has to give the big card three times the weights, and nothing in
+# NCCL expresses that. So placement here is explicit instead of rank-based:
+#
+#   probe_devices()  measure every card (total/free VRAM, bandwidth)
+#   Pool             one ledger across all cards, sized from what is really free
+#   asplit()         split a dimension in proportion to each card's share, block-aligned
+#   Placement        key -> device, i.e. the addressing table the forward pass consults
+#
+# Nothing here assumes the cards are identical, symmetric, or even the same architecture.
+
+
+@dataclass
+class Device:
+    """One visible GPU and what it can take."""
+
+    index: int
+    name: str
+    total: int          # bytes of VRAM
+    free: int           # bytes free right now
+    bandwidth: float    # bytes/s, from the spec sheet (clock x bus), not measured
+
+
+def probe_devices(reserve: int = 512 << 20) -> list[Device]:
+    """Enumerate every visible GPU with its real free VRAM.
+
+    reserve is kept out of the budget on each card: the caching allocator, the CUDA
+    context and the KV cache all need room that placement does not get to spend.
+    """
+    out: list[Device] = []
+    if not torch.cuda.is_available():
+        return out
+    for i in range(torch.cuda.device_count()):
+        p = torch.cuda.get_device_properties(i)
+        try:
+            free, _total = torch.cuda.mem_get_info(i)
+        except Exception:
+            free = p.total_memory
+        # bandwidth from the spec: memory clock (kHz) x 2 (DDR) x bus width / 8
+        bus = getattr(p, "memory_bus_width", 0) or 0
+        clk = getattr(p, "memory_clock_rate", 0) or 0     # kHz
+        bw = float(clk) * 1e3 * 2.0 * bus / 8.0 if bus and clk else 0.0
+        out.append(Device(index=i, name=p.name, total=int(p.total_memory),
+                          free=max(0, int(free) - reserve), bandwidth=bw))
+    return out
+
+
+class Pool:
+    """One VRAM ledger across every card.
+
+    Placement asks the pool, not the devices directly, so that two allocations cannot
+    both believe they own the same free bytes. Shares are proportional to each card's
+    free VRAM, which is what makes the split asymmetric without a separate knob.
+    """
+
+    def __init__(self, devices: list[Device]):
+        self.devices = devices
+        self.cap = [max(0, int(d.free)) for d in devices]
+        self.used = [0] * len(devices)
+
+    def remaining(self) -> int:
+        return sum(c - u for c, u in zip(self.cap, self.used))
+
+    def room_on(self, i: int) -> int:
+        return max(0, self.cap[i] - self.used[i])
+
+    def shares(self) -> list[float]:
+        """Fraction of the remaining budget each card represents (sums to 1)."""
+        rem = [self.room_on(i) for i in range(len(self.cap))]
+        tot = float(sum(rem))
+        if tot <= 0:
+            return [0.0] * len(rem)
+        return [r / tot for r in rem]
+
+    def take(self, nbytes: int, prefer: int | None = None) -> int:
+        """Book nbytes on one card; returns its index, or -1 when nothing fits."""
+        if nbytes <= 0:
+            return -1
+        order = list(range(len(self.cap)))
+        if prefer is not None and 0 <= prefer < len(self.cap):
+            order.remove(prefer)
+            order.insert(0, prefer)
+        # best fit: smallest card that still holds it, keeping the big ones for big pieces
+        fit = [i for i in order if self.room_on(i) >= nbytes]
+        if not fit:
+            return -1
+        best = min(fit, key=lambda i: self.room_on(i))
+        self.used[best] += nbytes
+        return best
+
+    def release(self, i: int, nbytes: int) -> None:
+        self.used[i] = max(0, self.used[i] - int(nbytes))
+
+
+def asplit(n: int, caps: list[int], align: int = SHARD_BLOCK) -> list[tuple[int, int]]:
+    """Split n rows in proportion to caps, every boundary a multiple of align.
+
+    Largest-remainder apportionment on the blocks, so the parts add up to exactly n and
+    a small card never ends up with a negative remainder. Blocks smaller than align
+    cannot be split at all (the scale layout would straddle the boundary), so a card
+    whose share rounds to zero simply gets nothing -- that is correct, not a bug.
+    """
+    if n <= 0 or not caps:
+        return []
+    nb = n // align
+    if nb <= 0:
+        return [(0, n)]
+    tot = float(sum(max(0, c) for c in caps))
+    if tot <= 0:
+        tot = 1.0
+    exact = [nb * max(0, c) / tot for c in caps]
+    base = [int(e) for e in exact]
+    left = nb - sum(base)
+    frac = sorted(range(len(caps)), key=lambda i: exact[i] - base[i], reverse=True)
+    for k in range(left):
+        base[frac[k % len(frac)]] += 1
+    out: list[tuple[int, int]] = []
+    lo = 0
+    for b in base:
+        hi = lo + b * align
+        if hi > lo:
+            out.append((lo, hi))
+        lo = hi
+    if lo < n and out:
+        out[-1] = (out[-1][0], n)
+    return out
+
+
+class Placement:
+    """The addressing table: which device holds each named tensor.
+
+    Keys are names the forward pass already uses (layer.12.attn.wo_b,
+    layer.12.expert.7.w1), so a lookup costs a dict hit and the caller never has to know
+    how the model was distributed.
+    """
+
+    def __init__(self, pool: Pool):
+        self.pool = pool
+        self.map: dict[str, int] = {}
+        self.bytes: dict[str, int] = {}
+
+    def __len__(self) -> int:
+        return len(self.map)
+
+    def place(self, key: str, nbytes: int, prefer: int | None = None) -> int:
+        dev = self.pool.take(nbytes, prefer=prefer)
+        if dev < 0:
+            raise MemoryError(
+                f"placement: {nbytes} bytes for {key} does not fit; "
+                f"{self.pool.remaining()} bytes left across {len(self.pool.cap)} device(s)")
+        self.map[key] = dev
+        self.bytes[key] = int(nbytes)
+        return dev
+
+    def device(self, key: str, default: int = 0) -> int:
+        return self.map.get(key, default)
+
+    def summary(self) -> dict[int, int]:
+        out: dict[int, int] = {}
+        for k, d in self.map.items():
+            out[d] = out.get(d, 0) + self.bytes.get(k, 0)
+        return out
