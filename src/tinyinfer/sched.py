@@ -133,10 +133,17 @@ class BatchScheduler:
         # (width - len(prompt)) + len(out), which is what forward() computes per row from
         # the attention path's start_pos and the row's offset. Passing the minimum keeps
         # every row's RoPE index consistent with its own history.
-        start = self._start_pos()
+        # Per-row positions. A row's last real token sits at column (len(prompt)-1) of a
+        # fresh prompt or column 0 of a decoding row, and those are different depths in
+        # different rows -- exactly what one shared start_pos cannot express.
+        pos = torch.tensor(
+            [(len(r.prompt) - 1) if id(r) in self._fresh else self._pos(r)
+             for r in self.running],
+            dtype=torch.long, device=self.engine.device)
+        start = int(pos.min().item())
         t0 = time.perf_counter()
         with torch.inference_mode():
-            logits = self.engine.forward(ids, start_pos=start)
+            logits = self.engine.forward(ids, start_pos=start, positions=pos)
         dt = time.perf_counter() - t0
         self._step_ms = dt * 1000.0
         self.steps += 1
@@ -157,20 +164,15 @@ class BatchScheduler:
         return finished
 
     def _start_pos(self) -> int:
-        """Absolute position the stacked columns begin at.
+        """Lowest per-row position in the batch (what forward()'s start_pos reports).
 
-        A row contributes (its prompt, then one token per step). There are two regimes:
-
-          prefill   some row is fresh, so the stack is prompt-width and starts at 0.
-          steady    every row contributes one column at its own next position; rows that
-                    joined later are shorter, so the shared position is the minimum.
-
-        Rows are right-aligned, so a row's own position is start + width - 1 -- which is
-        why a late arrival re-supplies its prompt instead of assuming the batch is level.
+        The authoritative per-row values are passed separately as positions; this is only
+        the scalar the engine uses for chunking decisions.
         """
-        if any(id(r) in self._fresh for r in self.running):
+        if not self.running:
             return 0
-        return min(self._pos(r) for r in self.running) if self.running else 0
+        return min((len(r.prompt) - 1) if id(r) in self._fresh else self._pos(r)
+                   for r in self.running)
 
     def _emit(self, r: Request, nid: int, finished: list) -> None:
         if not r.first_token_at:

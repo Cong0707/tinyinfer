@@ -202,7 +202,13 @@ class MLACompressedAttention:
         self.tp_world = tp.world
         self.tp_rank = tp.rank
 
-    def forward(self, x: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, start_pos: int = 0,
+                positions: torch.Tensor | None = None) -> torch.Tensor:
+        # positions: optional [b] absolute position of each row's LAST token. A batched
+        # call has rows at different depths (one sequence just prefilled, another already
+        # decoding), and every per-row quantity below -- the RoPE row, the compressed
+        # group index -- is a function of that row's own position, not of one shared
+        # start_pos. None keeps the single-sequence path exactly as it was.
         import os as _os
         _pt = {} if _os.environ.get("TI_ATTN_PROF") else None
         _t0 = __import__("time").perf_counter() if _pt is not None else 0.0
@@ -256,7 +262,11 @@ class MLACompressedAttention:
         if full and self._decode_win_idxs is not None:
             win_idxs = self._decode_win_idxs
         else:
-            win_idxs = window_idxs_general(start_pos, s, old.size(1), self.window, x.device).unsqueeze(0).expand(b, -1, -1)
+            if positions is not None and positions.numel() == b and b > 1:
+                from ..nn import window_idxs_per_row
+                win_idxs = window_idxs_per_row(positions, s, old.size(1), self.window, x.device)
+            else:
+                win_idxs = window_idxs_general(start_pos, s, old.size(1), self.window, x.device).unsqueeze(0).expand(b, -1, -1)
             if full:
                 self._decode_win_idxs = win_idxs
         # view into the staging buffer, not a per-token allocation (see MLAWindowAttention)
@@ -271,6 +281,14 @@ class MLACompressedAttention:
         latent = self.compressor.forward(x, start_pos) if self.compressor is not None else None
         if _pt is not None:
             _pt["compressor"] = (__import__("time").perf_counter() - _t1) * 1e3
+        # Per-row group index, resolved BEFORE the RoPE block below needs it. With one
+        # shared start the whole batch lands at the same group offset, so two sequences
+        # at different depths overwrite each other's compressed history -- measured as
+        # row A drifting 16.18 against the same prompt run alone.
+        if positions is not None and positions.numel() == b:
+            _grp0 = (positions // self.ratio).to(torch.long)
+        else:
+            _grp0 = None
         if latent is not None:
             # the reference rotates the latent at its group position and quantises it to fp4
             # (block 16, E4M3 scales) before it enters the shared cache; both steps are part
@@ -278,30 +296,41 @@ class MLACompressedAttention:
             if getattr(self, "quant", False) and latent.is_cuda:
                 from ..nn import apply_rope as _apply_rope
                 from ..official_kernel_ref import fp4_act_quant
-                if start_pos == 0:
-                    # One row per latent group, and the number of groups comes from the
-                    # latent itself: a prompt chunk that is not a multiple of ``ratio``
-                    # (the last chunk of a 120-token prompt through chunk=8 is 5 tokens)
-                    # made the old ``s - s % ratio`` slice produce fewer rows than the
-                    # latent had groups, and apply_rope then failed with
-                    # "shape '[1, 5, 32]' is invalid for input of size 128".
-                    _groups = int(latent.size(1))
-                    fr = self.freqs_cis[:_groups * self.ratio : self.ratio]
+                # One RoPE row per latent group; group j rotates at its window's first
+                # token position. With per-row positions the rows differ, so this becomes
+                # a gather instead of an arange (a batched call can hold one sequence at
+                # group 0 and another at group 40).
+                _ng = int(latent.size(1))
+                if _grp0 is not None:
+                    _grp = _grp0.unsqueeze(1) + torch.arange(
+                        _ng, device=latent.device).unsqueeze(0)
+                    fr = self.freqs_cis[(_grp * self.ratio).reshape(-1)].reshape(
+                        b, _ng, -1)
+                elif start_pos == 0:
+                    fr = self.freqs_cis[:_ng * self.ratio : self.ratio]
                 else:
-                    # one row per latent group: a group stands for the first token of its
-                    # window, so group j rotates at position (start_group + j) * ratio.
-                    # (A single row only works when the caller passes exactly one group.)
                     _g0 = start_pos // self.ratio
-                    _grp = torch.arange(_g0, _g0 + latent.size(1), device=latent.device)
+                    _grp = torch.arange(_g0, _g0 + _ng, device=latent.device)
                     fr = self.freqs_cis[_grp * self.ratio]
                 # the reference keeps the pre-RoPE latent for the indexer (its KProject runs
                 # on the compressor output before rotation) and only the rotated copy goes
                 # into the shared cache -- rotating in place fed the indexer rotated keys
                 stored = latent.clone()
-                _apply_rope(stored[..., -self.rope_dim:], fr)
+                if fr.dim() == 3:
+                    # per-row table [b, ng, d]: rotate each row on its own, because a
+                    # single [ng, d] table cannot describe two rows at different depths
+                    for _r in range(stored.size(0)):
+                        _apply_rope(stored[_r:_r + 1, ..., -self.rope_dim:],
+                                    fr[_r:_r + 1].reshape(fr.size(1), -1))
+                else:
+                    _apply_rope(stored[..., -self.rope_dim:], fr)
                 fp4_act_quant(stored, 16, True, scale_dtype=torch.float8_e4m3fn)
                 latent = stored
-            start_group = start_pos // self.ratio
+            # Per-row group index. With a shared start the batch would store every row at
+            # the same group offset, so two sequences of different length overwrite each
+            # other's compressed history -- that is what made the second one degrade the
+            # first (measured: row A drifted by 16.18 against the same prompt alone).
+            start_group = int(_grp0.min().item()) if _grp0 is not None else start_pos // self.ratio
             need = start_group + latent.size(1)
             cur = self._compress_kv
             # The cache is shared across the kv_source group via self.rt, so it can already

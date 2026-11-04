@@ -1,4 +1,4 @@
-﻿"""Minimal numeric building blocks used by the reference forward."""
+"""Minimal numeric building blocks used by the reference forward."""
 from __future__ import annotations
 
 import math
@@ -83,6 +83,28 @@ def window_idxs_general(start_pos: int, seqlen: int, old_len: int, window: int, 
     idx = gpos - base
     valid = (gpos >= 0) & (idx >= 0) & (idx < old_len + seqlen)
     return torch.where(valid, idx, torch.full_like(idx, -1)).int()
+
+
+def window_idxs_per_row(positions, seqlen: int, old_len: int, window: int, device=None) -> torch.Tensor:
+    """Window slots for a batch whose rows have different absolute positions.
+
+    window_idxs_general() describes one row and is broadcast over the batch, so rows that
+    are not at the same depth get one row's mask. That is the whole reason a batched
+    prefill of "Hello" (1 token) next to "The capital of France is" (5 tokens) produced
+    different logits for the short row: the shared mask let the short row attend to slots
+    the long row had filled. This builds [b, seqlen, window] instead.
+
+    positions: [b] absolute position of each row's first column.
+    """
+    back = torch.arange(window - 1, -1, -1, device=device)
+    out = []
+    for p0 in positions.tolist():
+        qpos = torch.arange(int(p0), int(p0) + seqlen, device=device)
+        gpos = qpos[:, None] - back[None, :]
+        idx = gpos - (int(p0) - old_len)
+        valid = (gpos >= 0) & (idx >= 0) & (idx < old_len + seqlen)
+        out.append(torch.where(valid, idx, torch.full_like(idx, -1)).int())
+    return torch.stack(out, 0)
 
 
 def sparse_attn_ref(

@@ -274,7 +274,8 @@ class Block(HCBlockMixin):
         self._device = device
         return self
 
-    def forward(self, x: torch.Tensor, start_pos: int, pre_mix: torch.Tensor):
+    def forward(self, x: torch.Tensor, start_pos: int, pre_mix: torch.Tensor,
+                positions=None):
         # Device alignment. With weights placed across cards (engine._gpu_for_layer) the
         # incoming activation still lives on the previous layer's card, so it has to move
         # before any of this layer's kernels run. On a single GPU the comparison is
@@ -308,7 +309,7 @@ class Block(HCBlockMixin):
             _w.append(_t.perf_counter())          # 1: attn input ready
         if self.profile:
             ev[1].record()
-        h = self.attn.forward(h, start_pos)
+        h = self.attn.forward(h, start_pos, positions=positions)
         _dp = getattr(self, "_dump_parts", None)
         if _dp is not None:
             _dp.append((self.layer_id, "y_attn", h.clone()))

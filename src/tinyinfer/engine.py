@@ -1760,7 +1760,9 @@ class Engine:
             return out
         return torch.nn.functional.linear(h.to(head.dtype), head)
 
-    def _forward_chunk(self, ids: torch.Tensor, start_pos: int):
+    def _forward_chunk(self, ids: torch.Tensor, start_pos: int, positions=None):
+        # positions: optional [b] per-row position of each row's last token, for a batch of
+        # sequences at different depths. None is the single-sequence path, unchanged.
         self._last_hidden = None  # filled after the final layer (MTP stage-0 input)
         self._target_layers = set(self.cfg.dspark_target_layer_ids)
         self._target_hidden: dict[int, torch.Tensor] = {}
@@ -1897,7 +1899,7 @@ class Engine:
                 pre_mix = h
                 continue
             try:
-                h, pre_mix = b.forward(h, start_pos, pre_mix)
+                h, pre_mix = b.forward(h, start_pos, pre_mix, positions=positions)
                 _dh = getattr(self, "_dump_h", None)
                 if _dh is not None:
                     _dh.append((i, h_in.clone(), h.clone()))
@@ -2182,8 +2184,16 @@ class Engine:
             logits = torch.nn.functional.linear(y.to(self.head.dtype), self.head).float()
         return int(_sample(logits[0, -1], temperature))
 
-    def forward(self, ids: torch.Tensor, start_pos: int = 0, chunk: int | None = None):
-        """Decode/prefill entry point: CUDA graph replay when captured, else the OOM ladder."""
+    def forward(self, ids: torch.Tensor, start_pos: int = 0, chunk: int | None = None,
+                positions=None):
+        """Decode/prefill entry point: CUDA graph replay when captured, else the OOM ladder.
+
+        positions: optional [b] per-row absolute position of each row's last token. A
+        batched call mixing a fresh prompt with already-decoding sequences needs it --
+        one shared start_pos would put every row at the same RoPE depth and the same
+        compressed group. None (the default) is exactly the previous behaviour, and the
+        CUDA-graph path only accepts the single-position form.
+        """
         for attempt in range(3):
             try:
                 if start_pos > 0 and chunk is None:
@@ -2191,7 +2201,7 @@ class Engine:
                     if hit is not None:
                         return hit
                     self._graph_try_capture(ids, start_pos)
-                return self._forward_impl(ids, start_pos, chunk)
+                return self._forward_impl(ids, start_pos, chunk, positions=positions)
             except Exception as exc:
                 # torch raises OutOfMemoryError, while some CUDA paths surface a plain
                 # RuntimeError whose text says "out of memory"; both are handled the same
@@ -2202,7 +2212,8 @@ class Engine:
                 self._shed_vram()
         raise RuntimeError("unreachable")
 
-    def _forward_impl(self, ids: torch.Tensor, start_pos: int = 0, chunk: int | None = None):
+    def _forward_impl(self, ids: torch.Tensor, start_pos: int = 0, chunk: int | None = None,
+                      positions=None):
         """Chunked prefill: KV/hash state carries across chunks (attention uses start_pos)."""
         if ids.device.type != self.device and self.device != "cpu":
             ids = ids.to(self.device)
@@ -2224,7 +2235,7 @@ class Engine:
         if chunk is None and T > 256:
             step = max(1, min(step, 256))
         if T <= step:
-            return self._forward_chunk(ids, start_pos)
+            return self._forward_chunk(ids, start_pos, positions=positions)
         logits = None
         for off in range(0, T, step):
             logits = self._forward_chunk(ids[:, off:off + step], start_pos + off)

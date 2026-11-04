@@ -429,7 +429,13 @@ class MoE:
         # as "disable" turned the fused path off for tiers that never asked either way.
         _force_fused = bool(getattr(self, "_official_gemv", False))
         _fused = False
-        if _single and use_fp4_kernel and _aq is not None and active:
+        # Batched decode (M>1) has to reach the same number as M=1 or two sequences in one
+        # call decode differently from the same sequences run alone. M=1 uses the fused fp4
+        # kernels; M>1 used to fall through to the bf16-dequant prefill path, which is a
+        # different (and less exact) arithmetic -- measured 16.85 apart on identical
+        # prompts. The fused path handles the rows it is given, so the gate is on the
+        # kernel being available, not on the row count.
+        if use_fp4_kernel and _aq is not None and active:
             _ok = self._fused_ok
             if _ok is None:
                 from . import moe_gemv

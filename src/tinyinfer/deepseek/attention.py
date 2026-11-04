@@ -218,7 +218,11 @@ class MLAWindowAttention:
         # other layers' windows alive and the next run started from stale KV
         self._states.clear()
 
-    def forward(self, x: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, start_pos: int = 0,
+                positions: torch.Tensor | None = None) -> torch.Tensor:
+        # positions is accepted for interface parity with the compressed path (a batch
+        # may mix both layer kinds); this layer's cache is per-row already, and the
+        # window indices are derived from start_pos plus the row's own offset.
         b, s, _ = x.shape
         assert start_pos + s <= self.freqs_cis.size(0), "sequence exceeds rotated position table"
         # one shared table per (dim, seqlen, yarn args): resolving it through the cache
@@ -303,7 +307,13 @@ class MLAWindowAttention:
         if full and self._decode_idxs is not None:
             idxs = self._decode_idxs
         else:
-            idxs = window_idxs_general(start_pos, s, old.size(1), self.window, x.device).unsqueeze(0).expand(b, -1, -1)
+            if positions is not None and positions.numel() == b and b > 1:
+                # rows at different depths need their own mask; a broadcast mask lets a
+                # short row attend to slots only a longer row had filled
+                from ..nn import window_idxs_per_row
+                idxs = window_idxs_per_row(positions, s, old.size(1), self.window, x.device)
+            else:
+                idxs = window_idxs_general(start_pos, s, old.size(1), self.window, x.device).unsqueeze(0).expand(b, -1, -1)
             if full:
                 # decode with a full linear history: slots 1..window is a fixed template
                 self._decode_idxs = idxs
