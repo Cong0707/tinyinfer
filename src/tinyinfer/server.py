@@ -1441,13 +1441,12 @@ class TinyModelBackend(BaseBackend):
             token_count += 1
             piece = self._decode([int(item)])
             emitted_text += piece
-            yield TokenEvent(kind="token", index=token_count, token_id=int(item), text=piece)
+            yield TokenEvent(text=piece, token_id=int(item))
         if token_count >= int(sampling.max_tokens or 64):
             finish = "length"
         else:
             finish = "stop"
-        yield TokenEvent(kind="done", index=token_count, token_id=None, text="",
-                         finish_reason=finish)
+        yield TokenEvent(text="", token_id=None, finish_reason=finish)
 
     def _serve_loop(self):
         """The one batch loop this backend serves through, started on first use."""
