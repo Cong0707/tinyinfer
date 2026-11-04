@@ -16,7 +16,8 @@ correct, just slow.
 
 After editing a `.cu`, recompile only what you touched:
 
-    .\scripts\build_native.ps1 -Only rms_norm
+    .\scripts\build_native.ps1 -Only rms_norm      # Windows
+    ./scripts/build_native.sh rms_norm              # Linux / macOS
 
 Requirements: Python 3.12+ (the venv is created 3.13), CUDA toolkit + VS Build Tools on
 Windows for the kernel step, and:
