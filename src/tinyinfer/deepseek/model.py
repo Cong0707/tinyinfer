@@ -88,7 +88,8 @@ class Block(HCBlockMixin):
         self.ffn = MoE(store, layer_id, cfg, expert_store=expert_store, topk=expert_topk,
                        cache_shared_bf16=cache_shared_bf16,
                        max_bf16_experts=(0 if quant and not __import__("os").environ.get("TI_BF16_CACHE")
-                                          else 8))
+                                          else 8),
+                       plan_fn=plan_fn)
         p = f"layers.{layer_id}."
         self.attn_norm = store.get(p + "attn_norm.weight")
         self.ffn_norm = store.get(p + "ffn_norm.weight")

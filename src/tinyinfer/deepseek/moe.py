@@ -221,7 +221,8 @@ class Expert:
 
 class MoE:
     def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, expert_store=None,
-                 max_bf16_experts: int = 8, topk: int = 0, cache_shared_bf16: bool = False):
+                 max_bf16_experts: int = 8, topk: int = 0, cache_shared_bf16: bool = False,
+                 plan_fn=None):
         self.cfg = cfg
         self.layer_id = layer_id
         self._expert_store = expert_store  # optional tinyinfer.loading.ExpertStore
@@ -231,10 +232,27 @@ class MoE:
         p = f"layers.{layer_id}.ffn."
         # shared expert stays fp8 on the device (halves its VRAM; official fp8 GEMM path)
         from ..linear import QuantLinear
+
+        def _mk(name, cache):
+            """One shared-expert projection, split across cards when a plan says so."""
+            ql = QuantLinear(store.get(p + name + ".weight"), store.get(p + name + ".scale"),
+                             cache_bf16=cache)
+            if plan_fn is None:
+                return ql
+            plan = plan_fn("shared." + name, int(ql.weight.shape[0]))
+            if not plan or len(plan) <= 1:
+                return ql
+            from ..tp import shard_quant_linear
+            return shard_quant_linear(ql.weight, ql.scale, plan)
+
+        # The shared expert runs on EVERY token and on every layer, unlike a routed expert:
+        # 3 projections x 40 layers = 120 launches per decode step that always happen.
+        # Splitting its output dimension across cards divides those reads by the number of
+        # cards with no reduction (the slices are disjoint).
         self.shared = Expert(
-            QuantLinear(store.get(p + "shared_experts.w1.weight"), store.get(p + "shared_experts.w1.scale"), cache_bf16=cache_shared_bf16),
-            QuantLinear(store.get(p + "shared_experts.w2.weight"), store.get(p + "shared_experts.w2.scale"), cache_bf16=cache_shared_bf16),
-            QuantLinear(store.get(p + "shared_experts.w3.weight"), store.get(p + "shared_experts.w3.scale"), cache_bf16=cache_shared_bf16),
+            _mk("shared_experts.w1", cache_shared_bf16),
+            _mk("shared_experts.w2", cache_shared_bf16),
+            _mk("shared_experts.w3", cache_shared_bf16),
             cfg.swiglu_limit,
         )
         self._store = store
@@ -260,6 +278,20 @@ class MoE:
             self.swiglu_limit,
         )
 
+    def _to_acc(self, val, y):
+        """Bring an expert's output back to the device the accumulator lives on.
+
+        With the slot arenas spread over several cards an expert can be computed on a
+        different device than the accumulator; the sum has to happen on one of them. On a
+        single card both are already the same device and this returns the tensor
+        unchanged, so there is no copy and no branch on the card count.
+        """
+        if val is None or not torch.is_tensor(val):
+            return val
+        if val.device != y.device:
+            return val.to(y.device, non_blocking=True)
+        return val
+
     def _expert_from_rec(self, rec) -> Expert:
         """One cudaMemcpyAsync per expert, straight from the host-pool slice.
 
@@ -268,7 +300,19 @@ class MoE:
         the queue to drain, which put ~18ms/layer on the critical path. One async 18.8MB
         DMA is 0.7ms and never blocks.
         """
+        # The device this expert should live on. `gate.weight.device` (one fixed card) was
+        # the only possibility when every expert fit on that card; with the slot arenas
+        # spread over the pool, an expert belongs wherever ITS slot was allocated, so ask
+        # the record rather than assuming. A single card answers the same device either
+        # way, which is why this replaces the constant instead of special-casing it.
         target = self.gate.weight.device
+        # The slot buffer IS the storage: its device is where this expert's bytes already
+        # are, so reading rec.buffer.device answers the question without trusting a
+        # separately-maintained string (which lags a re-allocation). A host buffer means
+        # the RAM-cache path, where the gate's device is the right destination.
+        _buf = getattr(rec, "buffer", None)
+        if _buf is not None and getattr(_buf, "device", None) is not None                 and _buf.device.type == "cuda":
+            target = _buf.device
         if target.type == "cuda" and hasattr(rec, "tensors_on"):
             t = rec.tensors_on(target)
             e = Expert(None, None, None, self.swiglu_limit)
@@ -491,9 +535,9 @@ class MoE:
                     # Marlin reads the raw activation and streams the weights at 308 GB/s;
                     # the fp8-GEMV path measures 40. fp4_linear short-circuits to Marlin
                     # before quantising, so the pre-quantised pair is only the fallback.
-                    y[rows] += e.forward_fp4(xf[rows], weights[rows, cols, None]).float()
+                    y[rows] += self._to_acc(e.forward_fp4(xf[rows], weights[rows, cols, None]).float(), y)
                 else:
-                    y[rows] += e.forward(xf[rows], weights[rows, cols, None])
+                    y[rows] += self._to_acc(e.forward(xf[rows], weights[rows, cols, None]), y)
                 served.append(i)
         to_fetch = [i for i in active if i not in served]
 
@@ -594,7 +638,7 @@ class MoE:
                                 # fp4_linear, whose kernel differs from the pq path -- that
                                 # mismatch is what made a batch disagree with one-at-a-time.
                                 _val = e.forward_fp4_pq(_aq, _asc, _w).float()
-                                y += _val
+                                y += self._to_acc(_val, y)
                                 served.append(i)
                                 continue
                             # idx holds *every* row routed to this expert. Taking idx[0]
@@ -621,7 +665,7 @@ class MoE:
                             else:
                                 _val = e.forward(xf[idx], weights[idx, top, None]).float()
                         _idx_acc.append(idx.reshape(-1))
-                        _val_acc.append(_val.reshape(-1, y.size(-1)))
+                        _val_acc.append(self._to_acc(_val, y).reshape(-1, y.size(-1)))
 
                         if limit > 0:
                             if len(self._expert_cache) >= limit:
@@ -684,9 +728,9 @@ class MoE:
                 if limit > 0 and len(self._expert_cache) > limit:
                     self._expert_cache.pop(next(iter(self._expert_cache)))
                 if e.fp4 is not None:
-                    y[idx] += e.forward_fp4(xf[idx], weights[idx, top, None]).float()
+                    y[idx] += self._to_acc(e.forward_fp4(xf[idx], weights[idx, top, None]).float(), y)
                 else:
-                    y[idx] += e.forward(xf[idx], weights[idx, top, None])
+                    y[idx] += self._to_acc(e.forward(xf[idx], weights[idx, top, None]), y)
 
         # the shared expert was already accumulated above (rank 0 only, so the all-reduce
         # lands it once instead of once per rank)
