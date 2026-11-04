@@ -1,4 +1,4 @@
-﻿"""MLA sliding-window attention for DeepSeek-V4.1 (window-only path, compress_ratio == 0).
+"""MLA sliding-window attention for DeepSeek-V4.1 (window-only path, compress_ratio == 0).
 
 Reference implementations (consult when fixing this file):
   * DeepInfer  deepinfer/model_executor/models/v4_modules/attn.py
@@ -207,6 +207,12 @@ class MLAWindowAttention:
             # torch's by ~4e-3, and levels 0-2 must stay bit-comparable to the reference.
             from .deepseek_kernels import norm_rope as _fused_norm_rope
             kv = _fused_norm_rope(_kv_raw, self.kv_norm, freqs, self.eps, self.rope_dim)
+        if kv is None and __import__("os").environ.get("TI_FUSED_KV2", "1") != "0":
+            # CUDA fusion, bit-identical to the pair (the tilelang norm_rope above is the
+            # one that was ~4e-3 off and could not be enabled)
+            from .deepseek_kernels import norm_rope_cuda
+
+            kv = norm_rope_cuda(_kv_raw, self.kv_norm, freqs, self.eps, self.rope_dim)
         if kv is None:
             kv = rms_norm(_kv_raw, self.kv_norm, self.eps)
             _fused = None

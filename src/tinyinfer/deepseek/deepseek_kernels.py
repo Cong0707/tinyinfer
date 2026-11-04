@@ -185,6 +185,37 @@ def compress_pool(score: torch.Tensor, latent: torch.Tensor, ratio: int):
     return compress_pool_tl(int(s.shape[1]), int(ratio))(s, l)
 
 
+def norm_rope_cuda(x: torch.Tensor, weight: torch.Tensor, freqs: torch.Tensor,
+                   eps: float, rot: int):
+    """rms_norm + rope in one CUDA kernel (kernels/cuda/rms_norm_rope.cu).
+
+    Bit-identical to rms_norm -> apply_rope: the reduction copies vllm_rms_norm's exact
+    structure (8-wide vectors, thread i owns vector i, same shuffle tree, same block
+    size), and RoPE reads the bf16-rounded normalised value the way apply_rope does.
+    freqs is the complex position table, already sliced to this step's rows.
+    """
+    from ..kernels import native
+
+    if not x.is_cuda or x.dim() != 3 or x.dtype != torch.bfloat16:
+        return None
+    n, t, dim = x.shape
+    if dim % 8 or rot % 2 or rot > dim or t == 0:
+        return None
+    try:
+        flat = x.reshape(n * t, dim).contiguous()
+        w = weight.contiguous()
+        fr = freqs[:t].contiguous()
+        out = torch.empty_like(flat)
+        blk = min(dim // 8, 1024 if n * t < 256 else 256)
+        native.launch(native.kernel("rms_norm_rope", "rms_norm_rope_bf"),
+                      (n * t,), (blk,),
+                      [flat, w, fr, out, n * t, t, dim, rot, float(eps)],
+                      shared=32 * 4)
+        return out.view(x.shape)
+    except Exception:
+        return None
+
+
 def norm_rope(x: torch.Tensor, weight: torch.Tensor, freqs: torch.Tensor, eps: float, rot: int):
     """rms_norm + rope in one kernel; freqs is a complex table [n, rot // 2]."""
     if not HAS_TILELANG or not x.is_cuda or x.dim() != 3 or x.size(0) != 1:
