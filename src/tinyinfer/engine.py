@@ -92,6 +92,7 @@ class Engine:
             except Exception as _tp_exc:
                 print(f"[tinyinfer] multi-GPU probe skipped ({_tp_exc!r})", flush=True)
         self._layer_dev: dict[int, int] = {}
+        self._expert_dev: dict[tuple[int, int], int] = {}
         self._tokenizer = tokenizer
         self.hashes = None
         self.adapter = open_adapter(adapter) if isinstance(adapter, str) else adapter
@@ -769,7 +770,66 @@ class Engine:
             self._layer_dev[layer_id] = dev
         return f"cuda:{dev}" if str(self.device).startswith("cuda") else self.device
 
+    def _plan_experts(self) -> None:
+        """Decide which card each expert belongs on (multi-GPU only).
+
+        This is a *table*, not a move: the fetch path still reads from disk/RAM into the
+        current device's slot exactly as before. Splitting the slots themselves is a much
+        deeper change (the read path, the cache accounting and the slot ring all assume
+        one device), so the plan is computed and recorded first and acted on afterwards.
+
+        The rule is capacity-proportional, not round-robin: on a 96+32 GB machine the big
+        card takes three quarters of the experts, which is the whole point of asymmetric
+        placement. Compiled per layer, because routing is per layer.
+        """
+        if not self._multi_gpu or self.placement is None:
+            return
+        cfg = getattr(self, "cfg", None)
+        if cfg is None or self._expert_dev:
+            return          # called before the config exists, or already planned
+        n_layers = int(getattr(cfg, "n_layers", 0) or 0)
+        per_layer = int(getattr(cfg, "n_routed_experts", 0) or 0)
+        if not n_layers or not per_layer:
+            return
+        try:
+            blob = int(getattr(cfg, "expert_bytes", 0) or 0)
+        except Exception:
+            blob = 0
+        if blob <= 0:
+            blob = 18_800_000          # measured flat-blob size on this checkpoint
+        caps = [self.pool.room_on(i) for i in range(len(self.pool.cap))]
+        # per layer: how many experts each card can hold at this blob size
+        per = [max(0, c // blob) for c in caps]
+        tot = sum(per)
+        if tot <= 0:
+            return
+        for layer in range(n_layers):
+            lo = 0
+            for dev, cnt in enumerate(per):
+                # this card's proportional share of THIS layer's experts
+                share = int(round(per_layer * cnt / tot))
+                take = min(per_layer - lo, share)
+                for e in range(lo, lo + take):
+                    self._expert_dev[(layer, e)] = dev
+                lo += take
+            # anything left over (rounding) goes to the biggest card
+            if lo < per_layer:
+                big = max(range(len(caps)), key=lambda i: caps[i])
+                for e in range(lo, per_layer):
+                    self._expert_dev[(layer, e)] = big
+        counts = {}
+        for d in self._expert_dev.values():
+            counts[d] = counts.get(d, 0) + 1
+        desc = ", ".join(f"cuda:{d}: {c} experts" for d, c in sorted(counts.items()))
+        print(f"[tinyinfer] expert placement plan: {desc}", flush=True)
+
+    def expert_device(self, layer_id: int, expert_id: int) -> int:
+        """Which card an expert is planned on (0 when single-GPU or unplanned)."""
+        return getattr(self, "_expert_dev", {}).get((int(layer_id), int(expert_id)), 0)
+
     def block(self, layer_id: int) -> Block:
+        if self._multi_gpu and not self._expert_dev:
+            self._plan_experts()   # config is live by the first call; plans once
         b = self._blocks.get(layer_id)
         if b is None:
             # The adapter decides how a layer is built. DeepSeek layers need the expert
