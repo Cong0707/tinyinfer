@@ -313,6 +313,37 @@ def fused_fp4_swiglu_pq(aq, asc, w1, s1, w3, s3, limit=10.0, block_M=32, block_N
     return h
 
 
+def fp4_swiglu_quant_cuda(aq, asc, w1, s1, w3, s3, limit=10.0):
+    """gate/up fp4 GEMV + SwiGLU + block-32 FP8 quantisation, one CUDA kernel.
+
+    Returns (hq fp8 [N], hs e8m0 [N/32]). Replaces fused_fp4_swiglu_pq followed by
+    act_quant: same arithmetic, but scalar FMA in fp32 rather than the tensor-core path,
+    so it is an A/B alternative (TI_FUSED_MOE=1) rather than a drop-in replacement until
+    the layer-by-layer probe says the outputs match.
+    """
+    from ..kernels import native
+
+    n, k = w1.shape[0], aq.shape[1]
+    if not aq.is_cuda or k % 32 or n % 32:
+        return None
+    try:
+        hq = torch.empty(n, device=aq.device, dtype=torch.float8_e4m3fn)
+        hs = torch.empty(n // 32, device=aq.device, dtype=torch.float8_e8m0fnu)
+        native.launch(
+            native.kernel("fp4_swiglu_quant", "fp4_swiglu_quant"),
+            ((n + 31) // 32,), (256,),
+            [aq.view(torch.uint8).reshape(-1), asc.view(torch.uint8).reshape(-1),
+             _packed(w1).contiguous().view(torch.uint8).reshape(-1),
+             s1.view(torch.uint8).reshape(-1),
+             _packed(w3).contiguous().view(torch.uint8).reshape(-1),
+             s3.view(torch.uint8).reshape(-1),
+             hq.view(torch.uint8), hs.view(torch.uint8),
+             int(n), int(k), float(limit)])
+        return hq, hs
+    except Exception:
+        return None
+
+
 def fused_fp4_down_pq(aq, asc, w2, s2, weights, block_M=32, block_N=128):
     m, k = aq.shape; n = w2.shape[0]
     y = torch.empty(m, n, device=aq.device, dtype=torch.bfloat16)
@@ -326,9 +357,24 @@ def fused_fp4_expert_ffn(x, w1, s1, w3, s3, w2, s2, weights, limit=10.0,
     """Full routed expert: act_quant(x) -> fused gate/up+silu -> act_quant(h) -> fused down+weights.
 
     Returns y [M,dim] bf16. This is the integration entry point for tinyinfer.moe.Expert.
+
+    The middle two steps are one CUDA kernel when the batch is a single row
+    (kernels/cuda/fp4_swiglu_quant.cu): gate/up GEMV, SwiGLU and the block-32 FP8
+    quantisation of h, which removes both the bf16 round trip of the whole [1, inter] row
+    and one launch per expert-layer (240 of them per decode token). Bit-identical to the
+    tilelang pair on the shapes tested; TI_FUSED_MOE=0 forces the original chain.
     """
+    import os as _os_moe
+
     import kernel as _k  # reference/official/kernel.py
+
     aq, asc = _k.act_quant(x, 32, "ue8m0", torch.float8_e8m0fnu)
+    if aq.shape[0] == 1 and _os_moe.environ.get("TI_FUSED_MOE", "1") != "0":
+        got = fp4_swiglu_quant_cuda(aq, asc, w1, s1, w3, s3, limit)
+        if got is not None:
+            hq, hs = got
+            return fused_fp4_down_pq(hq.view(1, -1), hs.view(1, -1),
+                                     w2, s2, weights, block_M, block_N)
     h = fused_fp4_swiglu_pq(aq, asc, w1, s1, w3, s3, limit, block_M, block_N)
     hq, hs = _k.act_quant(h, 32, "ue8m0", torch.float8_e8m0fnu)
     return fused_fp4_down_pq(hq, hs, w2, s2, weights, block_M, block_N)
