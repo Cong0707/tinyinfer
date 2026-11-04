@@ -1,7 +1,7 @@
-import tilelang
+﻿import tilelang
 from tilelang import language as T
 
-from tile_kernels.utils import align
+from tinyinfer.kernels.tilelang.utils import align
 
 
 @tilelang.jit(

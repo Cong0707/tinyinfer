@@ -1,10 +1,10 @@
-"""Compensated RSTD helpers for Ascend TileLang kernels."""
+﻿"""Compensated RSTD helpers for Ascend TileLang kernels."""
 
 import struct
 
 from tilelang import language as T
 
-from tile_kernels.config import is_ascend
+from tinyinfer.kernels.tilelang.config import is_ascend
 
 if is_ascend():
     from tilelang.ascend.language import simd as S

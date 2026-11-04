@@ -1,7 +1,7 @@
-import math
+﻿import math
 
-from tile_kernels.config import get_num_vec_cores, get_pdl, is_ascend
-from tile_kernels.mhc.pre_big_fuse_cuda import mhc_pre_big_fuse_fwd_cuda
+from tinyinfer.kernels.tilelang.config import get_num_vec_cores, get_pdl, is_ascend
+from tinyinfer.kernels.tilelang.mhc.pre_big_fuse_cuda import mhc_pre_big_fuse_fwd_cuda
 
 # Ascend fused kernel token block; num_tokens must be a multiple of it.
 _ASCEND_TOKEN_BLOCK = 16
@@ -28,7 +28,7 @@ def mhc_pre_big_fuse_fwd(
         mhc_mult = residual.shape[-2]
         assert mhc_mult == 4, f'Ascend pre_big_fuse only supports mHC4, got {mhc_mult}'
         assert gemm_out_mul.shape[0] == 1, 'Ascend pre_big_fuse expects the GEMM to reduce split-K internally (one partial)'
-        from tile_kernels.mhc.pre_big_fuse_asc import mhc_pre_big_fuse_fwd_asc
+        from tinyinfer.kernels.tilelang.mhc.pre_big_fuse_asc import mhc_pre_big_fuse_fwd_asc
 
         h_blk = min(math.gcd(512, hidden_size), 256)
         mhc_pre_big_fuse_fwd_asc(

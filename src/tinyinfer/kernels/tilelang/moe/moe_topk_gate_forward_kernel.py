@@ -1,9 +1,9 @@
-from typing import Optional
+﻿from typing import Optional
 
 import torch
 
-from tile_kernels.config import get_num_vec_cores, get_pdl, is_ascend
-from tile_kernels.moe.moe_topk_gate_forward_cuda import get_moe_topk_gate_forward_kernel_cuda
+from tinyinfer.kernels.tilelang.config import get_num_vec_cores, get_pdl, is_ascend
+from tinyinfer.kernels.tilelang.moe.moe_topk_gate_forward_cuda import get_moe_topk_gate_forward_kernel_cuda
 
 
 def moe_topk_gate_forward(
@@ -114,7 +114,7 @@ def moe_topk_gate_forward(
         assert fix_routing_mask.dim() == 1 and fix_routing_mask.size(0) == num_tokens
 
     if is_ascend():
-        from tile_kernels.moe.moe_topk_gate_forward_asc import get_moe_topk_gate_forward_kernel_asc
+        from tinyinfer.kernels.tilelang.moe.moe_topk_gate_forward_asc import get_moe_topk_gate_forward_kernel_asc
 
         kernel = get_moe_topk_gate_forward_kernel_asc(
             num_topk,

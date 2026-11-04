@@ -1,7 +1,7 @@
-import torch
+﻿import torch
 
-from tile_kernels.config import get_num_vec_cores, get_pdl, is_ascend
-from tile_kernels.moe.topk_gate_cuda import get_topk_gate_kernel_cuda
+from tinyinfer.kernels.tilelang.config import get_num_vec_cores, get_pdl, is_ascend
+from tinyinfer.kernels.tilelang.moe.topk_gate_cuda import get_topk_gate_kernel_cuda
 
 
 def topk_gate(scores: torch.Tensor, num_topk: int) -> torch.Tensor:
@@ -33,7 +33,7 @@ def topk_gate(scores: torch.Tensor, num_topk: int) -> torch.Tensor:
         return topk_idx
 
     if is_ascend():
-        from tile_kernels.moe.topk_gate_asc import get_topk_gate_kernel_asc
+        from tinyinfer.kernels.tilelang.moe.topk_gate_asc import get_topk_gate_kernel_asc
 
         kernel = get_topk_gate_kernel_asc(num_experts, num_topk, get_num_vec_cores())
     else:

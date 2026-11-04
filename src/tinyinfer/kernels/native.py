@@ -1,4 +1,4 @@
-﻿"""Hand-written decode kernels: nvcc -> cubin -> CUDA driver API.
+"""Hand-written decode kernels: nvcc -> cubin -> CUDA driver API.
 
 No torch C++ extension build. scripts/build_native.ps1 runs nvcc (under the MSVC
 environment that nvcc insists on) and this module loads the cubin with nvcuda.dll, so
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 from pathlib import Path
 
 _DIR = Path(__file__).with_name("build")
@@ -20,7 +21,22 @@ def _lib():
     global _LIB
     if _LIB is not None:
         return _LIB
-    lib = ctypes.CDLL("nvcuda.dll")
+    # The driver library has a different name per platform, and it is the only file name
+    # in this module that is platform-specific: hardcoding nvcuda.dll made every kernel
+    # lookup fail on Linux with a bare OSError, which the callers' try/except turns into
+    # "silently use torch instead" -- correct output, 5-10x slower, no message.
+    if sys.platform == "win32":
+        lib = ctypes.CDLL("nvcuda.dll")
+    else:
+        last = None
+        for _cand in ("libcuda.so.1", "libcuda.so"):
+            try:
+                lib = ctypes.CDLL(_cand)
+                break
+            except OSError as exc:  # driver installed under another soname
+                last = exc
+        else:
+            raise RuntimeError("libcuda not found (is the NVIDIA driver installed?)") from last
     lib.cuInit.argtypes = [ctypes.c_uint]
     lib.cuInit.restype = ctypes.c_int
     lib.cuModuleLoad.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p]

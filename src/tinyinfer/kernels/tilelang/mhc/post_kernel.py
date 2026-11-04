@@ -1,10 +1,10 @@
-import math
+﻿import math
 
 import torch
 
-from tile_kernels.config import get_num_vec_cores, get_pdl, is_ascend
-from tile_kernels.mhc.post_cuda import mhc_post_bwd_cuda, mhc_post_fwd_cuda
-from tile_kernels.utils import align, ceil_div
+from tinyinfer.kernels.tilelang.config import get_num_vec_cores, get_pdl, is_ascend
+from tinyinfer.kernels.tilelang.mhc.post_cuda import mhc_post_bwd_cuda, mhc_post_fwd_cuda
+from tinyinfer.kernels.tilelang.utils import align, ceil_div
 
 
 def mhc_post_fwd(
@@ -34,7 +34,7 @@ def mhc_post_fwd(
 
     n = num_seqs * num_tokens
     if is_ascend():
-        from tile_kernels.mhc.post_asc import mhc_post_fwd_asc
+        from tinyinfer.kernels.tilelang.mhc.post_asc import mhc_post_fwd_asc
 
         h_blk = hidden if hidden <= 4096 else min(ceil_div(hidden, 2), 4096)
         h_blk = align(h_blk, 64)
@@ -78,7 +78,7 @@ def mhc_post_bwd(
     h = d_o.shape[3]
 
     if is_ascend():
-        from tile_kernels.mhc.post_asc import mhc_post_bwd_asc
+        from tinyinfer.kernels.tilelang.mhc.post_asc import mhc_post_bwd_asc
 
         h_blk = h if h <= 4096 else min(ceil_div(h, 2), 4096)
         h_blk = align(h_blk, 64)

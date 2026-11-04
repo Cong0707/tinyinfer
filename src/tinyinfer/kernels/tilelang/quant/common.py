@@ -1,13 +1,13 @@
-import functools
+﻿import functools
 from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
 from tilelang import language as T
 
-from tile_kernels.config import get_amax_clamp_for_quant, is_ascend
-from tile_kernels.quant.types import QuantTensor
-from tile_kernels.utils import align, ceil_div, str_to_dtype
+from tinyinfer.kernels.tilelang.config import get_amax_clamp_for_quant, is_ascend
+from tinyinfer.kernels.tilelang.quant.types import QuantTensor
+from tinyinfer.kernels.tilelang.utils import align, ceil_div, str_to_dtype
 
 
 @functools.lru_cache(maxsize=8)

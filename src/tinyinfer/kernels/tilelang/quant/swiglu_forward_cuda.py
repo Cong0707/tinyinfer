@@ -1,11 +1,11 @@
-from math import gcd
+﻿from math import gcd
 from typing import Optional
 
 import tilelang
 from tilelang import language as T
 
-from tile_kernels.quant.common import *
-from tile_kernels.utils import is_power_of_two
+from tinyinfer.kernels.tilelang.quant.common import *
+from tinyinfer.kernels.tilelang.utils import is_power_of_two
 
 
 PREFETCH_SOURCE = """

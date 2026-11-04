@@ -1,6 +1,6 @@
-from tilelang import language as T
+﻿from tilelang import language as T
 
-from tile_kernels.config import is_ascend
+from tinyinfer.kernels.tilelang.config import is_ascend
 
 if is_ascend():
     from tilelang.ascend.language import simd as S
@@ -114,7 +114,7 @@ _BACKWARD_COEFFS = (
 
 @T.macro
 def sqrt_softplus_backward_cuda(y: T.Ref):
-    """Recover dy/dx from y=sqrt(softplus(x)); use the polynomial only for y²<1."""
+    """Recover dy/dx from y=sqrt(softplus(x)); use the polynomial only for y虏<1."""
     u = y * y
     half_y = 0.5 * y
     q = T.alloc_var(T.float32, init=_BACKWARD_COEFFS[0])
@@ -128,7 +128,7 @@ def sqrt_softplus_backward_cuda(y: T.Ref):
 
 @T.macro
 def sqrt_softplus_backward_asc(y):
-    """Recover dy/dx from y=sqrt(softplus(x)); use the polynomial only for y²<1."""
+    """Recover dy/dx from y=sqrt(softplus(x)); use the polynomial only for y虏<1."""
     u = S.vmul(y, y)
     half_y = S.vmuls(y, 0.5)
     q = T.alloc_var(y.dtype, init=S.vdup(_BACKWARD_COEFFS[0], T.float32))

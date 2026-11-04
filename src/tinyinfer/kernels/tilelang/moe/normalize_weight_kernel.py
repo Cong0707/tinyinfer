@@ -1,6 +1,6 @@
-import torch
+﻿import torch
 
-from tile_kernels.config import get_num_vec_cores, get_pdl, is_ascend
+from tinyinfer.kernels.tilelang.config import get_num_vec_cores, get_pdl, is_ascend
 
 from .normalize_weight_cuda import get_normalize_weight_kernel_cuda
 

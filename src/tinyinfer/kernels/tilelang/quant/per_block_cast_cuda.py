@@ -1,8 +1,8 @@
-import tilelang
+﻿import tilelang
 from tilelang import language as T
 
-from tile_kernels.utils import ceil_div
-from tile_kernels.quant.common import *
+from tinyinfer.kernels.tilelang.utils import ceil_div
+from tinyinfer.kernels.tilelang.quant.common import *
 
 
 @tilelang.jit(

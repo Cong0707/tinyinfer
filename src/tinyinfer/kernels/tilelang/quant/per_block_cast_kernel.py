@@ -1,10 +1,10 @@
-from typing import Optional, Union
+﻿from typing import Optional, Union
 
 import torch
 
-from tile_kernels.config import get_num_vec_cores, get_pdl
-from tile_kernels.quant.common import *
-from tile_kernels.quant.per_block_cast_cuda import get_per_block_cast_kernel_cuda
+from tinyinfer.kernels.tilelang.config import get_num_vec_cores, get_pdl
+from tinyinfer.kernels.tilelang.quant.common import *
+from tinyinfer.kernels.tilelang.quant.per_block_cast_cuda import get_per_block_cast_kernel_cuda
 
 
 def per_block_cast_impl(
@@ -40,7 +40,7 @@ def per_block_cast_impl(
     out_config = get_cast_output_config(fmt, block_size, use_tma_aligned_col_major_sf, round_sf, use_packed_ue8m0)
 
     if is_ascend():
-        from tile_kernels.quant.per_block_cast_asc import get_per_block_cast_kernel_asc
+        from tinyinfer.kernels.tilelang.quant.per_block_cast_asc import get_per_block_cast_kernel_asc
 
         kernel = get_per_block_cast_kernel_asc(
             hidden=hidden,

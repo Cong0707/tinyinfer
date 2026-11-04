@@ -1,8 +1,8 @@
-import tilelang
+﻿import tilelang
 from tilelang import language as T
 
-from tile_kernels.utils import align, ceil_div
-from tile_kernels.moe.sqrt_softplus import sqrt_softplus_forward_cuda
+from tinyinfer.kernels.tilelang.utils import align, ceil_div
+from tinyinfer.kernels.tilelang.moe.sqrt_softplus import sqrt_softplus_forward_cuda
 
 
 @T.macro

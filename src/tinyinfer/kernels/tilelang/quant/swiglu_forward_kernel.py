@@ -1,11 +1,11 @@
-from typing import Optional
+﻿from typing import Optional
 
 import torch
 from tilelang import language as T
 
-from tile_kernels.config import get_num_sms, get_num_vec_cores, get_pdl, get_token_alignment, is_ascend
-from tile_kernels.quant.common import *
-from tile_kernels.quant.swiglu_forward_cuda import get_swiglu_forward_and_per_token_cast_kernel_cuda
+from tinyinfer.kernels.tilelang.config import get_num_sms, get_num_vec_cores, get_pdl, get_token_alignment, is_ascend
+from tinyinfer.kernels.tilelang.quant.common import *
+from tinyinfer.kernels.tilelang.quant.swiglu_forward_cuda import get_swiglu_forward_and_per_token_cast_kernel_cuda
 
 
 def swiglu_forward_and_per_token_cast_impl(
@@ -47,7 +47,7 @@ def swiglu_forward_and_per_token_cast_impl(
 
     # Get kernel implement
     if is_ascend():
-        from tile_kernels.quant.swiglu_forward_asc import get_swiglu_forward_kernel_asc
+        from tinyinfer.kernels.tilelang.quant.swiglu_forward_asc import get_swiglu_forward_kernel_asc
 
         kernel = get_swiglu_forward_kernel_asc(
             hidden,
