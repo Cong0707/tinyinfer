@@ -280,3 +280,47 @@ class Placement:
         for k, d in self.map.items():
             out[d] = out.get(d, 0) + self.bytes.get(k, 0)
         return out
+
+def shard_forward(x: torch.Tensor, plan: list, fn) -> torch.Tensor:
+    """Run one row-parallel projection across cards and stitch the output back.
+
+    plan is what asplit() produced, zipped with the device that owns each range:
+        [(dev, (lo, hi)), ...]
+    fn(dev, lo, hi, x_on_dev) must compute this device's slice of the output. The
+    activations are copied in, the results are copied back and concatenated on dim=-1,
+    which is where a row-parallel projection splits.
+
+    This is the piece that cannot be verified without two real cards, so it is kept
+    separate from the model code and exercised by a single-GPU test with a fake plan:
+    one card holding two ranges reproduces the unsharded result exactly.
+    """
+    if not plan:
+        raise ValueError("shard_forward: empty plan")
+    if len(plan) == 1:
+        dev, (lo, hi) = plan[0]
+        tgt = torch.device(f"cuda:{dev}") if x.is_cuda else x.device
+        xs = x if x.device == tgt else x.to(tgt)
+        out = fn(dev, lo, hi, xs)
+        return out if out.device == x.device else out.to(x.device)
+    outs = []
+    for dev, (lo, hi) in plan:
+        tgt = torch.device(f"cuda:{dev}") if x.is_cuda else x.device
+        xs = x if x.device == tgt else x.to(tgt)
+        ys = fn(dev, lo, hi, xs)
+        if ys.device != x.device:
+            ys = ys.to(x.device, non_blocking=True)
+        outs.append(ys)
+    return torch.cat(outs, dim=-1)
+
+
+def plan_for(n: int, pool: Pool, align: int = SHARD_BLOCK) -> list:
+    """asplit(n, capacities) paired with the device index that owns each range."""
+    caps = [pool.room_on(i) for i in range(len(pool.cap))]
+    ranges = asplit(n, caps, align=align)
+    # asplit drops cards whose share rounds to zero, so walk both lists together
+    out = []
+    for dev in range(len(caps)):
+        if not ranges:
+            break
+        out.append((dev, ranges.pop(0)))
+    return out
