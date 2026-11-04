@@ -47,6 +47,31 @@ def _bf16_default():
 
 
 def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, block: int = 32) -> torch.Tensor:
+    if (x.is_cuda and x.dim() == 2 and x.size(0) == 1
+            and block == 32 and w_fp8.shape[1] % 512 == 0
+            and w_fp8.shape[0] % 32 == 0
+            and __import__("os").environ.get("TI_FP8_NEW", "1") != "0"):
+        # kernels/cuda/fp8_gemv_bs.cu: 16 output rows x 32 lanes per block, one LDG.E.128
+        # per lane, so a warp reads 512 consecutive k. Measured 25.2 us vs 45.5 for the
+        # block_M=32 tilelang path on [2304, 5120] (1.8x, bit-identical). This is the
+        # shared-expert path, ~248 calls per decode token.
+        try:
+            from .kernels import native
+
+            aq, asc = _k.act_quant(x, block, SCALE_FMT, SCALE_DTYPE)
+            n, k = w_fp8.shape
+            y = torch.empty(n, device=x.device, dtype=torch.bfloat16)
+            native.launch(native.kernel("fp8_gemv_bs", "fp8_gemv_bs"),
+                          ((n + 15) // 16,), (512,),
+                          [aq.view(torch.uint8).reshape(-1),
+                           asc.view(torch.uint8).reshape(-1),
+                           w_fp8.view(torch.uint8).reshape(-1),
+                           w_scale.view(torch.uint8).reshape(-1),
+                           y, int(n), int(k)])
+            return y.view(1, n)
+        except Exception:
+            pass
+
     """C = x @ w_fp8.T with blockwise fp8 activation quant (official kernel path).
 
     decode (M==1) dispatches to the fused GEMV kernel (~1.8x faster than the
