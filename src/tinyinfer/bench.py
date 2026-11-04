@@ -1,6 +1,6 @@
 """Reproducible benchmark: prefill, decode, expert-cache hit rate, disk read rate.
 
-    python -m tinyinfer.bench --model E:\\Models\\DeepSeek-V4.1-Flash-1017 [--json out.json]
+    python -m tinyinfer.bench --model <checkpoint dir> [--json out.json]
 
 Prints a JSON object so runs can be diffed. Every number is measured, nothing is
 assumed: the disk rate is taken from the same reader the engine uses.

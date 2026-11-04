@@ -1,4 +1,4 @@
-"""Hyper-Connections: Sinkhorn-normalized mix coefficients, collapse/expand of hc copies."""
+﻿"""Hyper-Connections: Sinkhorn-normalized mix coefficients, collapse/expand of hc copies."""
 from __future__ import annotations
 
 import torch
@@ -48,7 +48,7 @@ def _sinkhorn_host(mixes, hc_scale, hc_base, hc_mult, iters, eps):
 
 def _native_sinkhorn(mixes, hc_scale, hc_base, hc_mult, iters, eps):
     """pre/post on the device, the hc x hc Sinkhorn in the hand-written kernel."""
-    from . import native
+    from .kernels import native
 
     hc = int(hc_mult)
     b, s, _ = mixes.shape
@@ -193,7 +193,7 @@ def _native_ok() -> bool:
     """True when the hand-written hc kernels are built."""
     if _NATIVE["ok"] is None:
         try:
-            from . import native
+            from .kernels import native
             native.kernel("hc", "hc_pre_f")
             _NATIVE["ok"] = True
         except Exception:
@@ -202,12 +202,12 @@ def _native_ok() -> bool:
 
 
 def _kern(name: str):
-    from . import native
+    from .kernels import native
     return native.kernel("hc", name)
 
 
 def _launch(fn, grid, block, args):
-    from . import native
+    from .kernels import native
     # no explicit stream: use torch's current one so graph capture sees the kernel
     native.launch(fn, grid, block, args)
 
@@ -243,7 +243,7 @@ class HCBlockMixin:
         # NOTE: a fused hc_mixes kernel (native/hc.cu, hc_mixes_f/_bf) exists and matches the
         # eager projection to ~2.9e-6, but that is not bit-identical: the torch path goes
         # through F.linear (cuBLAS tile order) while the kernel reduces with a warp tree.
-        # Enabling it changed the greedy answer from "中国的首都是北京" to "中国的首都北京",
+        # Enabling it changed the greedy answer from "涓浗鐨勯閮芥槸鍖椾含" to "涓浗鐨勯閮藉寳浜?,
         # so it stays off -- tier 2 is defined as full precision and the answer must not
         # move. TI_HC_MIXES_KERNEL=1 re-enables it for benchmarking only.
         if (__import__("os").environ.get("TI_HC_MIXES_KERNEL") == "1"

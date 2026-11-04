@@ -3,9 +3,23 @@
 Everything here is what was measured on an 8GB laptop; the same commands work on bigger
 cards (the planner adapts, docs/HARDWARE.md has the table).
 
-## 0. Requirements
+## 0. Install (one command)
 
-- Python 3.11+, torch with CUDA, and this package installed (`pip install -e .`).
+    .\scripts\bootstrap.ps1          # Windows
+    ./scripts/bootstrap.sh            # Linux / macOS
+
+That creates the venv, installs torch for your CUDA driver, installs the package editable,
+**and compiles the kernels**. The kernel step is the one that matters for speed: the engine
+loads every kernel from `kernels/build/*.cubin`, and without them each dispatch falls back
+to torch, which runs 5-10x slower. A missing `nvcc` is only a warning -- the fallback is
+correct, just slow.
+
+After editing a `.cu`, recompile only what you touched:
+
+    .\scripts\build_native.ps1 -Only rms_norm
+
+Requirements: Python 3.12+ (the venv is created 3.13), CUDA toolkit + VS Build Tools on
+Windows for the kernel step, and:
 - The checkpoint as HF safetensors on a fast disk (510GB). The volume's read speed sets
   decode speed: 4.5GB/s measured best, 1.5GB/s after heavy use.
 - ~16GB free host RAM for the pinned slab on an 8GB card (47GB total recommended).

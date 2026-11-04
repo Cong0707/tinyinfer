@@ -48,9 +48,10 @@ eager 驱动 49.9 tok/s，捕获后 180.4 tok/s（3.6 倍），十个 token 与 
 模型由**启动引擎的人**决定，客户端只连端口：
 
 ```powershell
-.\start.ps1                                            # DeepSeek（默认）
-.\start.ps1 -Model "E:\Models\Qwen3.5-0.8B"           # Qwen 0.8B
-.\start.ps1 -Model "D:\part1;E:\part2"                 # 一个 checkpoint 跨盘分片
+.\start.ps1 -Model <path>                              # 前台
+.\start.ps1 -Model <path> -Bg                          # 后台，日志进 serve.log
+$env:TINYINFER_MODEL = <path>; .\start.ps1             # 或用环境变量
+.\start.ps1 -Model "<pathA>;<pathB>"                   # 一个 checkpoint 跨盘分片
 
 .\venv\Scripts\python.exe repl.py                     # 唯一客户端
 ```

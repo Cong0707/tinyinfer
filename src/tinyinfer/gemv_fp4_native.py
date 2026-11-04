@@ -1,4 +1,4 @@
-"""Swap the fp4 expert GEMV for the hand-written ALU-decode kernel.
+﻿"""Swap the fp4 expert GEMV for the hand-written ALU-decode kernel.
 
 The tilelang kernel the engine shipped measures 41 GB/s on a 40MB expert matrix. A pure
 read of the same buffer reaches 212 GB/s, so the decode math -- not memory -- was the
@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import torch
 
-from . import native
+from .kernels import native
 
 # the native kernel reads an fp32 activation vector and e8m0 scale bytes
 _AVAILABLE = None

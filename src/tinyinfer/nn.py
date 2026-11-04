@@ -1,4 +1,4 @@
-"""Minimal numeric building blocks used by the reference forward."""
+﻿"""Minimal numeric building blocks used by the reference forward."""
 from __future__ import annotations
 
 import math
@@ -14,7 +14,7 @@ _RMS_NATIVE = {"ok": None}
 def _rms_native_ok() -> bool:
     if _RMS_NATIVE["ok"] is None:
         try:
-            from . import native
+            from .kernels import native
             native.kernel("rms_norm", "rms_norm_kernel")
             _RMS_NATIVE["ok"] = True
         except Exception:
@@ -43,7 +43,7 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     if (x.is_cuda and x.dtype == torch.bfloat16 and _rms_native_ok()
             and weight.numel() == x.shape[-1]):
         try:
-            from . import native
+            from .kernels import native
             shape = x.shape
             d = shape[-1]
             rows = 1

@@ -3,12 +3,14 @@
 # The engine loads once and picks its runtime path from the checkpoint itself, so whoever
 # starts it decides which model is served. Every client then just connects.
 #
-#   .\start.ps1                          # foreground, DeepSeek default
-#   .\start.ps1 -Bg                      # background, logs to serve.log
-#   .\start.ps1 -Model "E:\Models\Qwen3.5-0.8B"
-#   .\start.ps1 -Model "D:\part1;E:\part2"   # one checkpoint striped over disks
+#   .\start.ps1 -Model <dir>              # foreground
+#   .\start.ps1 -Model <dir> -Bg          # background, logs to serve.log
+#   $env:TINYINFER_MODEL = <dir>; .\start.ps1
+#   .\start.ps1 -Model "<dirA>;<dirB>"     # one checkpoint striped over disks
 param(
-    [string]$Model = "E:\Models\DeepSeek-V4.1-Flash-1017",
+    # No baked-in default: the repository must not carry any one machine's checkpoint
+    # path. Pass -Model, or export TINYINFER_MODEL in the shell that starts the engine.
+    [string]$Model = $env:TINYINFER_MODEL,
     [string]$Tier = "aggressive",
     [string]$HostAddr = "127.0.0.1",
     [int]$Port = 8000,
@@ -20,6 +22,10 @@ $env:PYTHONPATH = Join-Path $here "src"
 $py = Join-Path $here ".venv\Scripts\python.exe"
 if (-not (Test-Path $py)) { $py = "python" }
 
+if (-not $Model) {
+    throw ("no checkpoint given: pass -Model <dir> (several dirs joined by ; for a " +
+           "striped checkpoint), or set TINYINFER_MODEL")
+}
 if (-not (Test-Path ($Model.Split(";")[0]))) {
     throw "checkpoint not found: $Model (pass -Model <dir>, or several dirs joined by ;)"
 }

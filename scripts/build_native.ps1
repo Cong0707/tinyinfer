@@ -1,14 +1,19 @@
 # Compile the hand-written decode kernels to cubin.
 #
 # nvcc needs the MSVC environment on Windows, so each call is wrapped in vcvars64.
-# Every *.cu under src/tinyinfer/native is built; pass names to build a subset.
-# The arch defaults to this GPU's compute capability, overridable with -Arch sm_90.
+# Sources live under src/tinyinfer/kernels/cuda, one sub-directory per domain (gemm, norm,
+# act, moe, hc, linear_attn); every cubin lands flat in src/tinyinfer/kernels/build because
+# the loader addresses a module by base name alone.
+#
+# Pass -Only <names> to build a subset. The arch defaults to this GPU compute capability.
 param(
     [string]$Arch = "",
     [string[]]$Only = @()
 )
 $ErrorActionPreference = "Stop"
-$dir = Join-Path $PSScriptRoot "..\src\tinyinfer\native"
+$cuda = Join-Path $PSScriptRoot "..\src\tinyinfer\kernels\cuda"
+$out  = Join-Path $PSScriptRoot "..\src\tinyinfer\kernels\build"
+New-Item -ItemType Directory -Force -Path $out | Out-Null
 
 if (-not $Arch) {
     $cc = (nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>$null | Select-Object -First 1)
@@ -26,18 +31,36 @@ if (-not $vc) {
 }
 if (-not $vc) { Write-Output "warning: vcvars64.bat not found; assuming cl.exe is on PATH" }
 
-$files = if ($Only.Count -gt 0) { $Only } else {
-    Get-ChildItem $dir -Filter *.cu | ForEach-Object { $_.BaseName }
+# Marlin templates need CUTLASS headers: point CUTLASS_PATH at a checkout to build them.
+$cutlass = $env:CUTLASS_PATH
+# Two Marlin translation units export module names that differ from their file name.
+$rename = @{ "instances" = "marlin_fp4"; "repack" = "marlin_repack" }
+
+# powershell -File passes "-Only a,b,c" as one string; split it so both call styles work.
+$Only = @($Only | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
+
+$files = Get-ChildItem $cuda -Recurse -Filter *.cu
+if ($Only.Count -gt 0) {
+    $files = $files | Where-Object { $Only -contains $_.BaseName -or $Only -contains $rename[$_.BaseName] }
 }
+if (-not $files) { throw "no .cu under $cuda" }
+
 foreach ($f in $files) {
-    $cu = Join-Path $dir "$f.cu"
-    $out = Join-Path $dir "$f.cubin"
-    if (-not (Test-Path $cu)) { throw "no such kernel: $cu" }
-    if ($vc) {
-        cmd /c "call `"$vc`" >nul 2>&1 && nvcc -cubin -arch=$Arch -o `"$out`" `"$cu`""
-    } else {
-        cmd /c "nvcc -cubin -arch=$Arch -o `"$out`" `"$cu`""
+    $name = $f.BaseName
+    $mod = if ($rename.ContainsKey($name)) { $rename[$name] } else { $name }
+    $dst = Join-Path $out "$mod.cubin"
+    $inc = ""
+    if ($f.DirectoryName -match "marlin") {
+        if (-not $cutlass) { Write-Output ("{0,-20} skipped (set CUTLASS_PATH)" -f $name); continue }
+        $inc = "-I `"$($f.DirectoryName)`" -I `"$cutlass\include`" --expt-relaxed-constexpr -std=c++17"
     }
-    if ($LASTEXITCODE -ne 0) { throw "nvcc failed for $f" }
-    Write-Output ("{0,-16} {1,8} bytes" -f $f, (Get-Item $out).Length)
+    if ($vc) {
+        $outTxt = cmd /c "call `"$vc`" >nul 2>&1 && nvcc -cubin -arch=$Arch $inc -o `"$dst`" `"$($f.FullName)`" 2>&1"
+        $code = $LASTEXITCODE
+    } else {
+        $outTxt = cmd /c "nvcc -cubin -arch=$Arch $inc -o `"$dst`" `"$($f.FullName)`" 2>&1"
+        $code = $LASTEXITCODE
+    }
+    if ($code -ne 0) { $outTxt | Select-Object -Last 4; throw "nvcc failed for $name" }
+    Write-Output ("{0,-20} {1,8} bytes  ({2})" -f $mod, (Get-Item $dst).Length, $f.Directory.Name)
 }

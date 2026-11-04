@@ -1,4 +1,4 @@
-"""Whole-layer GEMV execution for Qwen3.5-0.8B decode.
+﻿"""Whole-layer GEMV execution for Qwen3.5-0.8B decode.
 
 The layer's weights are packed once into one contiguous bf16 block, in execution order,
 and every projection of the layer runs from a single kernel launch (grid.y / prefix-sum
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import torch
 
-from . import native
+from .kernels import native
 
 
 class Layer:

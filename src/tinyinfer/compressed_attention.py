@@ -1,4 +1,4 @@
-"""MLA attention with compressed KV (compress_ratio > 0), chunked-prefill capable.
+﻿"""MLA attention with compressed KV (compress_ratio > 0), chunked-prefill capable.
 
 Window KV uses a linear rolling history; compressed KV is a global group-indexed cache
 shared from kv_source layers. Supports arbitrary (start_pos, seqlen) chunks and decode.
@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from .compressor import Compressor, Indexer, shared_attn
 from .config import TinyConfig
-from .kernels import sparse_attn_dispatch
+from .kernels.sparse_attn import sparse_attn_dispatch
 from .linear import QuantLinear
 from .nn import apply_rope, precompute_freqs_cis, rms_norm, window_idxs_general
 from .quant import dequant_fp8_block

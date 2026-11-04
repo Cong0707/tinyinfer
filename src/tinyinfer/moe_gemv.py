@@ -1,4 +1,4 @@
-"""Decode-time fp4 MoE fused across every routed expert of a layer.
+﻿"""Decode-time fp4 MoE fused across every routed expert of a layer.
 
 The tilelang path launches one GEMV per expert per projection, converts each expert's
 e8m0 scale block to fp32 before the kernel can read it, and then spends about seven
@@ -20,7 +20,7 @@ replaces, and the result matches an fp32 reference to within one bf16 ulp.
 """
 import torch
 
-from . import native
+from .kernels import native
 
 MAX_EXPERTS = 8
 _fn_cache: dict[str, object] = {}

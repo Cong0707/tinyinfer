@@ -1,4 +1,4 @@
-"""Qwen3.5 layer arithmetic, called by QwenLayer.
+﻿"""Qwen3.5 layer arithmetic, called by QwenLayer.
 
 These are the reference formulas, not transformers internals: the attention block, the
 GatedDeltaNet recurrence, and the glue between the embedding and the head. They take plain
@@ -14,7 +14,7 @@ import torch.nn.functional as F
 
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """RMSNorm with the reference rounding: fp32 statistics, bf16 out."""
-    from . import native
+    from .kernels import native
 
     if x.dtype == torch.bfloat16 and native.available("qwen_norm", "qwen_rms_norm_bf"):
         out = torch.empty_like(x)
@@ -120,7 +120,7 @@ def _mlp(t: dict, h: torch.Tensor) -> torch.Tensor:
 
 
 def _swiglu_kernel(g: torch.Tensor, u: torch.Tensor, inter: int) -> torch.Tensor:
-    from . import native
+    from .kernels import native
 
     gu = torch.cat([g.reshape(-1), u.reshape(-1)], 0).contiguous()
     out = torch.empty(inter, dtype=torch.bfloat16, device=g.device)

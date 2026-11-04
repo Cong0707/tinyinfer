@@ -1,4 +1,4 @@
-"""fp4 expert GEMV through vLLM's Marlin kernel.
+﻿"""fp4 expert GEMV through vLLM's Marlin kernel.
 
 The hand-written ALU-decode kernel reaches 59 GB/s on a 40MB expert matrix; the
 tilelang one 40 GB/s. vLLM's Marlin measures 294 GB/s on the same buffer --
@@ -84,7 +84,7 @@ def _repack_launcher():
     if _REPACK is not None:
         return _REPACK or None
     try:
-        from . import native
+        from .kernels import native
 
         props = torch.cuda.get_device_properties(0)
         sms = int(props.multi_processor_count)
@@ -181,7 +181,7 @@ def _native_launcher():
     if _NATIVE is not None:
         return _NATIVE or None
     try:
-        from . import native
+        from .kernels import native
 
         props = torch.cuda.get_device_properties(0)
         sms = int(props.multi_processor_count)

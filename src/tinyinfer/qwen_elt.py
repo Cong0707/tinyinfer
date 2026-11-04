@@ -1,4 +1,4 @@
-"""Point Qwen3.5's per-layer elementwise steps at single-kernel versions.
+﻿"""Point Qwen3.5's per-layer elementwise steps at single-kernel versions.
 
 Qwen3_5MLP.forward is down_proj(act_fn(gate_proj(x)) * up_proj(x)): silu and mul are two
 torch kernels for a 3584-element activation. Qwen3_5DecoderLayer.forward does two
@@ -12,7 +12,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from . import native
+from .kernels import native
 
 
 def available() -> bool:

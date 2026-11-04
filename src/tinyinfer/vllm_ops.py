@@ -1,4 +1,4 @@
-"""vLLM-derived kernels, ported into native/ and called through the driver API.
+﻿"""vLLM-derived kernels, ported into native/ and called through the driver API.
 
 These are ports, not calls into vLLM's binary. Each one's source lives in
 src/tinyinfer/native/vllm_*.cu with its upstream file and the changes noted at the
@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import torch
 
-from . import native
+from .kernels import native
 
 _OPS = None
 _TRIED = False

@@ -1,4 +1,4 @@
-"""Hand-written decode kernels for Qwen3.5's GatedDeltaNet (linear attention).
+﻿"""Hand-written decode kernels for Qwen3.5's GatedDeltaNet (linear attention).
 
 transformers falls back to a pure-torch reference for these when fla/causal-conv1d are
 missing (and torch.compile is broken on this box, so even installed fla cannot be used).
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import torch
 
-from . import native
+from .kernels import native
 
 
 def available() -> bool:

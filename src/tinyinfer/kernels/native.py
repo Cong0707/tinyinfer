@@ -1,4 +1,4 @@
-"""Hand-written decode kernels: nvcc -> cubin -> CUDA driver API.
+﻿"""Hand-written decode kernels: nvcc -> cubin -> CUDA driver API.
 
 No torch C++ extension build. scripts/build_native.ps1 runs nvcc (under the MSVC
 environment that nvcc insists on) and this module loads the cubin with nvcuda.dll, so
@@ -10,7 +10,7 @@ import ctypes
 import os
 from pathlib import Path
 
-_DIR = Path(__file__).with_name("native")
+_DIR = Path(__file__).with_name("build")
 _MODULES: dict[str, int] = {}
 _KERNELS: dict[tuple[str, str], int] = {}
 _LIB = None

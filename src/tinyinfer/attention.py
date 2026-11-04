@@ -1,4 +1,4 @@
-"""MLA sliding-window attention for DeepSeek-V4.1 (window-only path, compress_ratio == 0).
+﻿"""MLA sliding-window attention for DeepSeek-V4.1 (window-only path, compress_ratio == 0).
 
 Reference implementations (consult when fixing this file):
   * DeepInfer  deepinfer/model_executor/models/v4_modules/attn.py
@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from .config import TinyConfig
-from .kernels import sparse_attn_dispatch
+from .kernels.sparse_attn import sparse_attn_dispatch
 from .nn import apply_rope, precompute_freqs_cis, rms_norm, window_idxs_general
 from .quant import dequant_fp8_block
 from .rope_cache import get_table, table_key

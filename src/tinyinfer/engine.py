@@ -1,4 +1,4 @@
-"""tinyinfer engine: full-model driver on top of adapters + tiers + ExpertStore.
+﻿"""tinyinfer engine: full-model driver on top of adapters + tiers + ExpertStore.
 
 Owns model lifecycle: embedding, block residency (lazy per-layer load), generation.
 The fetch/dequant/eviction policy lives in loading.py; this is the orchestration layer.
@@ -1586,7 +1586,7 @@ class Engine:
             # passed as a device one); with the head placed by the plan and checked below
             # the kernel is exact and beats the chunked fp32 GEMM (0.800 vs 0.835s/token)
             try:
-                from . import native
+                from .kernels import native
 
                 if (head.device.type != "cuda" or head.dtype != torch.bfloat16
                         or not head.is_contiguous()):
@@ -1736,7 +1736,9 @@ class Engine:
             if self.profile:
                 ev0 = torch.cuda.Event(enable_timing=True)
                 ev0.record()
-            if b.engram is not None and hash_ids is not None:
+            # getattr: a non-DeepSeek layer (Qwen's QwenLayer) has no engram attribute
+            # at all, and the plain attribute access crashed every Qwen run here.
+            if getattr(b, "engram", None) is not None and hash_ids is not None:
                 _e0 = __import__("time").perf_counter() if __import__("os").environ.get("TI_LAYER_TIME") else None
                 h = b.engram.forward(h, hash_ids[b.engram.hash_index])
                 if _e0 is not None:
@@ -1895,7 +1897,7 @@ class Engine:
                 h_cpu, pre_cpu, hash_ids, off = slot
                 h = h_cpu.to(self.device, non_blocking=False)
                 pre_mix = pre_cpu.to(self.device, non_blocking=False)
-                if bobj.engram is not None and hash_ids is not None:
+                if getattr(bobj, "engram", None) is not None and hash_ids is not None:
                     h = bobj.engram.forward(h, hash_ids[bobj.engram.hash_index])
                 h, pre_mix = bobj.forward(h, off, pre_mix)
                 slot[0] = h.cpu()

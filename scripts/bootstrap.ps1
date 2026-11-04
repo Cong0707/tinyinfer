@@ -46,8 +46,21 @@ Write-Host "==> 安装 tinyinfer 基础依赖"
 Write-Host "==> 安装 tinyinfer 包 (editable)"
 & $py -m pip install -e . --no-deps
 
+Write-Host "==> 编译 kernel (cubin)"
+# The engine loads kernels from kernels/build/*.cubin; this is the step that turns the
+# package from "works" into "fast". Without nvcc every dispatch falls back to torch and
+# decode runs 5-10x slower, so a missing toolkit is a warning, not an install failure.
+if (Get-Command nvcc -ErrorAction SilentlyContinue) {
+    try { & (Join-Path $PSScriptRoot "build_native.ps1") }
+    catch { Write-Host "警告: kernel 编译失败: $_" }
+} else {
+    Write-Host "警告: 找不到 nvcc，跳过 kernel 编译（会退回 torch 实现，慢 5-10 倍）"
+    Write-Host "      装好 CUDA toolkit 后再运行 scripts/build_native.ps1"
+}
+
 Write-Host "==> 自检"
 & $py -c "import torch, tinyinfer; print('torch', torch.__version__, 'cuda', torch.cuda.is_available()); print('tinyinfer', tinyinfer.__version__)"
+& $py -c "from pathlib import Path; from tinyinfer.kernels import native; n=len(list((Path(native.__file__).parent/'build').glob('*.cubin'))); print('cubin:', n, '(0 means torch fallback)')"
 
 Write-Host ""
 Write-Host "完成。运行: $py -m tinyinfer.cli --help"

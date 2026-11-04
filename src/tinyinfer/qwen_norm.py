@@ -1,4 +1,4 @@
-"""Point Qwen3.5's two RMSNorm variants at the hand-written kernels.
+﻿"""Point Qwen3.5's two RMSNorm variants at the hand-written kernels.
 
 Each call is seven torch kernels (to fp32, pow, mean, rsqrt, mul, mul, to dtype) and both
 run on every one of 24 layers, plus the gated one inside all 18 linear-attention layers.
@@ -16,7 +16,7 @@ import torch
 
 
 def install() -> bool:
-    from . import native
+    from .kernels import native
 
     try:
         native.kernel("qwen_norm", "qwen_rms_norm_bf")

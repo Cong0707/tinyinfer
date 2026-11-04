@@ -1,4 +1,4 @@
-"""Dense bf16 GEMV fast path for M=1, and helpers to fuse same-input projections.
+﻿"""Dense bf16 GEMV fast path for M=1, and helpers to fuse same-input projections.
 
 The card's limiting factor at decode is not bandwidth but how well small kernels cover
 memory latency: measured 174 GB/s for a 1024x1024 weight, 540 GB/s for 6144x1024, and
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import torch
 
-from . import native
+from .kernels import native
 
 _ENABLED = True
 

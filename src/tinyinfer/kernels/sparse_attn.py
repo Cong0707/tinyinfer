@@ -1,4 +1,4 @@
-"""Optional tilelang backends (O2). Lazy, cached, fallback-safe.
+﻿"""Optional tilelang backends (O2). Lazy, cached, fallback-safe.
 
 The tilelang JIT needs nvcc + MSVC cl.exe (vcvars64); when unavailable the
 dispatch silently falls back to the PyTorch reference implementation.
@@ -7,7 +7,7 @@ import functools
 
 import torch
 
-from .nn import sparse_attn_ref
+from ..nn import sparse_attn_ref
 
 _TL_STATE: bool | None = None  # None = untried, True = works, False = disabled
 
@@ -126,7 +126,7 @@ def sparse_attn_dispatch(q, kv, attn_sink, topk_idxs, scale: float, prefer_tilel
         # prefill differ from the token-by-token path. The alias keeps the name local:
         # a bare import here shadowed the module-level fallback below and raised
         # UnboundLocalError in tests.
-        from .nn import sparse_attn_ref as _ref
+        from ..nn import sparse_attn_ref as _ref
         return _ref(q, kv, attn_sink, topk_idxs, scale)
     """Official sparse_attn first (tilelang kernel.py), then our kernel, then torch.
 
