@@ -2639,6 +2639,24 @@ class ExpertStore:
         self._stream_bytes = 0
         self._lock = threading.RLock()
 
+    def set_devices(self, devices, caps) -> None:
+        """Spread this store's VRAM expert slots over several cards.
+
+        One entry means one card, which is the default: the slot cache then allocates a
+        single arena exactly as it always did. The call is forwarded rather than
+        duplicated so there is one implementation of the split.
+        """
+        sl = getattr(self, "slots", None)
+        if sl is not None and hasattr(sl, "set_devices"):
+            sl.set_devices(devices, caps)
+
+    def slot_device(self, slot: int) -> int:
+        """Which card this store's slot lives on (0 when there is one card)."""
+        sl = getattr(self, "slots", None)
+        if sl is not None and hasattr(sl, "slot_device"):
+            return sl.slot_device(slot)
+        return 0
+
     @classmethod
     def from_store(cls, store: Any, **kwargs) -> "ExpertStore":
         """Build from a tinyinfer.weights.ShardStore (duck-typed)."""

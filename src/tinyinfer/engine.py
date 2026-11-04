@@ -66,31 +66,32 @@ class Engine:
         self._engine_lock = EngineLock().acquire()
         self.layer_ids = list(layers) if layers is not None else None
         self.device = device
-        # Multi-GPU: probe every visible card, pool their VRAM and build the addressing
-        # table. With one card this collapses to a single-entry table and every path
-        # below behaves exactly as before, so a single-GPU run is byte-for-byte the same
-        # engine. The pool accounts for what is *really* free on each card, which is what
-        # makes the placement asymmetric without a configuration knob: the caller never
-        # says "put 60% here", the cards say how much they can hold.
+        # Every visible card is probed and pooled, unconditionally. There is no separate
+        # single-GPU code path: one card is simply the case where the device list has one
+        # entry, so placement, addressing and the expert slot split all run the same code
+        # and produce a one-element plan. That matters beyond tidiness -- a special case
+        # for N=1 is a path nobody exercises at N>1 and vice versa, and the two drift.
+        #
+        # The pool accounts for what is *really* free on each card, so the split is
+        # asymmetric without a knob: the caller never says "put 60% here", the cards say
+        # how much they can hold.
         self.devices: list = []
         self.pool = None
         self.placement = None
-        self._multi_gpu = False
         if str(device).startswith("cuda"):
             try:
                 from .tp import Pool, Placement, probe_devices
 
                 self.devices = probe_devices()
-                if len(self.devices) > 1:
+                if self.devices:
                     self.pool = Pool(self.devices)
                     self.placement = Placement(self.pool)
-                    self._multi_gpu = True
                     desc = ", ".join(
                         f"cuda:{d.index} {d.name} {d.free >> 30}GiB free "
                         f"({d.bandwidth / 1e9:.0f} GB/s)" for d in self.devices)
-                    print(f"[tinyinfer] multi-GPU pool: {desc}", flush=True)
+                    print(f"[tinyinfer] GPU pool ({len(self.devices)}): {desc}", flush=True)
             except Exception as _tp_exc:
-                print(f"[tinyinfer] multi-GPU probe skipped ({_tp_exc!r})", flush=True)
+                print(f"[tinyinfer] GPU probe skipped ({_tp_exc!r})", flush=True)
         self._layer_dev: dict[int, int] = {}
         self._expert_dev: dict[tuple[int, int], int] = {}
         # Padding token for batched prefill. Right padding relies on the causal mask, so
@@ -395,7 +396,7 @@ class Engine:
                 # slots per card, so a fetch lands on one device and the experts kernels
                 # read it from there; on a single card this list has one entry and the
                 # allocation is byte-for-byte the old one.
-                if self._multi_gpu and self.devices and self.expert_store is not None:
+                if self.devices and self.expert_store is not None:
                     try:
                         self.expert_store.set_devices(
                             [f"cuda:{d.index}" for d in self.devices],
@@ -775,14 +776,15 @@ class Engine:
     def _gpu_for_layer(self, layer_id: int, nbytes: int = 200 << 20):
         """Which device this layer's weights belong on.
 
-        Single GPU: the configured device, exactly as before. Multi-GPU: booked through
-        Placement on first use, so the cards fill proportionally to their real free VRAM
-        without anyone specifying a split. The byte estimate only drives the *booking*,
-        not the copy: if a card runs out the layer falls back to device 0 rather than
-        failing the run, because a suboptimal placement still works and a failed startup
-        does not.
+        Booked through Placement on first use, so the cards fill in proportion to their
+        real free VRAM without anyone specifying a split. One card means one entry in the
+        pool and every layer lands on it -- same call, same bookkeeping, no branch.
+
+        The byte estimate only drives the *booking*, not the copy: if a card runs out, the
+        layer falls back to device 0 rather than failing the run, because a suboptimal
+        placement still works and a failed startup does not.
         """
-        if not self._multi_gpu or self.placement is None:
+        if self.placement is None:
             return self.device
         dev = self._layer_dev.get(layer_id)
         if dev is None:
@@ -800,7 +802,7 @@ class Engine:
         aligned to the quantisation block, or None when there is only one card -- and
         None is what keeps the single-GPU code path exactly as it was.
         """
-        if not self._multi_gpu or self.pool is None:
+        if self.pool is None:
             return None
         try:
             from .tp import asplit
@@ -814,18 +816,17 @@ class Engine:
             return None
 
     def _plan_experts(self) -> None:
-        """Decide which card each expert belongs on (multi-GPU only).
+        """Decide which card each expert belongs on.
 
-        This is a *table*, not a move: the fetch path still reads from disk/RAM into the
-        current device's slot exactly as before. Splitting the slots themselves is a much
-        deeper change (the read path, the cache accounting and the slot ring all assume
-        one device), so the plan is computed and recorded first and acted on afterwards.
+        Capacity-proportional, not round-robin: on a 96+32 GB machine the big card takes
+        three quarters of the experts, which is the point of asymmetric placement. With
+        one card every expert maps to it, so the table is uniform and the lookup is a
+        no-op -- the same code, not a special case.
 
-        The rule is capacity-proportional, not round-robin: on a 96+32 GB machine the big
-        card takes three quarters of the experts, which is the whole point of asymmetric
-        placement. Compiled per layer, because routing is per layer.
+        Per layer, because routing is per layer: expert 7 of layer 3 and expert 7 of layer
+        4 are unrelated tensors and land wherever their own layer's plan puts them.
         """
-        if not self._multi_gpu or self.placement is None:
+        if self.placement is None:
             return
         cfg = getattr(self, "cfg", None)
         if cfg is None or self._expert_dev:
@@ -871,7 +872,7 @@ class Engine:
         return getattr(self, "_expert_dev", {}).get((int(layer_id), int(expert_id)), 0)
 
     def block(self, layer_id: int) -> Block:
-        if self._multi_gpu and not self._expert_dev:
+        if not self._expert_dev:
             self._plan_experts()   # config is live by the first call; plans once
         b = self._blocks.get(layer_id)
         if b is None:
