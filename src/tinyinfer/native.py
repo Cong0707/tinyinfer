@@ -34,6 +34,11 @@ def _lib():
                                    ctypes.POINTER(ctypes.c_void_p),
                                    ctypes.POINTER(ctypes.c_void_p)]
     lib.cuLaunchKernel.restype = ctypes.c_int
+    # opt-in dynamic shared memory above the 48KB default. Marlin asks for the whole
+    # 99KB this card allows, and a launch with more than 48KB of dynamic smem fails
+    # with CUDA_ERROR_INVALID_VALUE unless the function's attribute was raised first.
+    lib.cuFuncSetAttribute.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    lib.cuFuncSetAttribute.restype = ctypes.c_int
     rc = lib.cuInit(0)
     if rc != 0:
         raise RuntimeError(f"cuInit failed: {rc}")
@@ -93,8 +98,113 @@ def available(name: str, func: str | None = None) -> bool:
         return False
 
 
+# Fast path: a bound launcher for one (kernel, signature, geometry). Building the
+# ctypes arg array costs more than the launch itself (measured: launch() 17.3us vs
+# torch.ops._C 8.3us for the same 4096-wide rms_norm), because every call re-tests each
+# argument's type and re-allocs the pointer array. A BoundLaunch caches the geometry and
+# the argument kinds, so the steady state is one list comprehension plus cuLaunchKernel.
+class BoundLaunch:
+    """A kernel + signature + launch geometry, pre-resolved for repeated calls."""
+
+    __slots__ = ("_fn", "_grid", "_block", "_shared", "_kinds", "_n", "_raw", "_ptrs")
+
+    def __init__(self, fn, grid, block, kinds, shared=0):
+        self._fn = fn
+        self._grid = tuple((list(grid) + [1, 1, 1])[:3])
+        self._block = tuple((list(block) + [1, 1, 1])[:3])
+        self._shared = shared
+        # 'T' tensor, 'O' tensor the kernel writes, 'n' optional pointer (None -> NULL),
+        # 'i' int32, 'f' float32.
+        self._kinds = kinds
+        self._n = len(kinds)
+        # one 8-byte slot per argument, with a stable address for the pointer array
+        self._raw = (ctypes.c_uint64 * self._n)()
+        self._ptrs = (ctypes.c_void_p * self._n)()
+        for _i in range(self._n):
+            self._ptrs[_i] = ctypes.cast(ctypes.byref(self._raw, _i * 8),
+                                         ctypes.c_void_p)
+
+    def __call__(self, *args, stream=None) -> None:
+        import torch
+
+        if len(args) != self._n:
+            raise TypeError(f"expected {self._n} args, got {len(args)}")
+        # cuLaunchKernel takes an array of POINTERS to argument values, so the values
+        # live in one preallocated 8-byte slot each and the pointer array is built once.
+        # Rebuilding a ctypes object per argument cost ~7us for Marlin's 18-argument
+        # signature, which is most of the launch time when the kernel itself only runs
+        # for 12us (measured: 26us vs 19us against the C++ binding at N=2048).
+        kinds = self._kinds
+        raw = self._raw
+        for i in range(self._n):
+            a = args[i]
+            k = kinds[i]
+            if k == "n":
+                raw[i] = 0 if a is None else a.data_ptr()
+            elif k == "T" or k == "O":
+                raw[i] = a.data_ptr()
+                # No record_stream here. Every caller in this engine keeps its tensors
+                # alive for the duration of the call (they are Python locals), so the
+                # allocator cannot recycle them mid-launch. Recording instead pinned
+                # buffers to the stream long after they were dead, which fragmented a
+                # card this full badly enough to break the 40-layer plan and tripped
+                # CUDACachingAllocator's "!handles_.at(i)" assert. The generic launch()
+                # below still records, for one-off call sites that pass temporaries.
+            elif k == "f":
+                raw[i] = _FLOAT_BITS(a)
+            else:
+                raw[i] = a & 0xFFFFFFFF
+        ptrs = self._ptrs
+        if stream is None:
+            # A fresh c_void_p every call: cuLaunchKernel takes the argument block by
+            # pointer and the driver may write through it, so a cached object reused
+            # across launches would be mutated under us.
+            stream = ctypes.c_void_p(int(torch.cuda.current_stream().cuda_stream))
+        gx, gy, gz = self._grid
+        bx, by, bz = self._block
+        rc = _lib().cuLaunchKernel(self._fn, gx, gy, gz, bx, by, bz, self._shared,
+                                   stream, ptrs, None)
+        if rc != 0:
+            raise RuntimeError(f"cuLaunchKernel failed: {rc}")
+        # holders must outlive cuLaunchKernel, which copies the argument block
+        return None
+
+
+
+
+
+def _FLOAT_BITS(v) -> int:
+    """Reinterpret a Python float as the 32 bits a kernel reads for a float argument."""
+    import struct
+
+    return struct.unpack("<I", struct.pack("<f", float(v)))[0]
+
+
+# CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+_CU_FUNC_MAX_DYNAMIC_SMEM = 8
+
+
+def set_dynamic_smem(name: str, func: str, nbytes: int) -> None:
+    """Raise the function's dynamic shared memory cap to nbytes.
+
+    Required before any launch asking for more than 48KB, which Marlin does (it uses
+    the entire opt-in budget so one block can hold a whole K-slice of stages).
+    """
+    fn = kernel(name, func)
+    rc = _lib().cuFuncSetAttribute(fn, _CU_FUNC_MAX_DYNAMIC_SMEM, int(nbytes))
+    if rc != 0:
+        raise RuntimeError(f"cuFuncSetAttribute failed: {rc}")
+
+
+def bind(name: str, func: str, grid, block, kinds, shared: int = 0) -> BoundLaunch:
+    """Resolve a cubin kernel once and return a reusable launcher."""
+    return BoundLaunch(kernel(name, func), grid, block, kinds, shared)
+
+
 def launch(fn: int, grid, block, args, stream=None, shared: int = 0) -> None:
-    """Launch fn with python args (tensors -> data_ptr, int -> int32, float -> float32).
+    """Generic launch (kept for one-off call sites; prefer bind() in hot paths).
+
+    fn is launched with python args: tensors -> data_ptr, int -> int32, float -> float32.
 
     The stream defaults to torch's CURRENT stream rather than 0. Legacy stream 0 is not
     captured by torch.cuda.graph_capture, so a kernel launched there executes for real
