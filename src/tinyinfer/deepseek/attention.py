@@ -308,10 +308,16 @@ class MLAWindowAttention:
             idxs = self._decode_idxs
         else:
             if positions is not None and positions.numel() == b and b > 1:
-                # rows at different depths need their own mask; a broadcast mask lets a
-                # short row attend to slots only a longer row had filled
+                # Rows at different depths need their own mask AND their own history
+                # length: the buffer is [b, n_old+s, D] with one shared n_old, but a row
+                # that just joined has no history while one that has been decoding for a
+                # while has a full window. Encoding that per row is what the index tensor
+                # is for, so old_len is derived from each row's own position instead of
+                # from the shared buffer width.
                 from ..nn import window_idxs_per_row
-                idxs = window_idxs_per_row(positions, s, old.size(1), self.window, x.device)
+                old_per_row = [max(0, min(self.window, int(p) - (s - 1)))
+                               for p in positions.tolist()]
+                idxs = window_idxs_per_row(positions, s, old_per_row, self.window, x.device)
             else:
                 idxs = window_idxs_general(start_pos, s, old.size(1), self.window, x.device).unsqueeze(0).expand(b, -1, -1)
             if full:

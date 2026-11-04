@@ -85,24 +85,31 @@ def window_idxs_general(start_pos: int, seqlen: int, old_len: int, window: int, 
     return torch.where(valid, idx, torch.full_like(idx, -1)).int()
 
 
-def window_idxs_per_row(positions, seqlen: int, old_len: int, window: int, device=None) -> torch.Tensor:
-    """Window slots for a batch whose rows have different absolute positions.
+def window_idxs_per_row(positions, seqlen: int, old_len, window: int, device=None) -> torch.Tensor:
+    """Window slots for a batch whose rows are at different depths.
 
-    window_idxs_general() describes one row and is broadcast over the batch, so rows that
-    are not at the same depth get one row's mask. That is the whole reason a batched
-    prefill of "Hello" (1 token) next to "The capital of France is" (5 tokens) produced
-    different logits for the short row: the shared mask let the short row attend to slots
-    the long row had filled. This builds [b, seqlen, window] instead.
+    window_idxs_general() describes ONE row and is then broadcast over the batch. Two
+    things then go wrong for rows at different depths, and together they are the whole
+    reason a batched call disagreed with the same sequences run one at a time:
 
-    positions: [b] absolute position of each row's first column.
+      * the absolute position differs, so each row must derive its own query positions;
+      * the history length differs too -- a row that just arrived has old_len 0 while one
+        already decoding has old_len == window. One shared old_len indexes the wrong slot
+        for every row but one (old_len=4 gives row 1 [1,2,3,4] while row 0 wants
+        [-1,-1,-1,0]).
+
+    old_len may be an int or a per-row sequence; this builds [b, seqlen, window].
+    positions: [b] absolute position of each row's first column in this call.
     """
     back = torch.arange(window - 1, -1, -1, device=device)
+    old_lens = (list(old_len) if not isinstance(old_len, int) else [old_len] * len(positions))
     out = []
-    for p0 in positions.tolist():
+    for p0, ol in zip(positions.tolist(), old_lens):
+        ol = int(ol)
         qpos = torch.arange(int(p0), int(p0) + seqlen, device=device)
         gpos = qpos[:, None] - back[None, :]
-        idx = gpos - (int(p0) - old_len)
-        valid = (gpos >= 0) & (idx >= 0) & (idx < old_len + seqlen)
+        idx = gpos - (int(p0) - ol)
+        valid = (gpos >= 0) & (idx >= 0) & (idx < ol + seqlen)
         out.append(torch.where(valid, idx, torch.full_like(idx, -1)).int())
     return torch.stack(out, 0)
 

@@ -588,9 +588,12 @@ class MoE:
                                 # one row, one expert: accumulate straight into y instead
                                 # of building row/col index tensors and scattering
                                 _w = _wsum[i]
-                                # raw activation: fp4_linear routes to Marlin before
-                                # it would quantise, so the fp8 pair is not needed here
-                                _val = e.forward_fp4(xf, _w).float()
+                                # Same entry point the batched path uses (forward_fp4_pq
+                                # with the layer's pre-quantised activation), so M=1 and
+                                # M>1 run the identical arithmetic. forward_fp4 routes to
+                                # fp4_linear, whose kernel differs from the pq path -- that
+                                # mismatch is what made a batch disagree with one-at-a-time.
+                                _val = e.forward_fp4_pq(_aq, _asc, _w).float()
                                 y += _val
                                 served.append(i)
                                 continue
@@ -598,7 +601,19 @@ class MoE:
                             # (as this once did) fed only the first row through the kernel,
                             # which is why a batch and the same rows one at a time
                             # disagreed while a single token was exact.
-                            _val = e.forward_fp4(xf[idx], weights[idx, top, None]).float()
+                            #
+                            # forward_fp4_pq takes the activation that is ALREADY quantised
+                            # for this layer (_aq/_asc, one pass for all experts) and its
+                            # _lin loops the exact single-row kernel over the routed rows.
+                            # forward_fp4 would quantise again and route to fp4_linear,
+                            # whose multi-row path is the one measured 35-42% off -- that
+                            # is what made M>1 differ from M=1 by 16.85 on identical
+                            # prompts.
+                            if idx.numel() > 0:
+                                _val = e.forward_fp4_pq(_aq[idx], _asc[idx],
+                                                        weights[idx, top, None]).float()
+                            else:
+                                continue
                         else:
                             e = self._make_expert(rec)
                             if e.fp4 is not None:
