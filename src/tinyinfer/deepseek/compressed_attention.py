@@ -1,4 +1,4 @@
-﻿"""MLA attention with compressed KV (compress_ratio > 0), chunked-prefill capable.
+"""MLA attention with compressed KV (compress_ratio > 0), chunked-prefill capable.
 
 Window KV uses a linear rolling history; compressed KV is a global group-indexed cache
 shared from kv_source layers. Supports arbitrary (start_pos, seqlen) chunks and decode.
@@ -19,9 +19,11 @@ from ..weights import ShardStore
 
 
 class MLACompressedAttention:
+    """MLA with compressed KV. Row-parallel split support mirrors MLAWindowAttention."""
     def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, *, quant: bool = False,
-                 rt=None, tp=None):
+                 rt=None, tp=None, plan_fn=None):
         p = f"layers.{layer_id}.attn."
+        self.plan_fn = plan_fn
         self.layer_id = layer_id
         self.tp = tp
         self.n_local_heads = cfg.n_heads
@@ -47,6 +49,8 @@ class MLACompressedAttention:
             self.wkv = QuantLinear(store.get(p + "wkv.weight"), store.get(p + "wkv.scale"))
             self.wo_a = QuantLinear(store.get(p + "wo_a.weight"), store.get(p + "wo_a.scale"))
             self.wo_b = QuantLinear(store.get(p + "wo_b.weight"), store.get(p + "wo_b.scale"))
+            if plan_fn is not None:
+                self._apply_plan(plan_fn)
         else:
             self.wq_a = dequant_fp8_block(store.get(p + "wq_a.weight"), store.get(p + "wq_a.scale"))
             self.wq_b = dequant_fp8_block(store.get(p + "wq_b.weight"), store.get(p + "wq_b.scale"))
@@ -78,6 +82,29 @@ class MLACompressedAttention:
         # per-layer runtime state (shared streaming slots serve several layers)
         self._states: dict[int, dict] = {}
         self._active_layer = 0
+
+    def _apply_plan(self, plan_fn) -> None:
+        """Split this layer's projections across cards (same rule as the window path).
+
+        Every projection is row-parallel, so each card owns whole output rows and nothing
+        has to be reduced. wq_a/wq_b/wkv/wo_b split on the output dimension; wo_a is
+        handled by the caller because its layout is grouped (o_groups, o_lora, -1).
+        """
+        from ..tp import shard_quant_linear
+
+        def split(name, ql):
+            w = getattr(ql, "weight", None)
+            if w is None or getattr(w, "dim", lambda: 0)() != 2:
+                return ql
+            plan = plan_fn(name, int(w.shape[0]))
+            if not plan or len(plan) <= 1:
+                return ql
+            return shard_quant_linear(ql.weight, ql.scale, plan)
+
+        self.wq_a = split("wq_a", self.wq_a)
+        self.wq_b = split("wq_b", self.wq_b)
+        self.wkv = split("wkv", self.wkv)
+        self.wo_b = split("wo_b", self.wo_b)
 
     def _st(self) -> dict:
         st = self._states.get(self._active_layer)
@@ -276,17 +303,23 @@ class MLACompressedAttention:
                 latent = stored
             start_group = start_pos // self.ratio
             need = start_group + latent.size(1)
-            if self._compress_kv is None:
+            cur = self._compress_kv
+            # The cache is shared across the kv_source group via self.rt, so it can already
+            # exist with a different batch width than this call wants (a single-sequence
+            # warm-up, then a batched request). Reallocate on a width change instead of
+            # letting the slice assignment broadcast-fail; the content of the old rows is
+            # still valid, so carry it over when the old width fits.
+            if cur is None or cur.shape[0] != b or cur.shape[1] < need:
                 # pre-allocate a decode-sized run of groups so the buffer address stays
                 # fixed for the lifetime of the conversation (CUDA graph capture needs
                 # it); a long prompt still grows once, outside the captured step.
                 cap = max(need, int(self.cfg.max_position_embeddings // max(1, self.ratio)))
                 cap = min(cap, max(need, 4096))
-                self._compress_kv = torch.zeros(b, cap, self.head_dim,
-                                                dtype=latent.dtype, device=latent.device)
-            elif self._compress_kv.shape[1] < need:
-                grown = torch.zeros(b, need, self.head_dim, dtype=latent.dtype, device=latent.device)
-                grown[:, : self._compress_kv.shape[1]] = self._compress_kv
+                grown = torch.zeros(b, cap, self.head_dim,
+                                    dtype=latent.dtype, device=latent.device)
+                if cur is not None:
+                    keep = min(cur.shape[1], cap)
+                    grown[:, :keep] = cur[:, :keep].expand(b, -1, -1)[:, :keep]
                 self._compress_kv = grown
             self._compress_kv[:, start_group : start_group + latent.size(1)] = latent
             self.rt.compress_kv = self._compress_kv

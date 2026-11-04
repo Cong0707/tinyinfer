@@ -31,10 +31,11 @@ class MLAWindowAttention:
     """
 
     def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, *, quant: bool = False,
-                 cache_wo_a: bool = False, tp=None):
+                 cache_wo_a: bool = False, tp=None, plan_fn=None):
         self.quant = quant
         self.cache_wo_a = cache_wo_a
         self.tp = tp          # tensor-parallel shard (None / world 1 = untouched)
+        self.plan_fn = plan_fn  # (name, out_features) -> [(device, (lo, hi))] or None
         p = f"layers.{layer_id}.attn."
         self.eps = cfg.rms_norm_eps
         self.n_heads = cfg.n_heads
@@ -60,6 +61,8 @@ class MLAWindowAttention:
             self.wo_a = QuantLinear(store.get(p + "wo_a.weight"), store.get(p + "wo_a.scale"),
                                     cache_bf16=cache_wo_a)
             self.wo_b = QuantLinear(store.get(p + "wo_b.weight"), store.get(p + "wo_b.scale"))
+            if plan_fn is not None:
+                self._apply_plan(plan_fn)
         else:
             self.wq_a = dequant_fp8_block(store.get(p + "wq_a.weight"), store.get(p + "wq_a.scale"))
             self.wq_b = dequant_fp8_block(store.get(p + "wq_b.weight"), store.get(p + "wq_b.scale"))
@@ -89,6 +92,47 @@ class MLAWindowAttention:
         self._active_layer = 0
         if tp is not None and tp.world > 1:
             self._shard_for_tp(tp)
+
+    def _apply_plan(self, plan_fn) -> None:
+        """Split this layer's projections across cards, in place.
+
+        plan_fn(name, out_features) returns [(device, (lo, hi)), ...] or None. Every
+        projection here is row-parallel by construction -- it owns whole output rows --
+        so nothing needs reducing; each card computes its slice and QuantLinear
+        concatenates. wqkv is the stacked (q_a, kv) projection and splits the same way:
+        the slice boundaries fall inside it, and concatenating the pieces restores the
+        original row order, which is what the forward pass indexes into.
+        """
+        from ..tp import shard_quant_linear
+
+        def split(name, ql):
+            if not hasattr(ql, "weight") or ql.weight.dim() != 2:
+                return ql
+            plan = plan_fn(name, int(ql.weight.shape[0]))
+            if not plan or len(plan) <= 1:
+                return ql
+            return shard_quant_linear(ql.weight, ql.scale, plan)
+
+        # Order matters: the stacked projection has to be built from the *whole* weights,
+        # so it happens before anything is split (after a split, .weight is only the
+        # first card's slice and the concatenation would silently use a fragment).
+        stacked = None
+        if getattr(self, "wqkv", None) is not None:
+            try:
+                stacked = QuantLinear(
+                    torch.cat([self.wq_a.weight, self.wkv.weight], dim=0),
+                    torch.cat([self.wq_a.scale, self.wkv.scale], dim=0))
+            except Exception:
+                stacked = None
+        self.wq_a = split("wq_a", self.wq_a)
+        self.wq_b = split("wq_b", self.wq_b)
+        self.wkv = split("wkv", self.wkv)
+        self.wo_b = split("wo_b", self.wo_b)
+        # The stacked projection is its own split: its rows are q_a's rows followed by
+        # kv's, so slicing it by output row keeps that order and forward() still finds the
+        # q_lora boundary at wq_a.out_features (the sum over parts).
+        # A None here means the two separate projections are used instead, which forward()
+        # already handles -- that is the same branch a non-quantised build takes.
 
     def _shard_for_tp(self, tp) -> None:
         """Split MLA over ranks: q_lora and the heads are column-parallel, wo is

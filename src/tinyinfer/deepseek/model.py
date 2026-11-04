@@ -46,7 +46,8 @@ class Block(HCBlockMixin):
     def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, expert_store=None, quant: bool = False,
                  tp=None,
                  hashes=None, cache_wo_a: bool = False, expert_topk: int = 0, rt=None,
-                 cache_shared_bf16: bool = False, kv_quant: bool | None = None):
+                 cache_shared_bf16: bool = False, kv_quant: bool | None = None,
+                 plan_fn=None):
         self.layer_id = layer_id
         self.cfg = cfg
         self._expert_store = expert_store
@@ -76,10 +77,10 @@ class Block(HCBlockMixin):
         # it explicitly. kv_quant is resolved in Engine and passed down.
         if cfg.compress_ratios[layer_id] == 0:
             self.attn = MLAWindowAttention(store, layer_id, cfg, quant=self.kv_quant,
-                                           cache_wo_a=cache_wo_a, tp=tp)
+                                           cache_wo_a=cache_wo_a, tp=tp, plan_fn=plan_fn)
         else:
             self.attn = MLACompressedAttention(store, layer_id, cfg, quant=self.kv_quant,
-                                               rt=rt, tp=tp)
+                                               rt=rt, tp=tp, plan_fn=plan_fn)
         # the bf16 expert cache exists for the dequantised (reference) path; when the
         # block keeps fp8/fp4 the fp4 serve path reads the blob views directly, so eight
         # bf16 copies per layer only cost VRAM (40 x 8 x 30MB = 9.6GB, which is what made

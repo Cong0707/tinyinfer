@@ -93,7 +93,17 @@ class Engine:
                 print(f"[tinyinfer] multi-GPU probe skipped ({_tp_exc!r})", flush=True)
         self._layer_dev: dict[int, int] = {}
         self._expert_dev: dict[tuple[int, int], int] = {}
+        # Padding token for batched prefill. Right padding relies on the causal mask, so
+        # any id works numerically; EOS is the conventional one and is what the tokenizer
+        # pads with anyway.
+        self.pad_id = 0
         self._tokenizer = tokenizer
+        if tokenizer is not None:
+            _p = getattr(tokenizer, "pad_token_id", None)
+            if _p is None:
+                _p = getattr(tokenizer, "eos_token_id", None)
+            if _p is not None:
+                self.pad_id = int(_p)
         self.hashes = None
         self.adapter = open_adapter(adapter) if isinstance(adapter, str) else adapter
         # the architecture family drives the two branches the engine cannot abstract away
@@ -770,6 +780,26 @@ class Engine:
             self._layer_dev[layer_id] = dev
         return f"cuda:{dev}" if str(self.device).startswith("cuda") else self.device
 
+    def _tensor_plan(self, name: str, out_features: int):
+        """Where the output rows of one projection go, in the multi-GPU case.
+
+        Returns [(device, (lo, hi)), ...] proportional to each card's free VRAM and
+        aligned to the quantisation block, or None when there is only one card -- and
+        None is what keeps the single-GPU code path exactly as it was.
+        """
+        if not self._multi_gpu or self.pool is None:
+            return None
+        try:
+            from .tp import asplit
+
+            caps = [self.pool.room_on(i) for i in range(len(self.pool.cap))]
+            ranges = asplit(int(out_features), caps)
+            if len(ranges) <= 1:
+                return None
+            return [(i, r) for i, r in enumerate(ranges)]
+        except Exception:
+            return None
+
     def _plan_experts(self) -> None:
         """Decide which card each expert belongs on (multi-GPU only).
 
@@ -859,7 +889,8 @@ class Engine:
                       cache_wo_a=(layer_id < self.gpu_layers and self.device != "cpu"),
                       cache_shared_bf16=(layer_id < self.gpu_layers and self.device != "cpu"),
                       expert_topk=self.tier.expert_topk, kv_quant=self._kv_quant,
-                      rt=self._rt_for(layer_id), tp=getattr(self, "tp", None))
+                      rt=self._rt_for(layer_id), tp=getattr(self, "tp", None),
+                      plan_fn=self._tensor_plan)
             b.hc_post_on_cpu = getattr(self, "small_ops_on_cpu", False)
             ffn = getattr(b, "ffn", None)
             if ffn is not None:

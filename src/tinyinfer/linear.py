@@ -79,7 +79,13 @@ class QuantLinear:
     # ---- compute ----
     def _one(self, x: torch.Tensor, weight, scale) -> torch.Tensor:
         if self._bf16 is not None:
+            # The bf16 copy is built on the host in __init__ and nothing moves it with the
+            # layer, so migrate lazily, once -- the old code did this and the rewrite
+            # dropped it, which surfaced as "mat2 is on cpu" inside the shared expert.
             w = self._bf16
+            if w.device != x.device:
+                w = w.to(x.device)
+                self._bf16 = w
             return F.linear(x, w.to(x.dtype) if w.dtype != x.dtype else w)
         if x.device.type == 'cuda' and gemm.available():
             shape = x.shape
