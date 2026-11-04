@@ -176,7 +176,15 @@ def gemv_pq4_kernel(N: int, K: int, rows: int, rope: bool, head_dim: int, rope_d
 def fused_fp8_gemv(x_bf16: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor,
                    rows: int = 16) -> torch.Tensor:
     """x [1,K] bf16, w [N,K] fp8, w_scale [N/32,K/32] -> y [1,N] bf16 (internal act quant)."""
-    x = x_bf16.reshape(-1).contiguous()
+    # .contiguous() is a no-op on an already-contiguous *view*, and a view can carry an
+    # unaligned base pointer (x = h[..., :D]) -- the kernel's vectorised reads then fault
+    # with "misaligned address" asynchronously, far from here. Force a fresh allocation
+    # (10 KB at K=5120) so the base is always 16-byte aligned.
+    x = x_bf16.reshape(-1)
+    if x.data_ptr() % 16 or not x.is_contiguous():
+        x = x.clone()
+    else:
+        x = x.contiguous()
     k = x.numel()
     n = w_fp8.shape[0]
     y = torch.empty(n, device=x.device, dtype=torch.bfloat16)

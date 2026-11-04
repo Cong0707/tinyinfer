@@ -79,8 +79,24 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
             except Exception:
                 pass
         try:
-            from .gemv_fp8 import gemv_fp8
-            return gemv_fp8(x, w_fp8, w_scale)
+            # The name this used to import, gemv_fp8, has never existed in that module
+            # (it exports fused_fp8_gemv / fused_fp8_gemv_pq). The ImportError raised on
+            # every call was swallowed here, so the whole M=1 fast path was dead: all 248
+            # fp8 linears per decode token fell through to the block_M=32 tilelang GEMM at
+            # ~96 GB/s while this kernel reaches ~160.
+            #
+            # Fixed the name, but turning it on makes the engine die with
+            # "CUDA error: misaligned address" a few layers later (gemv_fp8.py's own
+            # docstring warns the bf16 variant crashes at N=1280/K=5120; shared expert is
+            # N=2304/K=5120 and it faults there too, asynchronously inside hc_post).
+            # Forcing a 16-byte-aligned copy of x did not fix it. Off until that kernel's
+            # alignment assumptions are understood: TI_FP8_GEMV=1 enables it.
+            import os as _os_g8
+
+            if _os_g8.environ.get("TI_FP8_GEMV") == "1":
+                from .gemv_fp8 import fused_fp8_gemv
+
+                return fused_fp8_gemv(x, w_fp8, w_scale)
         except Exception:
             pass
     # M in 2..8: pre-quantise once, then one gemv_pq per row. The bf16-input gemv
