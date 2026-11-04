@@ -14,6 +14,7 @@ on every request already accounts for everything we (and every other process) ho
 from __future__ import annotations
 
 import os
+import sys
 import threading
 
 GB = 1 << 30
@@ -309,6 +310,8 @@ class HostBudget:
         kernel time (measured: 19GB in 0.000s), unlike bytearray(), which zero-fills and
         costs ~1.7s per 19GB. This is the "claim it up front, in under a second" primitive.
         """
+        if sys.platform != "win32":
+            return self._commit_posix(nbytes)
         try:
             import ctypes
 
@@ -429,6 +432,54 @@ class HostBudget:
             return 0
         except Exception:
             return False
+
+    def _commit_posix(self, nbytes: int) -> int:
+        """mmap + touch: the POSIX counterpart of VirtualAlloc + faulting the pages in.
+
+        Same contract as the Windows path: one contiguous anonymous mapping, every 4KB
+        page written so the pages are really owned, halving on failure, and the bytes that
+        were actually taken are what gets booked. mlock is attempted but not required --
+        a container or an ordinary user shell usually has RLIMIT_MEMLOCK far below what a
+        model slab needs, and refusing the pool over that would be worse than a pool the
+        kernel may page out under pressure.
+        """
+        import ctypes
+        import mmap
+
+        n = int(nbytes)
+        held = getattr(self, "_held", None)
+        if held is None:
+            held = self._held = []
+        while n >= (256 << 20):
+            try:
+                buf = mmap.mmap(-1, n)
+            except (OSError, MemoryError, ValueError):
+                n //= 2
+                continue
+            try:
+                _touch_pages(buf, n)
+            except Exception:
+                try:
+                    buf.close()
+                except Exception:
+                    pass
+                n //= 2
+                continue
+            try:
+                libc = ctypes.CDLL("libc.so.6", use_errno=True)
+                libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+                # mmap keeps the range mapped for the life of the object; addressof is
+                # not available for mmap, so lock through a one-byte buffer view instead
+                addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
+                libc.mlock(ctypes.c_void_p(addr), ctypes.c_size_t(n))
+            except Exception:
+                pass
+            held.append(("mmap", buf, n))
+            self._claim_buf = buf
+            self._claim_bytes = n
+            self._claim_pinned = False
+            return n
+        return 0
 
     def room(self) -> int:
         """Bytes we may still hand out from our share of physical RAM.
