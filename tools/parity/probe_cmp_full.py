@@ -26,7 +26,7 @@ args = official.ModelArgs(**kw)
 
 from tinyinfer.weights import ShardStore
 from tinyinfer.config import TinyConfig
-from tinyinfer.model import Block as OurBlock
+from tinyinfer.deepseek.model import Block as OurBlock
 from tinyinfer.quant import dequant_fp8_block
 from tinyinfer.nn import rms_norm, apply_rope
 from tinyinfer.official_kernel_ref import act_quant, fp4_act_quant, sparse_attn

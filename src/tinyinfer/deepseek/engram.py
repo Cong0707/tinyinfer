@@ -15,9 +15,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .config import TinyConfig
-from .quant import dequant_fp8_block, e8m0_to_float
-from .weights import ShardStore
+from ..config import TinyConfig
+from ..quant import dequant_fp8_block, e8m0_to_float
+from ..weights import ShardStore
 
 DEAD = np.int64(-1)
 

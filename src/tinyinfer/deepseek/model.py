@@ -5,11 +5,11 @@ import torch
 
 from .attention import MLAWindowAttention
 from .compressed_attention import MLACompressedAttention
-from .config import TinyConfig
+from ..config import TinyConfig
 from .hc import HCBlockMixin
 from .moe import MoE
-from .nn import rms_norm
-from .weights import ShardStore
+from ..nn import rms_norm
+from ..weights import ShardStore
 
 
 def set_weight(owner, name: str, tensor) -> None:
@@ -225,7 +225,7 @@ class Block(HCBlockMixin):
 
             self._cpu_refs = {self._wkey(o, n): _pin(t) for (o, n, t) in paths}
         import os as _os
-        from .cpu_kernels import slab
+        from ..cpu_kernels import slab
 
         st = None if _os.environ.get("TI_SLAB") is None else slab()
         if st is not None:

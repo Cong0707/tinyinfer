@@ -9,7 +9,7 @@ import model as official
 import kernel as offk
 from tinyinfer.weights import ShardStore
 from tinyinfer.config import TinyConfig
-from tinyinfer.hc import hc_split_sinkhorn, HCBlockMixin
+from tinyinfer.deepseek.hc import hc_split_sinkhorn, HCBlockMixin
 from tinyinfer.nn import rms_norm
 store = ShardStore(MD); cfg = TinyConfig.from_hf(MD)
 torch.manual_seed(0)

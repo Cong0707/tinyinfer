@@ -54,7 +54,7 @@ def gemv_fp4_kernel_v2(N: int, K: int, rows: int = 16):
 
 def gemv_fp4(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor) -> torch.Tensor:
     """x [1,K] bf16 activation, w fp4 [N,K] packed, scale [N/32,K/32] ue8m0 -> [1,N] bf16."""
-    from .gemm import _bf16_default, SCALE_DTYPE, SCALE_FMT
+    from ..gemm import _bf16_default, SCALE_DTYPE, SCALE_FMT
     import kernel as _k
 
     n, k2 = w_fp4.shape
@@ -146,7 +146,7 @@ def gemv_fp4_m8(aq: torch.Tensor, asc: torch.Tensor, w_fp4: torch.Tensor,
 
 def quantize_act(x: torch.Tensor, k: int):
     """One activation quantisation for a whole expert batch."""
-    from .gemm import _bf16_default, SCALE_DTYPE, SCALE_FMT
+    from ..gemm import _bf16_default, SCALE_DTYPE, SCALE_FMT
     import kernel as _k
 
     with _bf16_default():

@@ -1044,7 +1044,7 @@ class TinyModelBackend(BaseBackend):
             try:
                 import torch
                 from .adapters import open_adapter
-                from .model import TinyModel
+                from .deepseek.model import TinyModel
             except Exception as exc:  # pragma: no cover - torch is installed in the venv
                 raise BackendError(
                     f"cannot import the tinyinfer reference implementation: {exc}",

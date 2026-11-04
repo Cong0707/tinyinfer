@@ -20,7 +20,7 @@ replaces, and the result matches an fp32 reference to within one bf16 ulp.
 """
 import torch
 
-from .kernels import native
+from ..kernels import native
 
 MAX_EXPERTS = 8
 _fn_cache: dict[str, object] = {}

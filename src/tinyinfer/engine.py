@@ -18,9 +18,9 @@ from pathlib import Path
 
 from .adapters import ModelAdapter, open_adapter
 from .config import TinyConfig
-from .hc import hc_split_sinkhorn  # noqa: F401  (re-export for callers)
+from .deepseek.hc import hc_split_sinkhorn  # noqa: F401  (re-export for callers)
 from .nn import rms_norm, sample_logits, softmax_sample
-from .model import Block, set_weight
+from .deepseek.model import Block, set_weight
 from .tiers import OptLevel, TierConfig, plan
 
 import torch
@@ -490,7 +490,7 @@ class Engine:
             # the engram tables are actually on disk
             shards = {self.store.shard_of(f"layers.{i}.engram.embed.weight") for i in self.cfg.engram_layer_ids}
             if all((self.store.model_dir / s).exists() for s in shards):
-                from .engram import EngramHashes
+                from .deepseek.engram import EngramHashes
                 try:
                     self.hashes = EngramHashes(self.cfg, tokenizer)
                 except Exception as e:  # weighted table missing / tokenizer mismatch: run without engram
@@ -705,7 +705,7 @@ class Engine:
         layer-major needs a separate instance per source so followers of different
         chunks cannot observe a stale neighbour's state.
         """
-        from .compressor import SharedAttentionRuntime, shared_attn
+        from .deepseek.compressor import SharedAttentionRuntime, shared_attn
 
         if not getattr(self, "_layer_major_mode", False):
             return shared_attn
@@ -863,7 +863,7 @@ class Engine:
         # the CPU references first and let the next forward rebuild the ring.
         # per-forward caches on the shared handoff slot must not leak between sessions
         try:
-            from .compressor import shared_attn as _sa0
+            from .deepseek.compressor import shared_attn as _sa0
             for _attr in ("_mask_cache", "candidates_by_chunk", "candidates",
                           "compress_kv", "topk_idxs"):
                 if hasattr(_sa0, _attr):
@@ -898,7 +898,7 @@ class Engine:
         # layers after it inside one forward. A fresh run must not inherit the previous
         # run's compressed KV / index-K, which is what produced NaNs on a repeat prefill.
         try:
-            from .compressor import shared_attn as _sa
+            from .deepseek.compressor import shared_attn as _sa
             _sa.reset()
         except Exception:
             pass
@@ -925,7 +925,7 @@ class Engine:
         # next forward and drifts: measured max|d| = 8.3 (rel 0.51) against a full
         # prefill while the argmax stayed the same.
         try:
-            from .compressor import shared_attn as _sa
+            from .deepseek.compressor import shared_attn as _sa
             snap["_rt"] = {
                 "compress_kv": None if getattr(_sa, "compress_kv", None) is None
                 else _sa.compress_kv.clone(),
@@ -965,7 +965,7 @@ class Engine:
             b.ffn._expert_cache.clear()
         if restore_rt:
             try:
-                from .compressor import shared_attn as _sa
+                from .deepseek.compressor import shared_attn as _sa
                 for _k in ("compress_kv", "index_k", "topk_idxs", "candidates"):
                     _v = restore_rt.get(_k)
                     setattr(_sa, _k, None if _v is None else _v.clone())
@@ -2179,7 +2179,7 @@ class Engine:
         return [int(dlogits[0, i].argmax()) for i in range(n)]
     def load_mtp(self) -> bool:
         """Load the three DSpark stages if their shards are on disk."""
-        from .mtp import load_mtp
+        from .deepseek.mtp import load_mtp
         stages = load_mtp(self.store, self.cfg, quant=self.tier.keep_weights_quantized,
                           feedback_window=bool(getattr(self.tier, "mtp_feedback_window", True)))
         if stages is None:

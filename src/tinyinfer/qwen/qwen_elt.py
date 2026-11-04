@@ -12,7 +12,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .kernels import native
+from ..kernels import native
 
 
 def available() -> bool:

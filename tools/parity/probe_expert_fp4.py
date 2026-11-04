@@ -8,7 +8,7 @@ MD = r"E:\Models\DeepSeek-V4.1-Flash-1017"
 import model as official
 from tinyinfer.weights import ShardStore
 from tinyinfer.config import TinyConfig
-from tinyinfer.moe import Expert as OurExpert
+from tinyinfer.deepseek.moe import Expert as OurExpert
 from tinyinfer.quant import e8m0_to_float
 
 store = ShardStore(MD)

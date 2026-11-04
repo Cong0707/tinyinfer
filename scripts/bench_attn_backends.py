@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 import tinyinfer.kernels as K
-from tinyinfer.attention import MLAWindowAttention
+from tinyinfer.deepseek.attention import MLAWindowAttention
 from tinyinfer.config import TinyConfig
 from tinyinfer.weights import ShardStore
 

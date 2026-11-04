@@ -9,7 +9,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from tinyinfer.config import TinyConfig
 from tinyinfer.loading import ExpertStore
-from tinyinfer.moe import MoE
+from tinyinfer.deepseek.moe import MoE
 from tinyinfer.weights import ShardStore
 
 MODEL = ROOT / "cache" / "weights"

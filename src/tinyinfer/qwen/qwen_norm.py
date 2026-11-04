@@ -16,7 +16,7 @@ import torch
 
 
 def install() -> bool:
-    from .kernels import native
+    from ..kernels import native
 
     try:
         native.kernel("qwen_norm", "qwen_rms_norm_bf")

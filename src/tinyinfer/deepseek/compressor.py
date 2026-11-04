@@ -9,10 +9,10 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .config import TinyConfig
-from .nn import apply_rope, rms_norm
-from .quant import dequant_fp8_block
-from .weights import ShardStore
+from ..config import TinyConfig
+from ..nn import apply_rope, rms_norm
+from ..quant import dequant_fp8_block
+from ..weights import ShardStore
 
 
 class SharedAttentionRuntime:

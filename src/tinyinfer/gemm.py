@@ -110,7 +110,7 @@ def fp4_linear(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor, act_
     # the small-M case there and keep the fp8 path as the fallback.
     if x.is_cuda and x.dim() == 2 and 0 < x.size(0) <= 8:
         try:
-            from .gemv_fp4_marlin import gemv_fp4_fast as _marlin_gemv
+            from .deepseek.gemv_fp4_marlin import gemv_fp4_fast as _marlin_gemv
 
             return _marlin_gemv(x, w_fp4, w_scale)
         except Exception:
@@ -121,7 +121,7 @@ def fp4_linear(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor, act_
         # measured 35% off on some (weight, row) pairs, and a chunk only has a handful
         # of rows per expert, so exactness wins over the launch count.
         try:
-            from .gemv_fp4 import gemv_fp4_m8, gemv_fp4_pq, quantize_act
+            from .deepseek.gemv_fp4 import gemv_fp4_m8, gemv_fp4_pq, quantize_act
             aq, asc = quantize_act(x, x.size(-1))
             if aq.size(0) > 1 and __import__("os").environ.get("TI_MULTIROW_GEMV") == "1":
                 return gemv_fp4_m8(aq, asc, w_fp4, w_scale)
@@ -131,7 +131,7 @@ def fp4_linear(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor, act_
             return gemv_fp4_pq(aq[0], asc[0], w_fp4, w_scale)
         except Exception:
             try:
-                from .gemv_fp4 import gemv_fp4
+                from .deepseek.gemv_fp4 import gemv_fp4
                 rows = [gemv_fp4(x[i:i + 1], w_fp4, w_scale) for i in range(x.size(0))]
                 return rows[0] if len(rows) == 1 else torch.cat(rows, dim=0)
             except Exception:

@@ -43,11 +43,11 @@ import torch
 import torch.nn.functional as F
 
 from .attention import MLAWindowAttention
-from .config import TinyConfig
+from ..config import TinyConfig
 from .moe import MoE
-from .nn import apply_rope, rms_norm, window_idxs_general
-from .quant import dequant_fp8_block
-from .weights import ShardStore
+from ..nn import apply_rope, rms_norm, window_idxs_general
+from ..quant import dequant_fp8_block
+from ..weights import ShardStore
 
 
 class _PrefixStore:
@@ -148,12 +148,12 @@ class MTPAttention(MLAWindowAttention):
             torch.arange(n_hist, device=x.device),
             n_hist + torch.arange(s, device=x.device),
         ]).view(1, 1, -1).expand(b, s, -1).contiguous()
-        from .kernels import sparse_attn_dispatch
+        from ..kernels import sparse_attn_dispatch
         o = sparse_attn_dispatch(q, kv_att, self.sink, idxs, self.scale)
         apply_rope(o[..., -rd:], freqs, inverse=True)
         o = o.view(b, s, self.o_groups, -1)
         if hasattr(self.wo_a, "weight"):  # fp8 resident: dequant just for the grouped einsum
-            from .quant import dequant_fp8_block
+            from ..quant import dequant_fp8_block
             wo_a = dequant_fp8_block(self.wo_a.weight, self.wo_a.scale)
         else:
             wo_a = self.wo_a

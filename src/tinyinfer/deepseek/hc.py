@@ -4,7 +4,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .nn import rms_norm
+from ..nn import rms_norm
 
 
 # Fused-kernel availability is a process-wide fact. Latching it per Block meant 40
@@ -48,7 +48,7 @@ def _sinkhorn_host(mixes, hc_scale, hc_base, hc_mult, iters, eps):
 
 def _native_sinkhorn(mixes, hc_scale, hc_base, hc_mult, iters, eps):
     """pre/post on the device, the hc x hc Sinkhorn in the hand-written kernel."""
-    from .kernels import native
+    from ..kernels import native
 
     hc = int(hc_mult)
     b, s, _ = mixes.shape
@@ -193,7 +193,7 @@ def _native_ok() -> bool:
     """True when the hand-written hc kernels are built."""
     if _NATIVE["ok"] is None:
         try:
-            from .kernels import native
+            from ..kernels import native
             native.kernel("hc", "hc_pre_f")
             _NATIVE["ok"] = True
         except Exception:
@@ -202,12 +202,12 @@ def _native_ok() -> bool:
 
 
 def _kern(name: str):
-    from .kernels import native
+    from ..kernels import native
     return native.kernel("hc", name)
 
 
 def _launch(fn, grid, block, args):
-    from .kernels import native
+    from ..kernels import native
     # no explicit stream: use torch's current one so graph capture sees the kernel
     native.launch(fn, grid, block, args)
 

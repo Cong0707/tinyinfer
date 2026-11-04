@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import torch
 
-from .kernels import native
+from ..kernels import native
 
 # the native kernel reads an fp32 activation vector and e8m0 scale bytes
 _AVAILABLE = None

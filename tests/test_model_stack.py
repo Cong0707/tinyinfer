@@ -10,7 +10,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from conftest import model_dir
 from tinyinfer.config import TinyConfig
-from tinyinfer.model import TinyModel
+from tinyinfer.deepseek.model import TinyModel
 
 
 class FakeStore:

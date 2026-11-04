@@ -65,7 +65,7 @@ class HFDeepSeekV41Adapter:
         return self.store.get(name)
 
     def build_block(self, layer_id: int, cfg: TinyConfig | None = None):
-        from .model import Block
+        from .deepseek.model import Block
         return Block(self.store, layer_id, cfg or self.cfg)
 
     def make_kv(self, capacity: int):
@@ -92,7 +92,7 @@ class HFQwen35Adapter:
     head_key = None                       # tied to the embedding
 
     def __init__(self, model_dir):
-        from .qwen_model import QwenModel
+        from .qwen.qwen_model import QwenModel
 
         self.model = QwenModel.open(model_dir)
         self.store = self.model.store

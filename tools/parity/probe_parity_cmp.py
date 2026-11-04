@@ -34,7 +34,7 @@ args = official.ModelArgs(**kw)
 
 from tinyinfer.weights import ShardStore
 from tinyinfer.config import TinyConfig
-from tinyinfer.model import Block as OurBlock
+from tinyinfer.deepseek.model import Block as OurBlock
 from tinyinfer.quant import dequant_fp8_block
 store = ShardStore(MD)
 cfg = TinyConfig.from_hf(MD)

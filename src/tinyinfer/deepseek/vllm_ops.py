@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import torch
 
-from .kernels import native
+from ..kernels import native
 
 _OPS = None
 _TRIED = False

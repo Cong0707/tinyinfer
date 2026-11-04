@@ -33,7 +33,7 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     # vLLM's rms_norm runs at 321 GB/s here; the native kernel below launches one
     # 32-thread block per row and measured 1.44x off at M=1 and 3.53x at M=8.
     try:
-        from .vllm_ops import rms_norm as _vllm_rms_norm
+        from .deepseek.vllm_ops import rms_norm as _vllm_rms_norm
 
         _hit = _vllm_rms_norm(x, weight, eps)
         if _hit is not None:

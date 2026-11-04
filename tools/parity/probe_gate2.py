@@ -8,7 +8,7 @@ MD = r"E:\Models\DeepSeek-V4.1-Flash-1017"
 import model as official
 from tinyinfer.weights import ShardStore
 from tinyinfer.config import TinyConfig
-from tinyinfer.moe import Gate as OurGate
+from tinyinfer.deepseek.moe import Gate as OurGate
 store = ShardStore(MD); cfg = TinyConfig.from_hf(MD)
 layer = 0
 torch.manual_seed(0)

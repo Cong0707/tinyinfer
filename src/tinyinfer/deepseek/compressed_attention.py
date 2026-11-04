@@ -9,13 +9,13 @@ import torch
 import torch.nn.functional as F
 
 from .compressor import Compressor, Indexer, shared_attn
-from .config import TinyConfig
-from .kernels.sparse_attn import sparse_attn_dispatch
-from .linear import QuantLinear
-from .nn import apply_rope, precompute_freqs_cis, rms_norm, window_idxs_general
-from .quant import dequant_fp8_block
-from .rope_cache import get_table, table_key
-from .weights import ShardStore
+from ..config import TinyConfig
+from ..kernels.sparse_attn import sparse_attn_dispatch
+from ..linear import QuantLinear
+from ..nn import apply_rope, precompute_freqs_cis, rms_norm, window_idxs_general
+from ..quant import dequant_fp8_block
+from ..rope_cache import get_table, table_key
+from ..weights import ShardStore
 
 
 class MLACompressedAttention:
@@ -64,7 +64,7 @@ class MLACompressedAttention:
         # The reference model.py defaults these to 0/40 only because its flat ModelArgs
         # never reads the nested rope_scaling block.
         _rs = cfg.rope_scaling or {}
-        from .rope_cache import get_table, table_key
+        from ..rope_cache import get_table, table_key
 
         _kargs = (self.rope_dim, min(cfg.max_position_embeddings, 1_048_576),
                   int(_rs.get("original_max_position_embeddings", 65536)),
@@ -148,7 +148,7 @@ class MLACompressedAttention:
     def _shard_for_tp(self, tp) -> None:
         """Same MLA split as MLAWindowAttention: q_lora and heads column-parallel,
         wo row-parallel with an all-reduce at the end; wkv replicated (one KV head)."""
-        from .tp import shard_linear
+        from ..tp import shard_linear
 
         if self.n_heads % tp.world:
             raise ValueError(f"n_heads {self.n_heads} not divisible by tp {tp.world}")
@@ -209,7 +209,7 @@ class MLACompressedAttention:
         # the form the cache holds. Order matters: skipping the round trip is a ~4.7%
         # output difference, and doing it before the rotation is a different value again.
         if getattr(self, "quant", False) and kv.is_cuda:
-            from .official_kernel_ref import act_quant
+            from ..official_kernel_ref import act_quant
             kv = act_quant(kv, 32, "ue8m0", torch.float8_e8m0fnu, True)
 
         old = self._kv_window if self._kv_window is not None else kv.new_empty(b, 0, self.head_dim)
@@ -249,8 +249,8 @@ class MLACompressedAttention:
             # (block 16, E4M3 scales) before it enters the shared cache; both steps are part
             # of the stored value, not an optimisation
             if getattr(self, "quant", False) and latent.is_cuda:
-                from .nn import apply_rope as _apply_rope
-                from .official_kernel_ref import fp4_act_quant
+                from ..nn import apply_rope as _apply_rope
+                from ..official_kernel_ref import fp4_act_quant
                 if start_pos == 0:
                     # One row per latent group, and the number of groups comes from the
                     # latent itself: a prompt chunk that is not a multiple of ``ratio``
@@ -343,7 +343,7 @@ class MLACompressedAttention:
 
         o = o.view(b, s, self.o_groups, -1)
         if hasattr(self.wo_a, "weight"):  # fp8 resident: dequant just this grouped GEMM
-            from .quant import dequant_fp8_block
+            from ..quant import dequant_fp8_block
             wo_a = dequant_fp8_block(self.wo_a.weight, self.wo_a.scale)
         else:
             wo_a = self.wo_a
@@ -352,12 +352,12 @@ class MLACompressedAttention:
         # grouped einsum; skipping the round trip is a ~4.8% output difference, so it is
         # part of the reference semantics rather than an optimisation
         if getattr(self, "quant", False) and o.is_cuda:
-            from .official_kernel_ref import act_quant
+            from ..official_kernel_ref import act_quant
             o = act_quant(o, 32, "ue8m0", torch.float8_e8m0fnu, True)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
         out = _lin(self.wo_b, o.flatten(2))
         if getattr(self, "tp_world", 1) > 1:
-            from .tp import all_reduce_sum
+            from ..tp import all_reduce_sum
 
             out = all_reduce_sum(out)
         return out

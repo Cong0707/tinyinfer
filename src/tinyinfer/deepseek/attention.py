@@ -15,12 +15,12 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .config import TinyConfig
-from .kernels.sparse_attn import sparse_attn_dispatch
-from .nn import apply_rope, precompute_freqs_cis, rms_norm, window_idxs_general
-from .quant import dequant_fp8_block
-from .rope_cache import get_table, table_key
-from .weights import ShardStore
+from ..config import TinyConfig
+from ..kernels.sparse_attn import sparse_attn_dispatch
+from ..nn import apply_rope, precompute_freqs_cis, rms_norm, window_idxs_general
+from ..quant import dequant_fp8_block
+from ..rope_cache import get_table, table_key
+from ..weights import ShardStore
 
 
 class MLAWindowAttention:
@@ -46,7 +46,7 @@ class MLAWindowAttention:
         self.window = cfg.sliding_window
 
         if quant:
-            from .linear import QuantLinear
+            from ..linear import QuantLinear
 
             self.wq_a = QuantLinear(store.get(p + "wq_a.weight"), store.get(p + "wq_a.scale"))
             self.wq_b = QuantLinear(store.get(p + "wq_b.weight"), store.get(p + "wq_b.scale"))
@@ -75,7 +75,7 @@ class MLAWindowAttention:
         # the compressed-KV layers; pure sliding-window layers rotate at the base theta
         # with the scaling disabled.
         _rs = cfg.rope_scaling or {}
-        from .rope_cache import get_table, table_key
+        from ..rope_cache import get_table, table_key
 
         _kargs = (self.rope_dim, min(cfg.max_position_embeddings, 1_048_576), 0,
                   cfg.rope_theta, int(_rs.get("factor", 1)),
@@ -94,7 +94,7 @@ class MLAWindowAttention:
         """Split MLA over ranks: q_lora and the heads are column-parallel, wo is
         row-parallel (all-reduced after wo_b). wkv is replicated because this model has
         a single KV head -- sharding it would need a different attention layout."""
-        from .tp import shard_linear
+        from ..tp import shard_linear
 
         if self.n_heads % tp.world:
             raise ValueError(f"n_heads {self.n_heads} not divisible by tp {tp.world}")
@@ -230,7 +230,7 @@ class MLAWindowAttention:
             # the reference ALWAYS round-trips the window KV through fp8 (post-RoPE):
             # that is the form the cache holds. The old "kv.dtype != bfloat16" guard
             # silently skipped it for bf16 inputs, which is where layer 0 diverged.
-            from .official_kernel_ref import act_quant
+            from ..official_kernel_ref import act_quant
             kv = act_quant(kv, 32, "ue8m0", torch.float8_e8m0fnu, True)
 
         old = self._kv_window
@@ -267,7 +267,7 @@ class MLAWindowAttention:
 
         o = o.view(b, s, self.o_groups, -1)
         if hasattr(self.wo_a, "weight"):  # fp8 resident: dequant the grouped matrix just for this einsum
-            from .quant import dequant_fp8_block
+            from ..quant import dequant_fp8_block
             wo_a = dequant_fp8_block(self.wo_a.weight, self.wo_a.scale)
         else:
             wo_a = self.wo_a
@@ -276,12 +276,12 @@ class MLAWindowAttention:
         # grouped einsum; skipping the round trip is a ~4.8% output difference, so it is
         # part of the reference semantics rather than an optimisation
         if getattr(self, "quant", False) and o.is_cuda:
-            from .official_kernel_ref import act_quant
+            from ..official_kernel_ref import act_quant
             o = act_quant(o, 32, "ue8m0", torch.float8_e8m0fnu, True)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
         out = _lin(self.wo_b, o.flatten(2))
         if getattr(self, "tp_world", 1) > 1:
-            from .tp import all_reduce_sum
+            from ..tp import all_reduce_sum
 
             out = all_reduce_sum(out)
         return out

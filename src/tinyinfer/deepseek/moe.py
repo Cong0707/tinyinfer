@@ -17,9 +17,9 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .config import TinyConfig
-from .quant import dequant_fp4_block, dequant_fp8_block
-from .weights import ShardStore
+from ..config import TinyConfig
+from ..quant import dequant_fp4_block, dequant_fp8_block
+from ..weights import ShardStore
 
 
 class Gate:
@@ -108,7 +108,7 @@ class Expert:
 
     def forward_fp4(self, x: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
         """fp4 kernel path; M==1 (decode) uses the GEMV kernels (GEMM wastes 31/32 rows)."""
-        from .gemm import fp4_linear
+        from ..gemm import fp4_linear
 
         w1, s1, w2, s2, w3, s3 = self.fp4
         # the fused prefill kernel is built for chunk-sized M; at M=2..8 it measured
@@ -197,7 +197,7 @@ class Expert:
         y = F.silu(gate) * up
         if weights is not None:
             y = weights * y
-        from .gemm import fp4_linear
+        from ..gemm import fp4_linear
         return fp4_linear(y.to(torch.bfloat16), w2, s2)
 
     def forward(self, x: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
@@ -230,7 +230,7 @@ class MoE:
         self.gate = Gate(store, layer_id, cfg, topk=topk)
         p = f"layers.{layer_id}.ffn."
         # shared expert stays fp8 on the device (halves its VRAM; official fp8 GEMM path)
-        from .linear import QuantLinear
+        from ..linear import QuantLinear
         self.shared = Expert(
             QuantLinear(store.get(p + "shared_experts.w1.weight"), store.get(p + "shared_experts.w1.scale"), cache_bf16=cache_shared_bf16),
             QuantLinear(store.get(p + "shared_experts.w2.weight"), store.get(p + "shared_experts.w2.scale"), cache_bf16=cache_shared_bf16),
@@ -670,7 +670,7 @@ class MoE:
         # the shared expert was already accumulated above (rank 0 only, so the all-reduce
         # lands it once instead of once per rank)
         if _world > 1:
-            from .tp import all_reduce_sum
+            from ..tp import all_reduce_sum
 
             y = all_reduce_sum(y)
         return y.to(x.dtype).view(shape)

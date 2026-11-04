@@ -84,7 +84,7 @@ def _repack_launcher():
     if _REPACK is not None:
         return _REPACK or None
     try:
-        from .kernels import native
+        from ..kernels import native
 
         props = torch.cuda.get_device_properties(0)
         sms = int(props.multi_processor_count)
@@ -181,7 +181,7 @@ def _native_launcher():
     if _NATIVE is not None:
         return _NATIVE or None
     try:
-        from .kernels import native
+        from ..kernels import native
 
         props = torch.cuda.get_device_properties(0)
         sms = int(props.multi_processor_count)

@@ -7,7 +7,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from tinyinfer.compressor import Compressor, Indexer, select_candidate_blocks, shared_attn
+from tinyinfer.deepseek.compressor import Compressor, Indexer, select_candidate_blocks, shared_attn
 from conftest import model_dir
 from tinyinfer.config import TinyConfig
 from tinyinfer.nn import precompute_freqs_cis

@@ -30,7 +30,7 @@ def main():
 
     # 2) FFT token-mix error vs a real L0 hidden state
     import tinyinfer.kernels as K
-    from tinyinfer.attention import MLAWindowAttention
+    from tinyinfer.deepseek.attention import MLAWindowAttention
     attn = MLAWindowAttention(store, 0, cfg)
     K._TL_STATE = False  # CPU reference only
     torch.manual_seed(0)

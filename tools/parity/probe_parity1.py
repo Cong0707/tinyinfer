@@ -28,7 +28,7 @@ args = official.ModelArgs(**kw)
 
 from tinyinfer.weights import ShardStore
 from tinyinfer.config import TinyConfig
-from tinyinfer.model import Block as OurBlock
+from tinyinfer.deepseek.model import Block as OurBlock
 store = ShardStore(MD)
 our_cfg = TinyConfig.from_hf(MD)
 
@@ -93,7 +93,7 @@ def _spy(q, kv, sink, idxs, scale, prefer_tilelang=True):
     except Exception:
         _calls["other"] += 1
         raise
-import tinyinfer.attention as _A
+import tinyinfer.deepseek.attention as _A
 _A.sparse_attn_dispatch = _spy
 out_w = tb.attn.forward(h_in, 0)
 print("dispatch calls", _calls)

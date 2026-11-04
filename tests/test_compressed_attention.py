@@ -15,7 +15,7 @@ pytestmark = pytest.mark.kernel
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from tinyinfer.compressed_attention import MLACompressedAttention
+from tinyinfer.deepseek.compressed_attention import MLACompressedAttention
 from conftest import model_dir
 from tinyinfer.config import TinyConfig
 

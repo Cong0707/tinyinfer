@@ -226,8 +226,8 @@ class QwenModel:
 
     @classmethod
     def open(cls, model_dir) -> "QwenModel":
-        from .config import TinyConfig  # noqa: F401
-        from .weights import ShardStore
+        from ..config import TinyConfig  # noqa: F401
+        from ..weights import ShardStore
 
         store = ShardStore(model_dir)
         raw = json.loads((store.model_dir / "config.json").read_text(encoding="utf-8"))
@@ -235,7 +235,7 @@ class QwenModel:
         return cls(store, raw)
 
     def load_config(self):
-        from .config import TinyConfig
+        from ..config import TinyConfig
         return TinyConfig.from_hf(self.store.model_dir)
 
     @property
