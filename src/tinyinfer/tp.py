@@ -389,3 +389,32 @@ def build_sharded(w_factory, plan: list):
     for dev, (lo, hi) in plan:
         parts.append((dev, w_factory(dev, lo, hi)))
     return ShardedLinear(parts)
+
+def shard_quant_linear(weight, scale, plan: list):
+    """Cut one block-quantized linear across cards; returns a QuantLinear with parts.
+
+    plan is [(device_index, (lo, hi)), ...] from asplit/plan_for. Both the weight rows and
+    their scale rows move together, and the scale slice follows the block layout rather
+    than the plain row index: fp8 layers carry one scale per 32x32 block ([out/32,
+    in/32]) while fp4 expert weights carry one per 32-wide row segment ([out, in/32]).
+    Getting this wrong does not crash -- it silently reads another block's scale -- so the
+    two layouts are told apart by shape rather than assumed.
+    """
+    from .linear import QuantLinear
+
+    out = []
+    for dev, (lo, hi) in plan:
+        w = weight[lo:hi]
+        s = None
+        if scale is not None:
+            if scale.shape[0] == weight.shape[0]:
+                s = scale[lo:hi]                       # [out, in/32]  fp4 experts
+            elif scale.shape[0] * 32 == weight.shape[0]:
+                s = scale[lo // 32:(hi + 31) // 32]     # [out/32, in/32] fp8 blocks
+            else:
+                s = scale[lo:hi]
+        tdev = torch.device(f"cuda:{dev}") if weight.is_cuda else weight.device
+        out.append((tdev,
+                    w.to(tdev, non_blocking=True).contiguous(),
+                    s.to(tdev, non_blocking=True).contiguous() if s is not None else None))
+    return QuantLinear(out[0][1], out[0][2], parts=out)

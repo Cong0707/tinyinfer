@@ -1,9 +1,17 @@
-"""Quantized linear layers: keep HF fp8 weights resident and compute with kernels.
+"""
+Quantized linear layers.
 
-Two backends:
-- CUDA + tilelang available: official fp8_gemm on the fp8 weights (no bf16 copy; block
-  scale 32x32 matches the HF layout).
-- otherwise: dequant to bf16 once (reference path).
+One class covers both a single card and a split across many, because the difference is
+data, not control flow: a layer holds a *list* of partitions, each a (device, weight
+slice, scale slice) on the card that owns it. One partition is the single-GPU case and
+takes the same path a split does -- there is no `if multi_gpu:` anywhere below, only
+`len(parts) == 1` skipping the concatenate.
+
+Row-parallel by construction: the output dimension is what gets divided, so each card
+computes a disjoint slice of y and nothing has to be reduced. The only traffic is the
+activation going out and the slices coming back. That is what lets n cards read n x K
+bytes in parallel, which is the whole point at decode: a token is bounded by reading the
+weights once, and reading them across cards divides that bound by n.
 """
 from __future__ import annotations
 
@@ -15,49 +23,88 @@ from .quant import dequant_fp8_block
 
 
 class QuantLinear:
-    """x @ w_fp8.T with the HF block scales; optionally keeps the bf16 copy around."""
+    """x @ W.T for a block-quantized W, optionally split across cards.
 
-    def __init__(self, w_fp8: torch.Tensor, scale: torch.Tensor, *, cache_bf16: bool = False, device=None):
+    parts[i] = (device, weight, scale) where weight holds rows [lo_i, hi_i) of the full
+    W and the matching scale rows. The list is in output order, so forward() only has to
+    concatenate. One part means one card and no copy in or out.
+    """
+
+    def __init__(self, weight, scale, *, cache_bf16: bool = False, device=None,
+                 parts=None):
+        if parts is not None:
+            self.parts = list(parts)
+            self.weight = self.parts[0][1]      # first slice: shape/identity for callers
+            self.scale = self.parts[0][2]
+            self._bf16 = None
+            self._n_out = sum(int(w.shape[0]) for _, w, _s in self.parts)
+            return
         if device is not None:
-            w_fp8 = w_fp8.to(device)
+            weight = weight.to(device)
             scale = scale.to(device)
-        self.weight = w_fp8
+        self.parts = [(weight.device, weight, scale)]
+        self.weight = weight
         self.scale = scale
         self._bf16 = None
+        self._n_out = int(weight.shape[0])
         if cache_bf16:
-            self._bf16 = dequant_fp8_block(w_fp8, scale)
+            self._bf16 = dequant_fp8_block(weight, scale)
 
+    # ---- shape ----
     @property
     def out_features(self) -> int:
-        return self.weight.shape[0]
+        return self._n_out
 
     @property
     def in_features(self) -> int:
-        return self.weight.shape[1]
+        return int(self.weight.shape[1])
 
+    @property
+    def is_sharded(self) -> bool:
+        return len(self.parts) > 1
+
+    # ---- placement ----
     def to(self, device):
+        # A sharded layer ignores this: every part is already pinned to the card the
+        # plan chose, and moving it would defeat the plan.
+        if self.is_sharded:
+            return self
         self.weight = self.weight.to(device)
         self.scale = self.scale.to(device)
+        self.parts = [(self.weight.device, self.weight, self.scale)]
         if self._bf16 is not None:
             self._bf16 = self._bf16.to(device)
         return self
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    # ---- compute ----
+    def _one(self, x: torch.Tensor, weight, scale) -> torch.Tensor:
         if self._bf16 is not None:
             w = self._bf16
-            if w.device != x.device:
-                # the bf16 copy is built on the host in __init__ and Block.to() only moves
-                # the fp8 weights it knows about; migrate lazily, once per block
-                w = w.to(x.device)
-                self._bf16 = w
             return F.linear(x, w.to(x.dtype) if w.dtype != x.dtype else w)
-        if x.device.type == "cuda" and gemm.available():
+        if x.device.type == 'cuda' and gemm.available():
             shape = x.shape
-            y = gemm.fp8_linear(x.reshape(-1, shape[-1]), self.weight, self.scale)
-            return y.view(*shape[:-1], self.out_features)
-        if self.weight.device != x.device:
-            self.to(x.device)
-        w = dequant_fp8_block(self.weight, self.scale)
+            y = gemm.fp8_linear(x.reshape(-1, shape[-1]), weight, scale)
+            return y.view(*shape[:-1], int(weight.shape[0]))
+        w = dequant_fp8_block(weight, scale)
         if x.dtype != w.dtype:
             x = x.to(w.dtype)
         return F.linear(x, w)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.is_sharded or not x.is_cuda:
+            _dev, weight, scale = self.parts[0]
+            if weight.device != x.device:
+                return self._one(x, weight.to(x.device), scale.to(x.device))
+            return self._one(x, weight, scale)
+        xdev = x.device
+        outs = []
+        for _dev, weight, scale in self.parts:
+            tgt = weight.device
+            xs = x if x.device == tgt else x.to(tgt, non_blocking=True)
+            ys = self._one(xs, weight, scale)
+            if ys.device != xdev:
+                ys = ys.to(xdev, non_blocking=True)
+            outs.append(ys)
+        return torch.cat(outs, dim=-1)
+
+    __call__ = forward
