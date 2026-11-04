@@ -6,7 +6,14 @@ import torch
 from .attention import MLAWindowAttention
 from .compressed_attention import MLACompressedAttention
 from ..config import TinyConfig
-from .hc import HCBlockMixin
+from .hc import HCBlockMixin, hc_pre_rms_norm
+
+# Fused hc_pre + rms_norm. Off by default: the fused kernel is bit-identical to the pair
+# on every shape and layer tested, but wiring it in changed the end-to-end output, so it
+# stays behind a switch until that is understood. TI_FUSE=1 enables it.
+import os as _os_fuse
+
+_FUSE_HC_PRE = _os_fuse.environ.get("TI_FUSE") == "1"
 from .moe import MoE
 from ..nn import rms_norm
 from ..weights import ShardStore
@@ -272,8 +279,11 @@ class Block(HCBlockMixin):
             ev[0].record()
         residual = x
         attn_pre, attn_post, attn_comb = self.hc_mixes(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
-        h = self.hc_pre(x, pre_mix)
-        h = rms_norm(h, self.attn_norm, self.cfg.rms_norm_eps)
+        if _FUSE_HC_PRE:
+            h = hc_pre_rms_norm(x, pre_mix, self.attn_norm, self.cfg.rms_norm_eps)
+        else:
+            h = self.hc_pre(x, pre_mix)
+            h = rms_norm(h, self.attn_norm, self.cfg.rms_norm_eps)
         self._last_attn_norm = h
         if _wt:
             _w.append(_t.perf_counter())          # 1: attn input ready
@@ -293,8 +303,11 @@ class Block(HCBlockMixin):
 
         residual = x
         ffn_pre, ffn_post, ffn_comb = self.hc_mixes(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
-        h = self.hc_pre(x, attn_pre)
-        h = rms_norm(h, self.ffn_norm, self.cfg.rms_norm_eps)
+        if _FUSE_HC_PRE:
+            h = hc_pre_rms_norm(x, attn_pre, self.ffn_norm, self.cfg.rms_norm_eps)
+        else:
+            h = self.hc_pre(x, attn_pre)
+            h = rms_norm(h, self.ffn_norm, self.cfg.rms_norm_eps)
         if _wt:
             _w.append(_t.perf_counter())          # 4: ffn input ready
         if self.profile:

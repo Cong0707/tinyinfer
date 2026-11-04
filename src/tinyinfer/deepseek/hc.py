@@ -212,6 +212,69 @@ def _launch(fn, grid, block, args):
     native.launch(fn, grid, block, args)
 
 
+# fused hc_pre + rms_norm; None = untried, False = unavailable
+_FUSED_PRE_NORM = None
+# dynamic shared memory holds one fp32 row; beyond this the fused path is not worth the
+# opt-in attribute call, so the two-kernel chain stays in charge
+_PRE_NORM_MAX_D = 8192
+
+
+def hc_pre_rms_norm(x: torch.Tensor, pre_mix: torch.Tensor,
+                    weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """h = sum_c pre_mix[c] * x[c];  y = rms_norm(h, weight).
+
+    One kernel instead of two when it is available, bit-identical to the pair it replaces
+    (the fused kernel rounds the collapsed row to bf16 at exactly the point hc_pre's
+    output tensor would have materialised). Set TI_FUSE=0 to force the two-step path.
+    """
+    global _FUSED_PRE_NORM
+    import os as _os
+
+    if _FUSED_PRE_NORM is not False and _os.environ.get("TI_FUSE") == "1":
+        if _FUSED_PRE_NORM is None:
+            try:
+                from ..kernels import native
+
+                native.kernel("hc_pre_rms_norm", "hc_pre_rms_norm_bf")
+                _FUSED_PRE_NORM = True
+            except Exception:
+                _FUSED_PRE_NORM = False
+        if _FUSED_PRE_NORM:
+            try:
+                from ..kernels import native
+
+                b, s, hc, d = x.shape
+                if x.dtype == torch.bfloat16 and x.is_cuda and d <= _PRE_NORM_MAX_D:
+                    xc = x.reshape(b * s, hc, d).contiguous()
+                    pc = pre_mix.reshape(b * s, hc).float().contiguous()
+                    w = weight.contiguous()
+                    out = torch.empty((b * s, d), dtype=x.dtype, device=x.device)
+                    native.launch(
+                        native.kernel("hc_pre_rms_norm", "hc_pre_rms_norm_bf"),
+                        (b * s,), (256,),
+                        [xc, pc, w, out, b * s, hc, d, float(eps)],
+                        shared=d * 4)
+                    return out.view(b, s, d)
+            except Exception:
+                _FUSED_PRE_NORM = False
+    from ..nn import rms_norm as _rms
+
+    h = _hc_pre_ref(x, pre_mix)
+    return _rms(h, weight, eps)
+
+
+def _hc_pre_ref(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
+    """Collapse the hyper-connection axis.
+
+    dim=-2, not a fixed index: x arrives as [b, s, hc, d] from the block, so the hc axis is
+    -2 (index 2). Writing dim=1 there silently reduces the sequence axis instead and
+    returns [b, hc, d] -- that is exactly what broke the first fused attempt, and it only
+    showed up end to end, never in the single-layer comparison, because there pre_mix was
+    [1, 1, hc] and b=s=1 made the wrong axis indistinguishable from the right one.
+    """
+    return torch.sum(pre_mix.unsqueeze(-1) * x.float(), dim=-2).to(x.dtype)
+
+
 def _hc_post_ref(x: torch.Tensor, residual: torch.Tensor,
                  post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
     """out[m,o] = post[m,o] * x[m] + sum_i comb[m,i,o] * residual[m,i]
