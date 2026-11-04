@@ -70,6 +70,18 @@ class MarlinScalarType<vllm::kBFloat16.id()> {
   using FragS0 = Vec<__nv_fp8x2_e4m3, 1>;
   using FragZP = Vec<nv_bfloat162, 4>;
 
+  // bf16 arithmetic is native from SM 80. Before that the CUDA headers only emulate
+  // float<->bfloat16 (via __bfloat162float and friends), and those helpers are NOT
+  // defined at all below SM 80 in some toolkit versions -- which is why this class used
+  // to compile to an empty shell on Turing and every call site failed with "has no member
+  // num2float". Upstream vLLM sidesteps it by running Turing in fp16; this engine runs
+  // the checkpoint's bf16 activations everywhere, so the conversions have to exist.
+  //
+  // The emulation is exact and cheap: bf16 IS the top 16 bits of fp32 (same exponent
+  // field, 7 explicit mantissa bits), so widening is a shift and narrowing is a shift
+  // plus round-to-nearest-even. No arithmetic is performed in bf16 here -- the kernels
+  // convert to float, accumulate in float, and convert back -- so the missing bf16 ALU
+  // on Turing costs nothing on this path.
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
   static __device__ float inline num2float(const nv_bfloat16 x) {
     return __bfloat162float(x);
@@ -90,6 +102,61 @@ class MarlinScalarType<vllm::kBFloat16.id()> {
 
   static __host__ __device__ float2 inline num22float2(const nv_bfloat162 x) {
     return __bfloat1622float2(x);
+  }
+#else
+  // SM 75 and below: widen/narrow by hand.
+  static __device__ float inline num2float(const nv_bfloat16 x) {
+    uint32_t bits = 0u;
+    memcpy(&bits, &x, sizeof(uint16_t));
+    bits <<= 16;
+    float out;
+    memcpy(&out, &bits, sizeof(float));
+    return out;
+  }
+
+  static __device__ nv_bfloat162 inline num2num2(const nv_bfloat16 x) {
+    nv_bfloat162 out;
+    uint32_t bits = 0u;
+    memcpy(&bits, &x, sizeof(uint16_t));
+    uint32_t packed = bits | (bits << 16);
+    memcpy(&out, &packed, sizeof(uint32_t));
+    return out;
+  }
+
+  static __device__ nv_bfloat162 inline nums2num2(const nv_bfloat16 x1,
+                                                  const nv_bfloat16 x2) {
+    uint32_t lo = 0u, hi = 0u;
+    memcpy(&lo, &x1, sizeof(uint16_t));
+    memcpy(&hi, &x2, sizeof(uint16_t));
+    uint32_t packed = lo | (hi << 16);
+    nv_bfloat162 out;
+    memcpy(&out, &packed, sizeof(uint32_t));
+    return out;
+  }
+
+  static __host__ __device__ nv_bfloat16 inline float2num(const float x) {
+    // round-to-nearest-even on the discarded low 16 bits
+    uint32_t bits;
+    memcpy(&bits, &x, sizeof(float));
+    uint32_t lsb = (bits >> 16) & 1u;
+    bits += 0x7FFFu + lsb;
+    uint16_t top = (uint16_t)(bits >> 16);
+    nv_bfloat16 out;
+    memcpy(&out, &top, sizeof(uint16_t));
+    return out;
+  }
+
+  static __host__ __device__ float2 inline num22float2(const nv_bfloat162 x) {
+    float2 out;
+    uint32_t packed;
+    memcpy(&packed, &x, sizeof(uint32_t));
+    nv_bfloat16 lo, hi;
+    uint16_t l = (uint16_t)(packed & 0xFFFFu), h = (uint16_t)(packed >> 16);
+    memcpy(&lo, &l, sizeof(uint16_t));
+    memcpy(&hi, &h, sizeof(uint16_t));
+    out.x = num2float(lo);
+    out.y = num2float(hi);
+    return out;
   }
 #endif
 };

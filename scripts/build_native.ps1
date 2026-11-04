@@ -61,6 +61,15 @@ foreach ($f in $files) {
         $outTxt = cmd /c "nvcc -cubin -arch=$Arch $inc -o `"$dst`" `"$($f.FullName)`" 2>&1"
         $code = $LASTEXITCODE
     }
-    if ($code -ne 0) { $outTxt | Select-Object -Last 4; throw "nvcc failed for $name" }
+    if ($code -ne 0) {
+        # Keep the whole diagnostic, not its last four lines: a template error prints the
+        # instantiation AFTER the message, so truncating to the tail hides every "error:"
+        # line and leaves only the summary count.
+        $log = Join-Path $out ("_fail_" + $name + ".txt")
+        $outTxt | Out-File -FilePath $log -Encoding utf8
+        $outTxt | Where-Object { $_ -match "error" } | Select-Object -First 12
+        Write-Output ("full log: " + $log)
+        throw "nvcc failed for $name"
+    }
     Write-Output ("{0,-20} {1,8} bytes  ({2})" -f $mod, (Get-Item $dst).Length, $f.Directory.Name)
 }
