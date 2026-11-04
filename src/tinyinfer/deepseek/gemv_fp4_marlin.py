@@ -1,4 +1,4 @@
-﻿"""fp4 expert GEMV through vLLM's Marlin kernel.
+"""fp4 expert GEMV through vLLM's Marlin kernel.
 
 The hand-written ALU-decode kernel reaches 59 GB/s on a 40MB expert matrix; the
 tilelang one 40 GB/s. vLLM's Marlin measures 294 GB/s on the same buffer --
@@ -90,8 +90,13 @@ def _repack_launcher():
         sms = int(props.multi_processor_count)
         smem = int(props.shared_memory_per_block_optin)
         native.set_dynamic_smem("marlin_repack", _REPACK_SYMBOL, smem)
+        # The kernel is (b_q_weight, out, size_k, size_n): FOUR arguments. This used to
+        # declare "Oii" (out + two ints, three total) and every call raised TypeError
+        # "expected 3 args, got 4", which the caller caught and silently fell back to
+        # ops.gptq_marlin_repack -- so the native repack never ran and the pyd was still
+        # a build-time dependency on every expert load.
         _REPACK = (native.bind("marlin_repack", _REPACK_SYMBOL, (sms,), (256,),
-                               "Oii", shared=smem), sms)
+                               "OOii", shared=smem), sms)
     except Exception:
         _REPACK = False
     return _REPACK or None

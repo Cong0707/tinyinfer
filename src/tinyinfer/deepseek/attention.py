@@ -127,7 +127,34 @@ class MLAWindowAttention:
         self.wq_a = split("wq_a", self.wq_a)
         self.wq_b = split("wq_b", self.wq_b)
         self.wkv = split("wkv", self.wkv)
-        self.wo_b = split("wo_b", self.wo_b)
+        # wo_a is [o_groups, o_lora_rank, r] and is consumed as einsum("bsgd,grd->bsgr"):
+        # the middle dimension IS the contracted one, so splitting it is column-parallel
+        # over the o-lora rank, and wo_b's input dimension must shrink by the same amount.
+        # Together they make the attention output a sum of per-card partial products,
+        # which is why this pair (unlike the others) needs a reduce at the end.
+        _wa = getattr(self.wo_a, "weight", None)
+        _plan_oa = plan_fn("wo_a", int(self.o_lora_rank))
+        if _wa is not None and _plan_oa and len(_plan_oa) > 1:
+            from ..tp import asplit  # noqa: F401  (only used for its alignment constant)
+            from . import tp as _tpmod  # noqa: F401
+            from ..tp import shard_quant_linear as _sql
+            # slice along dim 1 (o_lora_rank), per card
+            _parts = []
+            _sc = getattr(self.wo_a, "scale", None)
+            for _dev, (_lo, _hi) in _plan_oa:
+                _tdev = torch.device(f"cuda:{_dev}") if _wa.is_cuda else _wa.device
+                _w = _wa[:, _lo:_hi].to(_tdev).contiguous()
+                _s = _sc[:, _lo:_hi].to(_tdev).contiguous() if _sc is not None else None
+                _parts.append((_tdev, _w, _s))
+            self.wo_a = type(self.wo_a)(_parts[0][1], _parts[0][2], parts=_parts)
+            self.o_lora_rank = sum(int(p[1].shape[1]) for p in _parts)
+            self._wo_parallel = True
+            # wo_b stays whole: with wo_a's contraction split, every card's wo_a part
+            # already has the full output width, so wo_b consumes the full o-lora vector
+            # once. Splitting it on its input as well would make each card read a
+            # different slice of the same vector and the sum would be wrong.
+        else:
+            self.wo_b = split("wo_b", self.wo_b)
         # The stacked projection is its own split: its rows are q_a's rows followed by
         # kv's, so slicing it by output row keeps that order and forward() still finds the
         # q_lora boundary at wq_a.out_features (the sum over parts).
@@ -344,6 +371,25 @@ class MLAWindowAttention:
         if getattr(self, "quant", False) and o.is_cuda:
             from ..official_kernel_ref import act_quant
             o = act_quant(o, 32, "ue8m0", torch.float8_e8m0fnu, True)
+        if getattr(self, "_wo_parallel", False) and getattr(self.wo_a, "is_sharded", False):
+            # wo_a's contracted dimension (o_lora_rank) is what gets split, so each card
+            # produces a partial product of the SAME output shape; the pieces are summed
+            # after wo_b. wo_b is therefore NOT split on its input here -- every card
+            # would then see a different slice of the o-lora vector and the sum would be
+            # wrong. It keeps whole rows and runs once, on the card that owns the
+            # accumulator. (Splitting wo_b on its input *and* wo_a on o_lora is the
+            # textbook column+row pair, but that needs an all-reduce per layer and the
+            # point of this path is to avoid one.)
+            _acc = None
+            for _dev, _w, _s in self.wo_a.parts:
+                _tgt = _w.device
+                _o = o if o.device == _tgt else o.to(_tgt, non_blocking=True)
+                _y = torch.einsum("bsgd,grd->bsgr", _o, _w)
+                if _acc is None:
+                    _acc = _y
+                else:
+                    _acc = _acc + _y.to(_acc.device, non_blocking=True)
+            return _lin(self.wo_b, _acc.flatten(2))
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
         out = _lin(self.wo_b, o.flatten(2))
         if getattr(self, "tp_world", 1) > 1:
