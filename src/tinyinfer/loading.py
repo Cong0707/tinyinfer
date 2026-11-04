@@ -2087,6 +2087,11 @@ class VramSlotCache:
         # set while a prefill wave owns the card: the pool must not re-create itself
         # behind its back (it is 1.2GB at 64 slots and the prefill workspace OOMs)
         self._paused = False
+        # multi-GPU: devices to spread slots over and their relative capacities. None
+        # means "everything on self.device", i.e. the single-GPU behaviour.
+        self.devices = None
+        self.device_caps = None
+        self._slot_dev: list[int] = []
 
     # -- infrastructure ---------------------------------------------------
     def _ensure(self):
@@ -2096,15 +2101,40 @@ class VramSlotCache:
         self._torch = torch
         dtype = self._dtype or torch.uint8
         dev = torch.device(self.device)
+        # Multi-GPU: slots are spread over the devices in self.devices, proportional to
+        # each card's free VRAM. One arena per card and every slot remembers which card
+        # it lives on, so a fetch writes to the right memory and a consumer reads from it.
+        # With one device this is exactly the old single-arena layout (one entry covering
+        # every slot), so the single-GPU path allocates the same bytes as before.
+        _devs = list(getattr(self, "devices", None) or [dev])
+        _caps = list(getattr(self, "device_caps", None) or [1] * len(_devs))
         try:
             if self.slot_arena:
-                # One arena, sliced into slots: a single CUDA allocation instead of one
-                # per slot, and contiguous addresses so a batch of experts can later be
-                # run by one kernel (Flare's grouped MoE relies on the same contiguity).
-                self._arena = torch.empty((self.slots, self.blob_bytes), dtype=dtype, device=dev)
-                self._buffers = [self._arena[i] for i in range(self.slots)]
+                # Split the slot budget by capacity, then give each card one contiguous
+                # arena. Contiguity is kept per card so a grouped kernel can still walk
+                # one card's slots; spanning all cards is impossible anyway.
+                _tot = float(sum(_caps)) or 1.0
+                _per = [max(0, int(round(self.slots * c / _tot))) for c in _caps]
+                _left = self.slots - sum(_per)
+                if _left:
+                    _big = max(range(len(_caps)), key=lambda i: _caps[i])
+                    _per[_big] += _left
+                self._arena = []
+                self._buffers = []
+                self._slot_dev = []
+                for _i, _n in enumerate(_per):
+                    if _n <= 0:
+                        continue
+                    _a = torch.empty((_n, self.blob_bytes), dtype=dtype, device=_devs[_i])
+                    self._arena.append(_a)
+                    for _s in range(_n):
+                        self._buffers.append(_a[_s])
+                        self._slot_dev.append(_i)
+                if not self._buffers:
+                    raise RuntimeError("no slot arena could be allocated")
             else:
                 self._arena = None
+                self._slot_dev = [0] * self.slots
                 self._buffers = [torch.empty(self.blob_bytes, dtype=dtype, device=dev)
                                  for _ in range(self.slots)]
         except Exception:
@@ -2362,6 +2392,32 @@ class VramSlotCache:
             self._ensure()
             return self._buffers[slot]
         return get
+
+    def set_devices(self, devices, caps) -> None:
+        """Spread the slot arenas over several cards (multi-GPU only).
+
+        Called before the first fetch, because the arenas are allocated on first use and
+        their layout is fixed afterwards. A single device is the default and allocates
+        exactly as before.
+        """
+        self.devices = list(devices)
+        self.device_caps = [max(0, int(c)) for c in caps]
+        self._buffers = []
+        self._arena = None
+        self._slot_dev = []
+        self.slots = int(self.slots)
+
+    def slot_device(self, slot: int) -> int:
+        """Which card this slot's memory lives on (0 when everything is on one card).
+
+        The fetch path writes into the slot and the expert kernels read from it, so both
+        have to agree on the device. On a single card this is always 0 and callers can
+        ignore it -- that is what keeps the one-GPU path unchanged.
+        """
+        devs = getattr(self, "_slot_dev", None)
+        if not devs or slot >= len(devs):
+            return 0
+        return int(devs[slot])
 
     def stats(self) -> dict[str, float]:
         with self._lock:

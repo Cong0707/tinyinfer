@@ -390,6 +390,19 @@ class Engine:
                     # multi-threaded pread path on a big-blob stream)
                     direct=True,
                 )
+                # Multi-GPU: hand the store the card list so it can spread its slot
+                # arenas over them in proportion to free VRAM. The store keeps whole
+                # slots per card, so a fetch lands on one device and the experts kernels
+                # read it from there; on a single card this list has one entry and the
+                # allocation is byte-for-byte the old one.
+                if self._multi_gpu and self.devices and self.expert_store is not None:
+                    try:
+                        self.expert_store.set_devices(
+                            [f"cuda:{d.index}" for d in self.devices],
+                            [int(d.free) for d in self.devices])
+                    except Exception as _de:
+                        print(f"[tinyinfer] expert multi-device skipped ({_de!r})",
+                              flush=True)
             except Exception as e:
                 print(f"[tinyinfer] ExpertStore disabled: {e}")
                 self.expert_store = expert_store
