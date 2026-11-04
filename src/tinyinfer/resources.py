@@ -183,6 +183,14 @@ def model_profile(index: Any) -> dict:
             parts = name.split(".")
             if "experts" in parts:
                 continue          # routed experts are counted per blob, not per layer
+            if "engram" in parts:
+                # engram.embed.weight/scale are the giant per-engram-layer lookup tables
+                # (91.5GB each on DeepSeek-V4.1-Flash). They are row-read from disk and
+                # never mapped into a layer buffer, so charging them to the layer made
+                # max_layer_bytes 94.7GB and the plan conclude the streaming skeleton
+                # needed 192GB on an 8GB card. Only the wkv projection is resident, and
+                # it is already counted into engram_bytes below.
+                continue
             # Everything else that belongs to a layer IS what the layer streams: the
             # engine asks the layer for its weight paths, so the planner must count the
             # same set. This used to filter on DeepSeek's tensor names (attn./ffn./hc_),

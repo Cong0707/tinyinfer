@@ -1,5 +1,32 @@
+# Changelog
 
-## This round (in progress)
+## vLLM baseline + Marlin fp4 experts
+
+- **vLLM 0.33.0 的 CUDA 扩展在 Windows/MSVC 上编译成功**，没有用 WSL：两个 ABI3 扩展
+  (`_C_stable_libtorch.pyd` 22.5MB、`_moe_C_stable_libtorch.pyd` 11.8MB) 现在随
+  tinyinfer 源码分发，`import torch` 之后直接加载，不依赖 vllm 的 Python 包。
+  全流程和所有兼容补丁写在 `docs/vllm-extension-build.md`。
+- **fp4 专家 GEMV 换成 vLLM 的 Marlin**（`gemv_fp4_marlin.py`）：657 us/59 GB/s ->
+  **130-137 us/305-323 GB/s**，4.8 倍，超过 vLLM 自己跑出来的 142.9 us。
+  权重在加载时 repack 一次（`gptq_marlin_repack` + e8m0 scale 置换），之后每次调用
+  就是一条 fused kernel。数值对着手工 E2M1 解码验过，最大相对误差 4.7e-3。
+- **rms_norm 换成 vLLM 的**：M=1 33.87 -> 21 us，M=8 67.03 -> 13.25 us。
+  原来的原生 kernel 每行只开 32 个线程的 block。
+- **端到端**：一个 fp4 专家的 SwiGLU FFN（3 个 GEMV，M=1）从 1971 us 降到 435 us。
+- 基线全表在 `docs/vllm-baseline.md`。
+
+## DeepSeek-V4.1-Flash-1017 能跑了
+
+- **修掉 `model_profile` 把 engram 查找表算成层的 bug**：`layers.N.engram.embed.weight`
+  每张 91.5 GB（按行从磁盘读、从不映射），却被累加进 per-layer 开销，使
+  `max_layer_bytes` 变成 94.7 GB、`fixed_b` 算出 192.4 GB，规划器直接拒绝启动。
+  加上 `if "engram" in parts: continue` 后 `max_layer_bytes` = 0.173 GB。
+- 结果：build 15.6s、首次前向 31s、热 prefill 7.9s、**稳态 decode 0.867 tok/s**
+  （10 层常驻 + 30 层流式，cache 13.2GB）。详见 `docs/deepseek-v41-flash.md`。
+- 剩余瓶颈：磁盘只跑到 1.26 GB/s（SSD 能力 2.47），日志里
+  `slab unavailable (ok)` 说明平坦 pinned slab 因为 host budget 太小没建起来。
+
+## 上一轮
 
 - **Fused KV (rope + fp8 round trip)**: `deepseek_kernels.rope_quant_tl` now reproduces
   `apply_rotary_emb` + `act_quant` **exactly (rel 0.000000, scales identical)** after two
@@ -123,4 +150,3 @@ after hours of repeated sweeps, so late measurements are disk-bound, not code-bo
   remaining suspects are the serve loop's 3-expert batching (`_val_acc`/`_idx_acc`
   accumulation order) and the slot/record sharing. The single-row path (decode) is
   unaffected.
-

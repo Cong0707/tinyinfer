@@ -152,7 +152,14 @@ class ShardStore:
             if got != nbytes:
                 raise ValueError(f"tensor {name} is truncated in {shard} (download incomplete)")
             flat = torch.frombuffer(slot, dtype=torch.uint8)
-            return flat.view(dtype).reshape(tuple(entry["shape"]))
+            out = flat.view(dtype).reshape(tuple(entry["shape"]))
+            # Remember which pool slice this tensor IS. The flat-streaming setup uses
+            # this to check whether a whole layer already sits in one contiguous pool
+            # region (it allocates 4096-aligned, so usually not); when it does, the layer
+            # is streamed from its own bytes and the pinned slab never makes a second
+            # copy, which is the 5GB that currently starves it.
+            out._tiny_pool_mv = slot
+            return out
         with path.open("rb") as f:
             f.seek(data_start + start)
             raw = f.read(nbytes)

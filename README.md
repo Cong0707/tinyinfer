@@ -19,13 +19,29 @@
 | 模型 | 权重 | 驻留 | 引擎路径 | 说明 |
 | --- | --- | --- | --- | --- |
 | Qwen3.5-0.8B | 1.4 GB bf16 | 24/24 全在卡上 | **180 tok/s** | CUDA graph，输出与参考逐 token 一致 |
-| DeepSeek-V4.1-Flash-1017 | 510 GB | 10/40 层 | **1.2 tok/s** | 流式 + 专家缓存 |
+| DeepSeek-V4.1-Flash-1017 | 510 GB | 10/40 层 | **1.22 tok/s** | AGGRESSIVE 档，流式 + 专家缓存 |
 | Qwen3.8-27B | 51.8 GB | 2/64 层 | 逐层读入 | 64 层能逐层读入并跑完一遍，速度未测通 |
 
 Qwen3.5-0.8B 走引擎：同一套代码，`engine.block(i)` 逐层驱动，整步捕获成一张 CUDA graph。
 eager 驱动 49.9 tok/s，捕获后 180.4 tok/s（3.6 倍），十个 token 与 eager 逐位相同。
 
 这台卡实测有效带宽约 343 GB/s，1.4GB ÷ 343GB/s = 4.1ms 是纯带宽下限，即 244 tok/s。
+
+## 优化档位
+
+四档，精度和能力的边界是硬性的：
+
+| 档 | 语义 | 在这台 8GB 卡上 |
+| --- | --- | --- |
+| 0 `CONSERVATIVE` | PyTorch 参考路径，最慢但最容易核对 | 装不下 |
+| 1 `BALANCED` | 开源栈的做法：整个 checkpoint 常驻显存，不流式 | **275 GiB 需求 > 6.9 GiB，明确拒绝** |
+| 2 `AGGRESSIVE` | 本引擎的流式加载 + 专家缓存 + 预取 + MTP | **1.22 tok/s** |
+| 3 `EXTREME` | 在 2 的基础上允许损失精度/能力（跳层、低秩、fast math、KV4） | 更快，但输出不再等价 |
+
+1 和 2 精度相同、能力相同，区别只在**机制从哪来**：1 是"把模型全放进显存"这条路，
+2 是"显存放不下时怎么跑"。所以 1 在小卡上会直接报错而不是硬撑——Windows 的 WDDM
+遇到超配不会报 OOM，而是把溢出的显存换到内存里，结果是"能跑但慢一半"，这种假象比
+失败更难查。3 是唯一允许牺牲精度的档，损失项都在 `tiers.py` 的 `approximations` 里。
 
 ## 用法
 
@@ -73,8 +89,23 @@ eager 驱动 49.9 tok/s，捕获后 180.4 tok/s（3.6 倍），十个 token 与 
 - RMSNorm 从 7 个 torch 算子合成 1 个 kernel，一步省掉约 280 个 launch：7.07 → 6.41ms
 
 **Kernel 通过 `nvcc -cubin` 编译成 cubin，运行时用 `cuModuleLoad` 直接加载**，
-不走 torch C++ 扩展（省去编译链依赖）。cubin 是按架构编译的产物，不入库：
-`scripts/build_native.ps1` 从 GPU 探测计算能力并编译全部 `*.cu`。
+不走 torch C++ 扩展（省去编译链依赖，改一个 kernel 是秒级而不是重编整棵扩展树）。
+cubin 是按架构编译的产物，不入库：`scripts/build_native.ps1` 从 GPU 探测计算能力并
+编译全部 `*.cu`。
+
+有成熟实现就抄进本仓库，不从头写。DeepSeek 这条路径上的四个热点全部是这么来的：
+
+| 本仓库 | 上游 | 数值对拍 |
+| --- | --- | --- |
+| `native/vllm_rms_norm.cu` | vLLM `layernorm_kernels.cu` | 与参考逐位相同 |
+| `native/vllm_silu_and_mul.cu` | vLLM `activation_kernels.cu` | 1-2 bf16 ulp |
+| `native/vllm_topk_softplus_sqrt.cu` | vLLM `moe/topk_softplus_sqrt_kernels.cu` | idx/权重逐位相同 |
+| `native/marlin/` | vLLM `quantization/marlin/` | GEMV 与 repack 逐位相同 |
+
+源码在仓库里，可以改、可以裁剪（Marlin 只实例化实际用到的那个模板，cubin 50 KB
+而不是整套 kernel_selector 的几 MB），参数顺序按本引擎的习惯定。同一个模板实例在
+cubin 里比原来的 C++ 绑定更快：Marlin 的 18 个参数用预分配参数槽打包，实测
+19.7μs vs 20.2μs。
 
 ## 正确性
 
@@ -111,7 +142,8 @@ src/tinyinfer/
   model.py         DeepSeek 层（MLA / 压缩器 / engram / 超连接）
   qwen_model.py    Qwen 层（meta 骨架 + 按层读入）
   hf_graph.py      通用 CUDA graph 解码器
-  native/*.cu      手写 kernel
+  native/*.cu      手写 kernel（含从上游抄入并裁剪的 vllm_*.cu）
+  native/marlin/   Marlin fp4 GEMV + 权重 repack（抄入，仅实例化所用配置）
   gdn*.py          Qwen 线性注意力
 repl.py            命令行客户端
 scripts/           构建与工具

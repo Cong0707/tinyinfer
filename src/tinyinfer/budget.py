@@ -19,6 +19,41 @@ import threading
 GB = 1 << 30
 
 
+def available_commit() -> int:
+    """Bytes the OS can still commit, i.e. what VirtualAlloc/cudaHostAlloc may charge.
+
+    On Windows this is ullAvailPageFile (physical + pagefile minus what is already
+    committed), and it is the real ceiling for pinned host memory -- not
+    ullAvailPhys. An engine that sizes its expert cache from free *physical* RAM can
+    ask for more pinned memory than the commit limit allows, which fails deep inside
+    the driver as "cuMemSetAccess ... out of memory" with plenty of RAM showing free.
+    Returns 0 when the platform cannot report it (callers then skip the clamp).
+    """
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class _MEMSTATUS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            st = _MEMSTATUS()
+            st.dwLength = ctypes.sizeof(_MEMSTATUS)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                return int(st.ullAvailPageFile)
+        else:
+            with open("/proc/meminfo", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return 0
+
+
 def _physical_ram() -> int:
     """Physical RAM without importing anything heavy (psutil can fail under pressure)."""
     try:
@@ -130,7 +165,22 @@ class HostPool:
             pass
         pool._view = view[: int(nbytes)]
         pool._owner = buffer          # keep the allocation alive
+        # Absolute address of byte 0: a tensor built from a pool slice can be located by
+        # data_ptr() - _base, which is what the flat-streaming setup uses to prove a whole
+        # layer already lies in one contiguous region and skip the copy.
+        try:
+            import ctypes
+
+            pool._base = int(ctypes.addressof(buffer))
+        except Exception:
+            pool._base = None
         return pool
+
+    def slice_at(self, offset: int, n: int):
+        """Pool bytes [offset, offset+n) as a memoryview, or None when out of range."""
+        if self._view is None or offset < 0 or n <= 0 or offset + n > self.total:
+            return None
+        return self._view[offset:offset + n]
 
     @property
     def used(self) -> int:
@@ -294,6 +344,11 @@ class HostBudget:
                 # straight to ordinary pages would hand the cache memory the OS is free
                 # to page out -- exactly the failure this pool exists to prevent. A
                 # smaller pinned pool still is DMA-able; a larger pageable one is not.
+                # Step down by 10% rather than halving: the driver's pinned ceiling sits
+                # somewhere below physical RAM, and halving throws away up to half of it
+                # (28GB refused -> 14GB taken, when 26GB would have worked). Ten percent
+                # converges in a handful of tries and keeps the expert cache, which is
+                # sized from what we actually get, as large as the driver allows.
                 want = int(n)
                 while want >= (256 << 20):
                     ptr = ctypes.c_void_p()
@@ -318,7 +373,12 @@ class HostBudget:
                             print(f"[tinyinfer] host pool: cudaHostAlloc shrank "
                                   f"{n/2**30:.1f}GB -> {want/2**30:.1f}GB", flush=True)
                         return want
-                    want //= 2
+                    # 10% steps, not halving: the driver's pinned ceiling sits somewhere
+                    # below physical RAM, and halving throws away up to half of it (28GB
+                    # refused -> 14GB taken when 26GB would have worked). The expert
+                    # cache is sized from what we actually get, so a better probe is
+                    # worth more than a fast one.
+                    want = int(want * 0.9)
             while n >= (256 << 20):
                 # Prefer large pages: their pages cannot be trimmed by the memory
                 # manager, which is the only way to keep the cache resident for the

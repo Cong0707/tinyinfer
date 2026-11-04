@@ -84,11 +84,31 @@ def main() -> None:
     hit = None
     entries = None
     if st is not None:
-        stats = getattr(getattr(st, "ram", None), "_stats", None)
+        # the RAM tier keys its entries by (layer, expert): DeepSeek has a distinct blob
+        # per layer per expert (40 x 256 = 10240 of them), which is why a 13GB cache
+        # holds ~7% of them and the hit rate sits around 16% instead of near 100%.
+        ram = getattr(st, "ram", None)
+        stats = getattr(ram, "_stats", None)
         if stats is not None:
             h, m = getattr(stats, "hits", 0), getattr(stats, "misses", 0)
             hit = h / (h + m) if h + m else None
-        entries = len(getattr(st, "cache", getattr(st, "_cache", {})) or {})
+        entries = len(getattr(ram, "_entries", {}) or {})
+
+    if os.environ.get("TI_MOE_PROF") == "1":
+        agg: dict[str, float] = {}
+        for lid in range(getattr(eng, "max_layers", 0)):
+            try:
+                b = eng._blocks.get(lid)
+                f = getattr(b, "ffn", None) if b is not None else None
+                parts = getattr(f, "_parts", None) if f is not None else None
+            except Exception:
+                parts = None
+            if parts:
+                for k, v in parts.items():
+                    agg[k] = agg.get(k, 0.0) + float(v)
+        if agg:
+            print("[moe prof] " + "  ".join(f"{k}={v * 1e3:.1f}ms"
+                                            for k, v in sorted(agg.items())), flush=True)
 
     out = {
         "build_s": round(build_s, 2),

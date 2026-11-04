@@ -20,7 +20,7 @@ from .adapters import ModelAdapter, open_adapter
 from .config import TinyConfig
 from .hc import hc_split_sinkhorn  # noqa: F401  (re-export for callers)
 from .nn import rms_norm, sample_logits, softmax_sample
-from .model import Block
+from .model import Block, set_weight
 from .tiers import OptLevel, TierConfig, plan
 
 import torch
@@ -93,6 +93,58 @@ class Engine:
         _topk = int(__import__("os").environ.get("TI_TOPK", "0"))
         if _topk > 0:
             self.tier.expert_topk = _topk
+        # kv_bits was a config field nobody read: KV precision rode on the weight flag
+        # instead, so tier 2's kv_bits=8 had no effect and a full-precision KV cache was
+        # silently the only option. Derive the flag here, once, and hand it to every
+        # Block. 16 = full precision (no round trip), 8 = the fp8 window cache the
+        # reference uses. 4 has no implementation -- say so instead of pretending.
+        # approximations: the dict was carried around but never consumed, so tier 3's
+        # "every8 skip / low-rank wo / fast math" were documentation only. Wire the two
+        # that change which weights are read (skip) and how the FFN output is projected.
+        _approx = dict(getattr(self.tier, "approximations", {}) or {})
+        self._approx = _approx
+        self._skip_layers: set[int] = set()
+        _pat = _approx.get("skip_layer_pattern")
+        if _pat:
+            from .approx import skip_layer_plan as _skip_plan
+            _every = {"every8": 8, "every4": 4, "every2": 2,
+                      "every16": 16}.get(str(_pat))
+            if _every:
+                self._skip_layers = set(_skip_plan(self.cfg.n_layers, _every))
+            else:
+                raise ValueError(f"unknown skip_layer_pattern {_pat!r}; known: every2/4/8/16")
+        self._wo_low_rank = float(_approx.get("wo_low_rank") or 0.0)
+        self._fast_math = set(_approx.get("fast_math") or ())
+        if self._fast_math:
+            # 'exp','silu','rsqrt','sin','cos' -> torch's fast-math kernels. There is no
+            # torch-level switch for one op at a time, so this turns on the global
+            # approximate-math flags those kernels honour on this backend.
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+            except Exception:
+                pass
+        _kvb = int(getattr(self.tier, "kv_bits", 16) or 16)
+        self._kv_bits_effective = 16 if _kvb >= 16 else 8
+        # The KV cache used to take its precision from keep_weights_quantized (one flag
+        # drove both axes), and the hardware plan was tuned against that. kv_bits now
+        # drives it, but only as an override: a tier that leaves kv_bits at 16 keeps the
+        # weight flag's behaviour so the resident-layer plan does not change.
+        _kvb_explicit = bool(getattr(self.tier, "kv_bits", 0))
+        if not _kvb_explicit or _kvb >= 16:
+            self._kv_quant = bool(self.tier.keep_weights_quantized)
+        elif _kvb == 8:
+            self._kv_quant = True
+        else:
+            # 4-bit KV has no reader in this engine. Tier 3 is the experimental tier and
+            # has to launch, so fall back to the narrowest precision that does exist
+            # (fp8) and say so -- silently pretending kv4 was on is what made the field
+            # useless in the first place.
+            self._kv_quant = True
+            self._kv_bits_effective = 8
+            print(f"[tinyinfer] kv_bits={_kvb} requested by tier "
+                  f"{self.tier.level.name}: no 4-bit KV reader exists, using fp8 "
+                  f"(kv_bits=8) instead", flush=True)
         # The streaming ring, the resident layers and the attention temporaries are
         # allocated and freed at very different lifetimes; on a card this close to full
         # the allocator's default segmenting leaves 0 free bytes even when the total is
@@ -110,6 +162,7 @@ class Engine:
                 from .loading import ShardIndex
 
                 _prof = _model_profile(ShardIndex(self.store.model_dir))
+                self._model_prof = _prof
                 if _prof is not None:
                     # routing width decides whether the expert pool can cover the experts
                     # a token may route to (planner's coverage/slot decision)
@@ -192,12 +245,22 @@ class Engine:
                 # cudaHostAlloc succeeds up to ~29GB on this box; above that the driver
                 # refuses the whole request and the halving retry lands at 15GB (which
                 # halves the expert cache and doubles decode time). Cap it.
+                # Size the pool from what is free and let _commit() shrink it: that path
+                # already retries at half size when the driver refuses (pinned allocations
+                # have a ceiling well below physical RAM), and the caches are sized from
+                # the bytes actually handed over. Hand-tuning a cap here only traded
+                # hit rate for a guess.
                 _target = max(192 << 20,
                               min(_budget.room(), int(_avail - (5 << 30)), 28 << 30))
                 _pov = __import__("os").environ.get("TI_HOST_POOL_GB")
                 if _pov:
+                    # An explicit override wins over the RAM-derived cap. It is the knob
+                    # used to probe how large the pinned pool can grow before the driver
+                    # refuses (cuMemSetAccess), and a cap that can only shrink cannot
+                    # answer that.
                     try:
-                        _target = min(_target, int(float(_pov) * (1 << 30)))
+                        _o = max(192 << 20, int(float(_pov) * (1 << 30)))
+                        _target = min(_budget.room(), _o)
                     except ValueError:
                         pass
                 _taken = int(_budget.claim(_target, real=True))
@@ -349,9 +412,56 @@ class Engine:
             self.small_ops_on_cpu = (small_op_on_cpu(self.gpu_layers, self.max_layers)
                                      and __import__("os").environ.get("TI_HC_GPU") != "1")
         if self.device != "cpu" and self.tier.level < OptLevel.AGGRESSIVE:
-            # Reference-project behaviour: put the whole model on the device and let the
-            # allocator decide. No streaming, no partial residency, no refusal -- if it
-            # does not fit, the OOM is the answer (the same one vLLM would give).
+            # Reference-project behaviour: put the whole model on the device, like vLLM --
+            # no streaming, no partial residency. The original comment assumed "if it does
+            # not fit, the OOM is the answer", but on Windows WDDM does not fail: it pages
+            # the overflow out to system RAM and keeps going. A 40-layer run on this 8GB
+            # card happily reported 13.27GB allocated against 7.93GB of VRAM and ran at
+            # half speed with no error at all, which is the worst of both worlds.
+            # So check the arithmetic up front and refuse, the way a reference stack
+            # would, instead of silently paging.
+            _per_layer = 0
+            try:
+                _per_layer = int((getattr(self, "_model_prof", None) or {}).get("layer_bytes", 0))
+            except Exception:
+                _per_layer = 0
+            # The reference stacks keep the WHOLE checkpoint resident -- every layer and
+            # every routed expert. For DeepSeek-V4.1-Flash that is 40 layers of ~164MB
+            # plus 40 x 384 experts of ~18MB (~281GiB), which is why this tier needs a
+            # machine with hundreds of GiB of device memory. Counting only the layers
+            # would have let an 8GB card "pass" a check that cannot possibly fit.
+            _n_exp = 0
+            _exp_b = 0
+            try:
+                _p = getattr(self, "_model_prof", None) or {}
+                _n_exp = int(getattr(self.cfg, "n_routed_experts", 0) or 0)
+                _exp_b = int(_p.get("expert_bytes", 0))
+            except Exception:
+                _n_exp = _exp_b = 0
+            _expert_total = self.max_layers * _n_exp * _exp_b
+            if _per_layer > 0:
+                _need = self.max_layers * _per_layer + _expert_total
+                _free = 0
+                try:
+                    _free, _total = torch.cuda.mem_get_info()
+                except Exception:
+                    _free = 0
+                # Leave room for the KV cache, the head and the prefill workspace. A flat
+                # 8% was not enough: 6.4GiB of layers against 6.9GiB free passed the test
+                # and still had only ~0.5GiB for a KV cache that needs several GiB on a
+                # long context. Reserve 2GiB outright, which keeps the check honest on a
+                # small card while the large cards this tier targets are unaffected.
+                _budget = int(_free - 2 * 2**30)
+                if _need > _budget:
+                    raise RuntimeError(
+                        f"tier {self.tier.level.name} keeps the whole checkpoint resident "
+                        f"(the reference behaviour: no streaming), and that needs "
+                        f"{_need / 2**30:.0f} GiB "
+                        f"({self.max_layers} layers x {_per_layer / 2**20:.0f} MiB"
+                        f"{f' + {self.max_layers * _n_exp} experts' if _expert_total else ''}) "
+                        f"against {_free / 2**30:.1f} GiB free. Windows would page the "
+                        f"overflow instead of failing, which runs at roughly half speed. "
+                        f"Use OptLevel.AGGRESSIVE, which streams layers and experts.")
             self.gpu_layers = self.max_layers
             print(f"[tinyinfer] tier {self.tier.level.name}: all {self.max_layers} layers "
                   f"resident (no streaming)", flush=True)
@@ -360,7 +470,14 @@ class Engine:
         # expert prefetch is opt-in: with the RAM cache holding ~600 of 15360 experts
         # the prediction misses often enough that the prefetch and the fetch read the
         # same blob twice (measured 5.3GB/step against 3.5GB of unique data)
-        self.enable_prefetch = bool(int(__import__("os").environ.get("TI_PREFETCH", "0")))
+        # tier.prefetch is the policy, TI_PREFETCH is the override: the field used to be
+        # dead, so a tier that asked for prefetching only got it if the env var happened
+        # to be set. Now the tier decides unless the operator forces it.
+        _pf_env = __import__("os").environ.get("TI_PREFETCH")
+        if _pf_env is None:
+            self.enable_prefetch = bool(getattr(self.tier, "prefetch", False))
+        else:
+            self.enable_prefetch = bool(int(_pf_env))
         self.cache_wo_a = False
         self.profile = False
         # CPU-side learned expert prefetcher (context tables; ~95% hit rate measured)
@@ -634,7 +751,7 @@ class Engine:
                       # across 40 layers)
                       cache_wo_a=(layer_id < self.gpu_layers and self.device != "cpu"),
                       cache_shared_bf16=(layer_id < self.gpu_layers and self.device != "cpu"),
-                      expert_topk=self.tier.expert_topk,
+                      expert_topk=self.tier.expert_topk, kv_quant=self._kv_quant,
                       rt=self._rt_for(layer_id), tp=getattr(self, "tp", None))
             b.hc_post_on_cpu = getattr(self, "small_ops_on_cpu", False)
             ffn = getattr(b, "ffn", None)
@@ -643,6 +760,10 @@ class Engine:
                 # the same MoE layer produce different values for different sequence
                 # lengths (T=8 vs T=11 differed 4% on identical inputs), which showed up
                 # as garbage tokens in the answer. Opt in with TI_ASYNC_FETCH=1.
+                # tier.official_gemv: True forces the fused four-launch decode path,
+                # False forces per-expert, None (the default) keeps the shape-based rule
+                # that the field documented but never controlled.
+                ffn._official_gemv = getattr(self.tier, "official_gemv", None)
                 ffn._async_fetch = (bool(getattr(self.tier, "async_expert_fetch", False))
                                     and __import__("os").environ.get("TI_ASYNC_FETCH") == "1")
                 ffn._batched_scatter = bool(getattr(self.tier, "batched_scatter", False))
@@ -921,7 +1042,7 @@ class Engine:
         buf = bufs[layer_id % 2]
         for (owner, name, t), (_, _, _, off, _) in zip(paths, layout):
             buf[off:off + t.numel() * t.element_size()].view(t.dtype).view(t.shape).copy_(t)
-            setattr(owner, name, buf[off:off + t.numel() * t.element_size()].view(t.dtype).view(t.shape))
+            set_weight(owner, name, buf[off:off + t.numel() * t.element_size()].view(t.dtype).view(t.shape))
         if getattr(b, "engram", None) is not None:
             b.engram.to(self.device)
         b._device = self.device
@@ -1005,8 +1126,47 @@ class Engine:
             raise RuntimeError("no streamed layers")
         lay: dict[int, tuple[list[tuple[int, int]], int]] = {}
         sizes: dict[int, int] = {}
+        # Layers already lying flat in the pool. Weights are read straight into pool
+        # slices, so a layer's tensors are often one contiguous region already; those
+        # layers can be streamed from their own bytes and never get a second copy.
+        zero_copy: set[int] = set()
+        _pool = getattr(self, "host_pool", None)
+        _pool_base = getattr(_pool, "_base", None) if _pool is not None else None
         for i in streamed:
             paths = self.block(i)._weight_paths()
+            # Only layers whose weights ALL live in the host pool can be streamed from
+            # their own bytes: wqkv.weight is a device copy that stays resident, and its
+            # data_ptr() is a GPU address, which would make the span arithmetic nonsense.
+            if _pool_base is not None and paths and all(
+                    t.device.type == "cpu" for (_, _, t) in paths):
+                try:
+                    actual = [(int(t.data_ptr()) - _pool_base,
+                               t.numel() * t.element_size()) for (_, _, t) in paths]
+                except Exception:
+                    actual = None
+                if actual and all(o >= 0 for o, _ in actual):
+                    pos = sorted((o, o + n) for o, n in actual)
+                    no_overlap = all(pos[k][1] <= pos[k + 1][0]
+                                     for k in range(len(pos) - 1))
+                    span = max(e for _, e in pos)
+                    total_b = sum(n for _, n in actual)
+                    # 4096-byte allocation alignment leaves padding; bound it so a
+                    # pathological layout falls back to the packed copy instead
+                    if __import__("os").environ.get("TI_FLAT_DBG"):
+                        print(f"[zc] L{i} base={_pool_base} n={len(actual)} span={span} "
+                              f"data={total_b} slack={span - total_b} "
+                              f"no_overlap={no_overlap}", flush=True)
+                    # The zero-copy path is opt-in: cudaHostAlloc's host address and the address
+                    # torch.frombuffer reports for the same slice do not agree on Windows
+                    # (measured: base 8.67e9 vs data_ptr 5.3e12), so the span arithmetic
+                    # cannot be trusted until the loader lays weights out for it directly.
+                    # See docs/deepseek-v41-flash.md; TI_ZC=1 turns the experiment on.
+                    if (no_overlap and span <= total_b + 65536 * len(actual)
+                            and __import__("os").environ.get("TI_ZC") == "1"):
+                        lay[i] = (actual, span)
+                        sizes[i] = span
+                        zero_copy.add(i)
+                        continue
             offs: list[tuple[int, int]] = []
             off = 0
             for (_, _, t) in paths:
@@ -1029,10 +1189,12 @@ class Engine:
         # k+1 and k+2 stream in.
         # ring depth is measurable: 3 hides one H2D behind compute, 2 frees a layer-sized
         # buffer (463MB here) for one more resident layer on a card this tight.
-        # Measured at decode with the expert path already in place: depth 3 = 0.739s/token,
-        # depth 2 = 0.723-0.729s/token, so the freed VRAM is worth more than the extra
-        # overlap on this card. TI_RING=3 restores the deeper ring.
-        _ring_n = max(2, min(4, int(__import__("os").environ.get("TI_RING", "2"))))
+        # Re-measured after the fp4 experts moved to vLLM's Marlin (the experts got 4.8x
+        # faster, so the layer H2D is now a larger share of the step): depth 3 =
+        # 0.935-1.19s/token = 0.968 tok/s, depth 4 = 1.03-1.40s/token = 0.864,
+        # depth 2 = 1.04-1.27s/token = 0.867. Deeper is not free -- each extra ring slot
+        # costs 463MB of the 6.9GB card -- so 3 is the measured optimum, not a maximum.
+        _ring_n = max(2, min(4, int(__import__("os").environ.get("TI_RING", "3"))))
         bufs = [torch.empty(mx, dtype=torch.uint8, device=self.device) for _ in range(_ring_n)]
         pinned_gb = 0.0
         # Pinned budget. Pinning all 17.9GB of streamed weights starved the expert
@@ -1074,6 +1236,11 @@ class Engine:
         _slab_cap = int(_hb.total * _slab_frac)
         if slab_total > _slab_cap:
             slab_total = _slab_cap
+        if __import__("os").environ.get("TI_FLAT_DBG"):
+            _f = sizes[streamed[0]] if streamed else 0
+            print(f"[slabdbg] n={len(streamed)} slab_total={slab_total/2**30:.2f}GB "
+                  f"cap={_slab_cap/2**30:.2f}GB hb_total={_hb.total/2**30:.1f}GB "
+                  f"room={_hb.room()/2**30:.1f}GB first={_f/2**20:.0f}MB", flush=True)
         host_slab = None
         # Ask the host budget, which re-reads what the machine actually has left right
         # now. No flag, no per-machine constant: on a small box the grant comes back
@@ -1107,6 +1274,24 @@ class Engine:
             _why = "pool-backed"
         for i in streamed:
             need = sizes[i]
+            if i in zero_copy and _pool is not None:
+                # Already flat in the pool: reuse the bytes in place. Copying them into
+                # a slab block is what made the slab run out of room (5/30 layers) and
+                # dropped the disk to 1.4GB/s.
+                b = self.block(i)
+                base_off = min(o for o, _ in lay[i][0])
+                mv = _pool.slice_at(base_off, need)
+                if mv is not None:
+                    blk = torch.frombuffer(mv, dtype=torch.uint8)
+                    blk._tiny_pool_mv = mv
+                    refs = {}
+                    for (owner, name, t), (o, n) in zip(b._weight_paths(), lay[i][0]):
+                        refs[Block._wkey(owner, name)] = blk[o:o + n].view(t.dtype).view(t.shape)
+                    b._cpu_refs = refs
+                    b._device = "cpu"
+                    host_map[i] = blk
+                    keep.append(i)
+                    continue
             if _slab_used + need > slab_total:
                 if _pool is None:
                     _why = (f"reached the pinned cap {slab_total/2**30:.1f}GB "
@@ -1140,7 +1325,7 @@ class Engine:
                     dst.copy_(t)
                 except Exception:
                     pass
-                setattr(owner, name, dst)
+                set_weight(owner, name, dst)
             _refs = {}
             for (owner, name, t), (o, n) in zip(paths, offs):
                 _refs[Block._wkey(owner, name)] = blk[o:o + n].view(t.dtype).view(t.shape)
@@ -1181,7 +1366,7 @@ class Engine:
                 # keyed the same way Block.to() keys its map, so the two stay in sync
                 b._cpu_refs = {Block._wkey(o, n): t for (o, n, _), t in zip(paths, refs)}
                 for (owner, name, _), t in zip(paths, refs):
-                    setattr(owner, name, t)
+                    set_weight(owner, name, t)
                 b._device = "cpu"
                 pinned_gb += sum(t.numel() * t.element_size() for t in refs if t.is_pinned()) / 2 ** 30
                 keep.append(i)
@@ -1209,7 +1394,7 @@ class Engine:
                 # freed: keeping both meant 15.9GB + 15.9GB resident, and under that pressure
                 # the pinned H2D fell from 30GB/s to 6.5GB/s (measured T=1 vs T=2)
                 for (owner, name, _), t in zip(paths, refs):
-                    setattr(owner, name, t)
+                    set_weight(owner, name, t)
                 b._device = "cpu"
                 pinned_gb += sum(t.numel() * t.element_size() for t in refs if t.is_pinned()) / 2 ** 30
                 keep.append(i)
@@ -1245,7 +1430,7 @@ class Engine:
         else:
             buf[:total].copy_(host[layer], non_blocking=True)
         for (owner, name, t), (o, n) in zip(b._weight_paths(), offs):
-            setattr(owner, name, buf[o:o + n].view(t.dtype).view(t.shape))
+            set_weight(owner, name, buf[o:o + n].view(t.dtype).view(t.shape))
         if getattr(b, "engram", None) is not None:
             b.engram.to(self.device)
         b._device = self.device
@@ -1328,7 +1513,7 @@ class Engine:
                 buf[off:off + n].view(t.dtype).view(t.shape).copy_(cpu, non_blocking=True)
             ev.record(stream)
         for (owner, name, t), (_, _, _, off, n) in zip(paths, layout):
-            setattr(owner, name, buf[off:off + n].view(t.dtype).view(t.shape))
+            set_weight(owner, name, buf[off:off + n].view(t.dtype).view(t.shape))
         if getattr(b, "engram", None) is not None:
             b.engram.to(self.device)
         return ev
@@ -1355,7 +1540,8 @@ class Engine:
         while len(pair) < 2:
             blk = Block(self.store, layer_id, self.cfg, expert_store=self.expert_store,
                         quant=self.tier.keep_weights_quantized, hashes=None,
-                        expert_topk=self.tier.expert_topk, rt=self._rt_for(layer_id))
+                        expert_topk=self.tier.expert_topk, kv_quant=self._kv_quant,
+                        rt=self._rt_for(layer_id))
             blk.hc_post_on_cpu = getattr(self, "small_ops_on_cpu", False)
             blk.to(self.device)
             pair.append(blk)
@@ -1486,7 +1672,12 @@ class Engine:
                 # so prefetching all 40 layers evicts every slot before it is consumed
                 # (measured: 0 slot hits, every read repeated on the compute thread).
                 # The rest is prefetched rolling inside the layer loop below.
-                for layer_i in layer_seq[:2]:
+                # tier.prefetch_k is how many layers ahead to warm: 0 means the tier
+                # asked for no lookahead (prefetch off), 2-3 is what the slot pool
+                # sustains. It was a config field nobody read, so every tier behaved
+                # like k=2.
+                _depth = int(getattr(self.tier, "prefetch_k", 2) or 0)
+                for layer_i in layer_seq[:max(0, _depth)]:
                     if source.get(layer_i):
                         self._prefetch_layer(layer_i, source[layer_i])
         self._timings = []
@@ -1558,6 +1749,12 @@ class Engine:
                 print(f"[mem] layer {i:2d} before alloc={torch.cuda.memory_allocated()/2**20:.0f}MB "
                       f"reserved={torch.cuda.memory_reserved()/2**20:.0f}MB", flush=True)
             h_in = h
+            # EXTREME's skip_layer_pattern: drop this layer's residual contribution.
+            # It was parsed into the tier config and never consulted, so the pattern
+            # looked active while every layer still ran.
+            if i in self._skip_layers:
+                pre_mix = h
+                continue
             try:
                 h, pre_mix = b.forward(h, start_pos, pre_mix)
                 _dh = getattr(self, "_dump_h", None)
@@ -1981,7 +2178,8 @@ class Engine:
     def load_mtp(self) -> bool:
         """Load the three DSpark stages if their shards are on disk."""
         from .mtp import load_mtp
-        stages = load_mtp(self.store, self.cfg, quant=self.tier.keep_weights_quantized)
+        stages = load_mtp(self.store, self.cfg, quant=self.tier.keep_weights_quantized,
+                          feedback_window=bool(getattr(self.tier, "mtp_feedback_window", True)))
         if stages is None:
             return False
         for st in stages:

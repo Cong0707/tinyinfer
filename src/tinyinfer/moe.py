@@ -36,7 +36,22 @@ class Gate:
         self.route_scale = cfg.route_scale
 
     def forward(self, x: torch.Tensor, image_mask: torch.Tensor | None = None):
-        scores = F.linear(x.float(), self.weight)  # gate_temp == 1.0 in the released config
+        logits = F.linear(x.float(), self.weight)  # gate_temp == 1.0 in the released config
+        # vLLM's router does softplus(x).sqrt() + bias + top-k + renormalise + routing
+        # scale in one kernel. The vision path is excluded: it picks a different bias per
+        # token, and the kernel takes a single e_score_correction_bias for all tokens.
+        # bias_vl only matters when a token is an image token, which is exactly what
+        # image_mask encodes; with image_mask=None the torch path below also ignores it
+        # and uses self.bias. Requiring "bias_vl is None" excluded every text-only run of
+        # a vision-capable checkpoint, so this model never reached the fused router.
+        if (self.score_func == "sqrtsoftplus" and image_mask is None):
+            from .vllm_ops import gate_topk
+
+            fused = gate_topk(logits, self.topk, self.norm_topk_prob,
+                              self.route_scale, self.bias)
+            if fused is not None:
+                return fused[0], fused[1].long()
+        scores = logits
         if self.score_func == "softmax":
             scores = scores.softmax(dim=-1)
         elif self.score_func == "sigmoid":
@@ -72,6 +87,9 @@ class Expert:
         self.w1, self.w2, self.w3 = w1, w2, w3
         self.swiglu_limit = swiglu_limit
         self.fp4 = None  # optional (w1,s1,w2,s2,w3,s3) tuple: compute without bf16 dequant
+        # merged gate|up matrix: one GEMV produces both halves so vLLM's
+        # silu_and_mul_with_clamp can consume them directly
+        self.fp4_13 = None
 
     def to(self, device):
         # torch.Tensor.to returns a NEW tensor; dropping the result left the weights on
@@ -105,12 +123,25 @@ class Expert:
                                             limit=float(self.swiglu_limit))
             except Exception:
                 pass
-        gate = fp4_linear(x, w1, s1).float()
-        up = fp4_linear(x, w3, s3).float()
+        gate = fp4_linear(x, w1, s1)
+        up = fp4_linear(x, w3, s3)
         if self.swiglu_limit > 0:
-            up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
-            gate = torch.clamp(gate, max=self.swiglu_limit)
-        y = F.silu(gate) * up
+            # Merge the two halves on the ACTIVATION (64KB at T=1), never on the
+            # weights: stacking W1/W3 would cost another 36MB per expert per step.
+            # vLLM's fused clamp+SwiGLU replaces clamp(clamp(silu(mul))) -- four
+            # dispatches become one.
+            from .vllm_ops import clamp_swiglu
+
+            fused = clamp_swiglu(torch.cat((gate, up), dim=-1), self.swiglu_limit)
+            if fused is not None:
+                y = fused.float()
+            else:
+                gf, uf = gate.float(), up.float()
+                uf = torch.clamp(uf, min=-self.swiglu_limit, max=self.swiglu_limit)
+                gf = torch.clamp(gf, max=self.swiglu_limit)
+                y = F.silu(gf) * uf
+        else:
+            y = F.silu(gate.float()) * up.float()
         if weights is not None:
             y = weights * y
         return fp4_linear(y.to(torch.bfloat16), w2, s2)
@@ -217,11 +248,10 @@ class MoE:
         target = self.gate.weight.device
         if target.type == "cuda":
             e = Expert(None, None, None, self.swiglu_limit)
-            e.fp4 = (
-                get("w1.weight").to(target), get("w1.scale").to(target),
-                get("w2.weight").to(target), get("w2.scale").to(target),
-                get("w3.weight").to(target), get("w3.scale").to(target),
-            )
+            w1t, s1t = get("w1.weight").to(target), get("w1.scale").to(target)
+            w2t, s2t = get("w2.weight").to(target), get("w2.scale").to(target)
+            w3t, s3t = get("w3.weight").to(target), get("w3.scale").to(target)
+            e.fp4 = (w1t, s1t, w2t, s2t, w3t, s3t)
             return e
         return Expert(
             dequant_fp4_block(get("w1.weight"), get("w1.scale")),
@@ -394,6 +424,10 @@ class MoE:
         # needed both disappear. Only a single-token forward has that shape. The expert
         # cache is consulted inside the fused path too, so the cache pass is skipped here
         # rather than splitting one layer's experts across two code paths.
+        # tier.official_gemv=True forces this path. False (the default) means "decide by
+        # shape", which is what every tier did before the field was wired -- reading False
+        # as "disable" turned the fused path off for tiers that never asked either way.
+        _force_fused = bool(getattr(self, "_official_gemv", False))
         _fused = False
         if _single and use_fp4_kernel and _aq is not None and active:
             _ok = self._fused_ok
@@ -404,7 +438,7 @@ class MoE:
                        and moe_gemv.supported_shape(self.cfg.moe_inter_dim, self.cfg.dim)
                        and moe_gemv.supported_shape(self.cfg.dim, self.cfg.moe_inter_dim))
                 self._fused_ok = _ok
-            _fused = bool(_ok)
+            _fused = bool(_ok) or _force_fused
             if _os0.environ.get("TI_FUSED_STATS") == "1":
                 import sys as _sys
                 print(f"[moe] layer {self.layer_id}: fused={_fused} "
@@ -448,11 +482,10 @@ class MoE:
                     rows = rows.unsqueeze(0)
                     cols = cols.unsqueeze(0)
                 if e.fp4 is not None:
-                    if _aq is not None:
-                        y[rows] += e.forward_fp4_pq(_aq[rows], _asc[rows],
-                                                    weights[rows, cols, None]).float()
-                    else:
-                        y[rows] += e.forward_fp4(xf[rows], weights[rows, cols, None]).float()
+                    # Marlin reads the raw activation and streams the weights at 308 GB/s;
+                    # the fp8-GEMV path measures 40. fp4_linear short-circuits to Marlin
+                    # before quantising, so the pre-quantised pair is only the fallback.
+                    y[rows] += e.forward_fp4(xf[rows], weights[rows, cols, None]).float()
                 else:
                     y[rows] += e.forward(xf[rows], weights[rows, cols, None])
                 served.append(i)
@@ -549,22 +582,17 @@ class MoE:
                                 # one row, one expert: accumulate straight into y instead
                                 # of building row/col index tensors and scattering
                                 _w = _wsum[i]
-                                if _aq is not None:
-                                    _val = e.forward_fp4_pq(_aq, _asc, _w).float()
-                                else:
-                                    _val = e.forward_fp4(xf, _w).float()
+                                # raw activation: fp4_linear routes to Marlin before
+                                # it would quantise, so the fp8 pair is not needed here
+                                _val = e.forward_fp4(xf, _w).float()
                                 y += _val
                                 served.append(i)
                                 continue
-                            if _aq is not None:
-                                # idx holds *every* row routed to this expert. Taking
-                                # idx[0] (as this did) fed only the first row through the
-                                # kernel, which is why a batch and the same rows one at a
-                                # time disagreed while a single token was exact.
-                                _val = e.forward_fp4_pq(_aq[idx], _asc[idx],
-                                                        weights[idx, top, None]).float()
-                            else:
-                                _val = e.forward_fp4(xf[idx], weights[idx, top, None]).float()
+                            # idx holds *every* row routed to this expert. Taking idx[0]
+                            # (as this once did) fed only the first row through the kernel,
+                            # which is why a batch and the same rows one at a time
+                            # disagreed while a single token was exact.
+                            _val = e.forward_fp4(xf[idx], weights[idx, top, None]).float()
                         else:
                             e = self._make_expert(rec)
                             if e.fp4 is not None:

@@ -31,3 +31,36 @@ Linux 用 [scripts/bootstrap.sh](scripts/bootstrap.sh)。
 ## 提交
 
 提交信息说明**为什么**这样改，而不是罗列改了什么。实测数字要写明测试条件。
+
+## Kernels: copy a proven implementation before writing one
+
+Every kernel starts from an upstream implementation whenever one exists. vLLM's csrc/ and
+llama.cpp's ggml/ are checked out under repositories/ for exactly this; read them before
+opening an editor.
+
+This is not a style preference. Measured on this machine (RTX 5060 Laptop, sm_120, fp4
+experts N=16384 K=5120, 40 MB of weights, three warm-up rounds):
+
+| implementation | time | bandwidth |
+| --- | --- | --- |
+| tinyinfer fp4_linear -> vendored vLLM Marlin (mxfp4) | **136.2 us** | **308.0 GB/s** |
+| vLLM Marlin run standalone (mxfp4, M=1) | 142.9 us | 293.6 GB/s |
+| tinyinfer, hand-written scalar decode | 657 us | 59 GB/s |
+| tinyinfer, tilelang fallback | 1044 us | 40 GB/s |
+
+Writing it from scratch cost five iterations (table lookup, ALU bit-assembly, SWAR, tensor
+core with manual fragments, 16-byte vector loads) and the best of them reached 4.8x SLOWER
+than the kernel that was already sitting in repositories/vllm/csrc/quantization/marlin/.
+The gap is not in the arithmetic; it is in the four-stage cp.async pipeline, the ldmatrix
+fragment loads, and the k-major interleaved weight repack -- three things Marlin already
+does.
+
+Vendoring it took one file (src/tinyinfer/gemv_fp4_marlin.py, ~150 lines): repack the
+weights once at load with gptq_marlin_repack, permute the e8m0 scales into the block order
+the dequantiser reads, then call marlin_gemm. Correctness is checked against a hand decode
+of E2M1 (max relative error 4.7e-3, i.e. bf16 activation precision). Full numbers in
+docs/vllm-baseline.md.
+
+So: vendor the upstream kernel, adapt its interface, keep its name in a comment with the
+commit or version it came from, and only then consider a replacement. A from-scratch kernel
+has to beat the vendored one on a measurement before it replaces it.

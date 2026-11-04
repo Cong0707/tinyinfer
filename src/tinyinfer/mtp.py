@@ -114,11 +114,20 @@ class MTPAttention(MLAWindowAttention):
         # official update_main_cache: main_k = main_kv_proj(main_hiddens) then kv_norm + rope
         main_kv = rms_norm(_lin(self.wkv, main_x), self.kv_norm, self.eps)  # [1, n_main, head_dim]
         apply_rope(main_kv[..., -rd:], self.freqs_cis[main_pos0:main_end])
+        # tier.mtp_feedback_window: accumulate the draft's main-KV window across decode
+        # steps (DSpark's feedback window). The field was documented but nothing read it,
+        # so every tier accumulated unconditionally -- the window update also costs a
+        # cat+slice over 'win' slots per draft step. With it off the draft attends only
+        # to the current token's main KV, which is the cheaper, lower-quality setting.
         hist = self._kv_window
-        if hist is None or hist.shape[0] != b or hist.device != main_kv.device:
-            hist = main_kv.new_empty(b, 0, self.head_dim)
-        hist = torch.cat([hist, main_kv], dim=1)[:, -win:].contiguous()
-        self._kv_window = hist
+        if getattr(self, "feedback_window", True):
+            if hist is None or hist.shape[0] != b or hist.device != main_kv.device:
+                hist = main_kv.new_empty(b, 0, self.head_dim)
+            hist = torch.cat([hist, main_kv], dim=1)[:, -win:].contiguous()
+            self._kv_window = hist
+        else:
+            hist = main_kv[:, -win:].contiguous()
+            self._kv_window = hist
         if start_pos == 0:
             return x  # prefill only seeds the window (official: no draft compute)
 
@@ -341,7 +350,8 @@ class MTPBlock:
         return self
 
 
-def load_mtp(store: ShardStore, cfg: TinyConfig, quant: bool = False) -> list[MTPBlock] | None:
+def load_mtp(store: ShardStore, cfg: TinyConfig, quant: bool = False,
+             feedback_window: bool = True) -> list[MTPBlock] | None:
     """Instantiate all MTP stages if the mtp.* weights are present (official DFlash: self.layers)."""
     if cfg.n_mtp_layers <= 0:
         return None
@@ -349,4 +359,7 @@ def load_mtp(store: ShardStore, cfg: TinyConfig, quant: bool = False) -> list[MT
         stages = [MTPBlock(store, st, cfg, quant=quant) for st in range(cfg.n_mtp_layers)]
     except (KeyError, FileNotFoundError, ValueError):
         return None
+    # each stage's draft attention carries the flag; MTPAttention reads it per call
+    for st in stages:
+        st.attn.feedback_window = feedback_window
     return stages

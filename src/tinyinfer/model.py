@@ -12,17 +12,37 @@ from .nn import rms_norm
 from .weights import ShardStore
 
 
+def set_weight(owner, name: str, tensor) -> None:
+    """Point a module's weight at a new tensor without losing its Parameter identity.
+
+    Qwen's layers wrap their weights in nn.Parameter, and assigning a plain Tensor
+    over one raises TypeError("cannot assign 'torch.BFloat16Tensor' as parameter
+    'weight'"). That aborted the flat-streaming setup on Qwen3.8-27B and left every
+    layer on the CPU, which surfaced far downstream as "mat2 is on cpu" in the head
+    matmul. Writing through .data keeps the registered parameter and swaps its storage.
+    """
+    cur = getattr(owner, name, None)
+    if isinstance(cur, torch.nn.Parameter):
+        cur.data = tensor
+        return
+    setattr(owner, name, tensor)
+
+
 class Block(HCBlockMixin):
     """One decoder layer: Hyper-Connection collapse -> norm -> attention -> HC expand -> ... FFN."""
 
     def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, expert_store=None, quant: bool = False,
                  tp=None,
                  hashes=None, cache_wo_a: bool = False, expert_topk: int = 0, rt=None,
-                 cache_shared_bf16: bool = False):
+                 cache_shared_bf16: bool = False, kv_quant: bool | None = None):
         self.layer_id = layer_id
         self.cfg = cfg
         self._expert_store = expert_store
         self.quant = quant
+        # KV precision is its own axis: tier.kv_bits decides whether the window cache
+        # round-trips through fp8. It used to ride on 'quant' (the weight flag), so a
+        # tier could not ask for quantised weights with a full-precision KV cache.
+        self.kv_quant = quant if kv_quant is None else kv_quant
         self.cache_wo_a = cache_wo_a
         self.engram = None
         self._device = "cpu"
@@ -39,11 +59,15 @@ class Block(HCBlockMixin):
         self.hc_mult = cfg.hc_mult
         self.hc_sinkhorn_iters = cfg.hc_sinkhorn_iters
         self.hc_eps = cfg.hc_eps
+        # KV precision is its own axis (tier.kv_bits), but it must default to the weight
+        # flag so the resident-layer plan is unchanged for every tier that does not set
+        # it explicitly. kv_quant is resolved in Engine and passed down.
         if cfg.compress_ratios[layer_id] == 0:
-            self.attn = MLAWindowAttention(store, layer_id, cfg, quant=quant,
+            self.attn = MLAWindowAttention(store, layer_id, cfg, quant=self.kv_quant,
                                            cache_wo_a=cache_wo_a, tp=tp)
         else:
-            self.attn = MLACompressedAttention(store, layer_id, cfg, quant=quant, rt=rt, tp=tp)
+            self.attn = MLACompressedAttention(store, layer_id, cfg, quant=self.kv_quant,
+                                               rt=rt, tp=tp)
         # the bf16 expert cache exists for the dequantised (reference) path; when the
         # block keeps fp8/fp4 the fp4 serve path reads the blob views directly, so eight
         # bf16 copies per layer only cost VRAM (40 x 8 x 30MB = 9.6GB, which is what made
@@ -177,7 +201,7 @@ class Block(HCBlockMixin):
             for (owner, name, _) in paths:
                 ref = refs.get(self._wkey(owner, name))
                 if ref is not None:
-                    setattr(owner, name, ref)
+                    set_weight(owner, name, ref)
             self._device = "cpu"
             return self
         # per-tensor copies: a packed flat buffer cannot be freed per layer (views pin
@@ -221,14 +245,14 @@ class Block(HCBlockMixin):
                     st[o:o + n].copy_(cpu.reshape(-1).view(torch.uint8), non_blocking=False)
                 gpu = st[:total].to(device, non_blocking=False)  # single pinned H2D
                 for (owner, name, t), o, n in zip(paths, offsets, nbytes):
-                    setattr(owner, name, gpu[o:o + n].view(t.dtype).view(t.shape))
+                    set_weight(owner, name, gpu[o:o + n].view(t.dtype).view(t.shape))
             else:
                 for (owner, name, _) in paths:
-                    setattr(owner, name,
+                    set_weight(owner, name,
                             self._cpu_refs[self._wkey(owner, name)].to(device, non_blocking=True))
         else:
             for (owner, name, _) in paths:
-                setattr(owner, name,
+                set_weight(owner, name,
                         self._cpu_refs[self._wkey(owner, name)].to(device, non_blocking=True))
         if getattr(self, "engram", None) is not None:
             # engram tables stay on disk (row reads) but its small projection weights

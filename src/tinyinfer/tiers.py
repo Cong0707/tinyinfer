@@ -72,10 +72,18 @@ def plan(level: OptLevel = OptLevel.BALANCED, vram_gb: float = 8.0, ram_gb: floa
             approximations={}, notes="reference: bf16 weights + plain torch ops (framework-average)")
         # tier 0 keeps every engine mechanism off: it is the correctness baseline
     if level == OptLevel.BALANCED:
-        # official optimizations as shipped by the reference stack (tilelang + fp8/fp4)
+        # official optimizations as shipped by the reference stack (tilelang + fp8).
+        # use_fp4_gemm must be False here: the fp4 GEMM/GEMV kernel coerces weights and
+        # activations to fp4 at runtime (~20% per-layer error, non-deterministic) and the
+        # tier-3 note below has always said it "must never be the default of any tier".
+        # It was True at this level, which made tier 1 and tier 2 disagree on precision
+        # even though both are supposed to be the same faithful run of the checkpoint.
         return TierConfig(
-            level=level, use_tilelang_attn=True, use_fp8_gemm=True, use_fp4_gemm=True,
-            keep_weights_quantized=True, expert_cache_gb=cache, kv_bits=16,
+            level=level, use_tilelang_attn=True, use_fp8_gemm=True, use_fp4_gemm=False,
+            # kv_bits=8 is what this tier actually ran before kv_bits was wired: KV
+            # precision rode on keep_weights_quantized, which is True here. 16 (bf16)
+            # doubles the KV cache and pushed the 40-layer plan into an OOM.
+            keep_weights_quantized=True, expert_cache_gb=cache, kv_bits=8,
             prefetch=False, prefetch_k=0, mtp=False, head_on_cpu=False,
             # level 1 = production-proven mechanisms ported in (official kernels + Flare)
             cuda_graph=True, graph_catalog=(128, 256, 512, 1024, 2048),
@@ -88,6 +96,9 @@ def plan(level: OptLevel = OptLevel.BALANCED, vram_gb: float = 8.0, ram_gb: floa
         # OUR engine optimizations (main production target): streaming + caches + prefetch + MTP
         return TierConfig(
             level=level, use_tilelang_attn=True, use_fp8_gemm=True, use_fp4_gemm=False,
+            # kv_bits matches BALANCED exactly: the two tiers are the SAME precision and
+            # the SAME capabilities; only the mechanisms differ (tier 1 uses what ships
+            # in the reference stack, tier 2 uses this engine's own dynamic loading).
             keep_weights_quantized=True, expert_cache_gb=cache, kv_bits=8,
             prefetch=True, prefetch_k=2, mtp=True, head_on_cpu=True,
             # level 2 = our engine's features on top of the ported mechanisms

@@ -104,6 +104,17 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
 
 def fp4_linear(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor, act_block: int = 32) -> torch.Tensor:
     """C = x @ w_fp4.T with fp8 activation quant, fp4 weight (official kernel path)."""
+    # vLLM's Marlin streams the expert weights at 284 GB/s on this card where the
+    # hand-written GEMV manages 59 -- it is the same matrix, decoded in ldmatrix
+    # fragments off a four-stage cp.async pipeline instead of by scalar loads. Route
+    # the small-M case there and keep the fp8 path as the fallback.
+    if x.is_cuda and x.dim() == 2 and 0 < x.size(0) <= 8:
+        try:
+            from .gemv_fp4_marlin import gemv_fp4_fast as _marlin_gemv
+
+            return _marlin_gemv(x, w_fp4, w_scale)
+        except Exception:
+            pass
     if x.dim() == 2 and 0 < x.size(0) <= 8 and x.is_cuda:
         # same block_M=32 waste as fp8: at M=2 the GEMM took 334ms/layer. Rows are done
         # one at a time with the single-row kernel: gemv_fp4_m8's multi-row grid was

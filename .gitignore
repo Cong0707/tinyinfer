@@ -38,3 +38,8 @@ reference/
 
 # 早期 kernel 实验（import 会失败，不是引擎的一部分）
 prototypes/
+
+# 手工编译的 vLLM 扩展（34 MB）：由 docs/vllm-extension-build.md 里的流程重建。
+# 不入库，但要跟着源码目录放，tinyinfer 优先从包内加载。
+src/tinyinfer/_C_stable_libtorch.pyd
+src/tinyinfer/_moe_C_stable_libtorch.pyd
