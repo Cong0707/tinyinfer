@@ -1,4 +1,4 @@
-﻿"""tinyinfer engine: full-model driver on top of adapters + tiers + ExpertStore.
+"""tinyinfer engine: full-model driver on top of adapters + tiers + ExpertStore.
 
 Owns model lifecycle: embedding, block residency (lazy per-layer load), generation.
 The fetch/dequant/eviction policy lives in loading.py; this is the orchestration layer.
@@ -66,6 +66,31 @@ class Engine:
         self._engine_lock = EngineLock().acquire()
         self.layer_ids = list(layers) if layers is not None else None
         self.device = device
+        # Multi-GPU: probe every visible card, pool their VRAM and build the addressing
+        # table. With one card this collapses to a single-entry table and every path
+        # below behaves exactly as before, so a single-GPU run is byte-for-byte the same
+        # engine. The pool accounts for what is *really* free on each card, which is what
+        # makes the placement asymmetric without a configuration knob: the caller never
+        # says "put 60% here", the cards say how much they can hold.
+        self.devices: list = []
+        self.pool = None
+        self.placement = None
+        self._multi_gpu = False
+        if str(device).startswith("cuda"):
+            try:
+                from .tp import Pool, Placement, probe_devices
+
+                self.devices = probe_devices()
+                if len(self.devices) > 1:
+                    self.pool = Pool(self.devices)
+                    self.placement = Placement(self.pool)
+                    self._multi_gpu = True
+                    desc = ", ".join(
+                        f"cuda:{d.index} {d.name} {d.free >> 30}GiB free "
+                        f"({d.bandwidth / 1e9:.0f} GB/s)" for d in self.devices)
+                    print(f"[tinyinfer] multi-GPU pool: {desc}", flush=True)
+            except Exception as _tp_exc:
+                print(f"[tinyinfer] multi-GPU probe skipped ({_tp_exc!r})", flush=True)
         self._tokenizer = tokenizer
         self.hashes = None
         self.adapter = open_adapter(adapter) if isinstance(adapter, str) else adapter
