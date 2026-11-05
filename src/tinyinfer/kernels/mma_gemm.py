@@ -25,6 +25,12 @@ def fp8_gemm_mma(x, w_fp8, w_scale, block: int = 32):
     n = int(w_fp8.size(0))
     if k % 32 or n % 64:
         raise ValueError(f'fp8_gemm_mma needs K%32==0 and N%64==0, got K={k} N={n}')
+    rows = x.size(0) if x.dim() == 2 else 1
+    if rows < 128:
+        # See the note in gemm.fp8_linear: a block covers 128 rows with 8 warps, and a
+        # partial first block only writes its leading warps. Silently returning a tensor
+        # with 112 unwritten rows is worse than making the caller take the GEMV path.
+        raise ValueError(f'fp8_gemm_mma needs M>=128, got M={rows}')
 
     xf = x.reshape(-1, k) if x.dim() != 2 else x
     if xf.dtype != torch.bfloat16:

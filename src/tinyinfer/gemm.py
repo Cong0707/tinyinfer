@@ -211,6 +211,13 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
     # paths differ by one bf16 ulp, which is enough to change decoded tokens over 40
     # layers ([989,43,4571,5958] -> [223,19,17,20]). Using one path for both is the only
     # way to keep them consistent until the two kernels are proven equivalent.
+    # 128 is a CORRECTNESS bound, not just a performance one. The kernel strides whole
+    # 16-row mma tiles and one block covers BLOCK_M=128 rows via its 8 warps; a block whose
+    # rows run past M returns early, so M not a multiple of 128 is fine (the tail block
+    # simply stops). But with M < 128 the first block is the only one and only its leading
+    # warps do any work -- rows 16..127 are never written, and the caller reads whatever
+    # torch.empty left there. Keeping the threshold at 128 is what makes the guard
+    # correct; it happens to also be where the kernel stops losing to the SIMT GEMV.
     if (x.is_cuda and x.dim() == 2 and x.size(0) >= 128 and block == 32
             and __import__("os").environ.get("TI_MMA_GEMM") == "1"):
         try:
