@@ -98,7 +98,16 @@ class QuantLinear:
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.is_sharded or not x.is_cuda:
-            _dev, weight, scale = self.parts[0]
+            # Read self.weight/self.scale, NOT parts[0]. Flat streaming swaps a layer's
+            # weights by calling set_weight(), which assigns .weight (and .data on an
+            # nn.Parameter) but cannot reach into the parts tuple. parts[0] therefore kept
+            # pointing at the host copy the layer was built with, so this branch saw
+            # weight.device != x.device on EVERY call and re-uploaded the matrix: measured
+            # 632 real copies per decode token in the attention linears alone (7.45GB) and
+            # another 490 in the MoE, 1.13s of a 1.5s step, all of it redundant. The
+            # sharded path below still uses parts, which is what multi-card placement
+            # owns.
+            weight, scale = self.weight, self.scale
             if weight.device != x.device:
                 return self._one(x, weight.to(x.device), scale.to(x.device))
             return self._one(x, weight, scale)
