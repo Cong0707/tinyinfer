@@ -6,6 +6,7 @@ the suite stays fast on CI.
 from pathlib import Path
 
 import pytest
+from conftest import requires_cuda
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +30,7 @@ def _engine():
 
 
 @pytest.mark.xfail(reason="a second prefill in the same session drifts by >1 logit; the residual session state is not fully cleared yet (see docs/changelog.md)", strict=False)
+@requires_cuda
 def test_repeat_prefill_same_argmax():
     """A second prefill in the same session must match the first (session reset)."""
     eng, tok = _engine()
@@ -48,6 +50,7 @@ def test_repeat_prefill_same_argmax():
 
 
 @pytest.mark.xfail(reason="one-shot T>1 forward differs from token-by-token (MoE batch path); generate() only consumes the last position of a causal prefill, so answers stay correct", strict=False)
+@requires_cuda
 def test_multi_token_matches_stepwise():
     eng, tok = _engine()
     ids = tok.encode("<｜begin▁of▁sentence｜><｜User｜>The capital of France is<｜Assistant｜>",

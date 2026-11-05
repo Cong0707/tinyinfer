@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from tinyinfer.deepseek.compressed_attention import MLACompressedAttention
-from conftest import model_dir
+from conftest import model_dir, requires_cuda
 from tinyinfer.config import TinyConfig
 
 
@@ -60,6 +60,7 @@ def make_store(cfg, layer_id=2, seed=0):
 
 
 @pytest.mark.kernel
+@requires_cuda
 def test_prefill_and_decode():
     cfg = TinyConfig.from_hf(model_dir())
     assert cfg.compress_ratios[2] == 2

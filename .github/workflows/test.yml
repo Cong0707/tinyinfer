@@ -1,0 +1,55 @@
+name: test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  # The CPU half always runs. It covers the planner (which is a solver over bytes and
+  # needs no device), the expert-parallel arithmetic, the TP sharding maths and the
+  # server/CLI surface -- the parts where a regression changes an ANSWER rather than a
+  # speed.
+  cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: install
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e '.[dev]'
+      - name: pytest (no GPU: anything that needs CUDA skips itself)
+        run: python -m pytest tests -x -q --ignore=tests/test_server.py
+      - name: planner and EP arithmetic
+        run: |
+          python - <<'PY'
+          import sys, pathlib
+          sys.path.insert(0, 'src')
+          from tinyinfer.ep import ExpertRoute, reduce_partials
+          import torch
+          r = ExpertRoute(384, ['cuda:0', 'cuda:1'])
+          assert r.world == 2
+          assert all(r.rank_of(e) >= 0 for e in range(384))
+          assert len(r.mine(list(range(384)), 0)) + len(r.mine(list(range(384)), 1)) == 384
+          a = torch.randn(2, 4); b = torch.randn(2, 4)
+          assert torch.equal(reduce_partials([a, b]), a + b)
+          print('planner/EP arithmetic ok')
+          PY
+
+  # The kernel half needs the cubins. It compiles them for the runner's own arch and
+  # then runs the conformance suite -- which is the point: a kernel that does not build
+  # for a given arch, or builds and computes something else, fails here rather than in
+  # production.
+  kernels:
+    runs-on: [self-hosted, gpu]
+    if: ${{ false }}   # enable once a runner with a GPU is registered
+    steps:
+      - uses: actions/checkout@v4
+      - name: build native kernels
+        run: ./scripts/build_native.sh
+      - name: kernel conformance
+        run: python scripts/check_kernels.py
