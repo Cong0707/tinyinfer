@@ -22,7 +22,15 @@ def _profile():
     path = os.environ.get('TI_MODEL')
     if not path:
         return None
-    return model_profile(ShardIndex(path))
+    # A wrong path is a skipped case, not a crashed suite: this file gets run on machines
+    # that do not have the checkpoint, and a test runner that dies on configuration is
+    # one people stop running.
+    if not os.path.isdir(path):
+        return None
+    try:
+        return model_profile(ShardIndex(path))
+    except Exception:
+        return None
 
 
 def register(report) -> None:
