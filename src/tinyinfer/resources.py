@@ -235,8 +235,20 @@ def model_profile(index: Any) -> dict:
                 import pathlib as _path
                 _cfg = _path.Path(getattr(index, "model_dir", "")) / "config.json"
                 if _cfg.exists():
-                    prof["topk"] = int(_json.loads(_cfg.read_text(encoding="utf-8"))
-                                       .get("num_experts_per_tok") or 0) or None
+                    # num_experts_per_tok lives under text_config on this checkpoint family
+                    # (the top level holds architectures/quantization_config/text_config/...).
+                    # Reading only the top level returned None here, which made
+                    # has_experts False below and drove the plan to slots=0 -- the one
+                    # state that comment at the slots block calls out as fatal: "a zero-slot
+                    # plan allocates a fresh 18.8MB buffer per expert per layer per token".
+                    # Measured with slots=0: 660 expert visits per token, 100% cache hits,
+                    # zero disk reads, and still 1.60s per token, because every visit was a
+                    # fresh device allocation instead of a staging slot. Fall back to the
+                    # top level so a flat config still works.
+                    _raw = _json.loads(_cfg.read_text(encoding="utf-8"))
+                    _tc = _raw.get("text_config")
+                    _top = _tc if isinstance(_tc, dict) else _raw
+                    prof["topk"] = int(_top.get("num_experts_per_tok") or 0) or None
             except Exception:
                 prof["topk"] = None
         for key, name in (("embed_bytes", "embed.weight"), ("head_bytes", "head.weight")):

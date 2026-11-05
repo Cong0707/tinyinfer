@@ -266,9 +266,20 @@ class MoE:
         target = self.gate.weight.device
         if target.type == "cuda":
             e = Expert(None, None, None, self.swiglu_limit)
-            w1t, s1t = get("w1.weight").to(target), get("w1.scale").to(target)
-            w2t, s2t = get("w2.weight").to(target), get("w2.scale").to(target)
-            w3t, s3t = get("w3.weight").to(target), get("w3.scale").to(target)
+            # non_blocking: the source is a slice of the pinned host pool, so a blocking
+            # copy has nothing to gain and everything to lose -- it waits for the whole
+            # transfer queue to drain before returning, once per tensor. This path runs
+            # 6 copies per expert and a decode token touches 660 experts, so on a
+            # slots=0 plan that is ~3960 synchronous waits per token; the docstring on
+            # _expert_from_rec measured ~18ms/layer from exactly this, i.e. ~0.7s of a
+            # 1.6s step. Pinned->device with non_blocking is a plain async DMA and the
+            # caller's stream ordering still makes the bytes visible before use.
+            w1t = get("w1.weight").to(target, non_blocking=True)
+            s1t = get("w1.scale").to(target, non_blocking=True)
+            w2t = get("w2.weight").to(target, non_blocking=True)
+            s2t = get("w2.scale").to(target, non_blocking=True)
+            w3t = get("w3.weight").to(target, non_blocking=True)
+            s3t = get("w3.scale").to(target, non_blocking=True)
             e.fp4 = (w1t, s1t, w2t, s2t, w3t, s3t)
             return e
         return Expert(
