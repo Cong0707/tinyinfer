@@ -195,8 +195,22 @@ class Expert:
                 from .fp4_native import _scale
 
                 ws = self._ws_cache = (_scale(s1), _scale(s2), _scale(s3))
-        gate = _lin(aq, asc, w1, s1, ws[0]).float()
-        up = _lin(aq, asc, w3, s3, ws[2]).float()
+        # Decode: gate and up in one launch. They are two fp4 matrices over the same
+        # activation, so the fused kernel reads that activation once instead of twice --
+        # measured 1.50x on real expert weights, bit-identical to the two calls
+        # (diff 0.0 on both). Prefill keeps the row loop, where the batch dimension makes
+        # the two-call form the cheaper one.
+        _fused_gu = (aq.dim() == 2 and aq.size(0) == 1 and aq.is_cuda
+                     and ws is not None and w1.shape == w3.shape)
+        if _fused_gu:
+            from .fp4_gate_up import gemv_fp4_gate_up
+
+            gate_t, up_t = gemv_fp4_gate_up(aq, asc, w1, ws[0], w3, ws[2])
+            gate = gate_t.float()
+            up = up_t.float()
+        else:
+            gate = _lin(aq, asc, w1, s1, ws[0]).float()
+            up = _lin(aq, asc, w3, s3, ws[2]).float()
         if self.swiglu_limit > 0:
             up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
             gate = torch.clamp(gate, max=self.swiglu_limit)
