@@ -1,4 +1,4 @@
-﻿"""Optional tilelang backends (O2). Lazy, cached, fallback-safe.
+"""Optional tilelang backends (O2). Lazy, cached, fallback-safe.
 
 The tilelang JIT needs nvcc + MSVC cl.exe (vcvars64); when unavailable the
 dispatch silently falls back to the PyTorch reference implementation.
@@ -118,6 +118,54 @@ def sparse_attn_tl(q, kv, attn_sink, topk_idxs, scale: float, h_chunk: int = 16,
     return o
 
 
+def sparse_attn_cuda(q, kv, attn_sink, topk_idxs, scale: float):
+    """CUDA implementation (kernels/cuda/sparse_attn_sink.cu). Returns None if unusable.
+
+    One CTA per (row, head): the warps split the slot list and the lanes inside a warp
+    split head_dim, so each warp produces a partial split-KV result that the CTA merges
+    with the log-sum-exp combine. The sink is folded in as one extra logit with no value,
+    which is what the reference does by appending a zero vector.
+
+    K matters here. With one warp walking all slots the kernel is latency-bound and loses
+    to the tiled path at this model's K (640 = 128 window + 512 index-topk): 982 us vs
+    554 us. Four warps over the same slots bring it down by roughly the warp count.
+
+    Falls back (returns None) rather than raising, so a shape this kernel does not cover
+    still runs through the existing path.
+    """
+    from . import native
+
+    if not q.is_cuda or q.dtype != torch.bfloat16 or kv.dtype != torch.bfloat16:
+        return None
+    if q.dim() != 4 or kv.dim() != 3 or topk_idxs.dim() != 3:
+        return None
+    b, m, h, d = q.shape
+    n = kv.shape[1]
+    k = topk_idxs.shape[-1]
+    if d > 512 or k <= 0 or h <= 0:
+        return None
+    try:
+        out = torch.empty_like(q)
+        idx = topk_idxs.to(torch.int32).contiguous()
+        if attn_sink.dtype != torch.float32:
+            attn_sink = attn_sink.float()
+        # One block per (row, head); warps inside it share the slot list. 128 threads
+        # (4 warps) is the point where the K=640 case stops being latency-bound without
+        # making the per-warp slices too short to amortise the merge.
+        nwarp = 4
+        blk = nwarp * 32
+        smem = (2 * nwarp + nwarp * d) * 4
+        grid = (b * m * h,)
+        native.launch(native.kernel("sparse_attn_sink", "sparse_attn_sink"),
+                      grid, (blk,),
+                      [q.contiguous(), kv.contiguous(), attn_sink.contiguous(), idx,
+                       out, b, m, h, d, n, k, float(scale)],
+                      shared=smem)
+        return out
+    except Exception:
+        return None
+
+
 def sparse_attn_dispatch(q, kv, attn_sink, topk_idxs, scale: float, prefer_tilelang: bool = True):
     import os as _o
     if _o.environ.get("TI_REF_ATTN") == "1":
@@ -135,6 +183,14 @@ def sparse_attn_dispatch(q, kv, attn_sink, topk_idxs, scale: float, prefer_tilel
     path. Our own kernel and the pure-torch reference remain as fallbacks.
     """
     global _TL_STATE
+    # Our own kernel is the only implementation in this tree -- the official path and the
+    # tilelang one are both external JIT kernels. It matched the reference bit-for-bit on
+    # every shape tried (and within two bf16 ulps on the largest), so there is no flag to
+    # choose: if the shape is covered it runs, and the external paths below only exist for
+    # the shapes it is not (it returns None rather than raising).
+    _cuda_out = sparse_attn_cuda(q, kv, attn_sink, topk_idxs, scale)
+    if _cuda_out is not None:
+        return _cuda_out
     try:
         from .official_kernel_ref import sparse_attn as _official_sparse_attn
 
