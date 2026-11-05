@@ -944,7 +944,23 @@ class Engine:
                 _epr = self._expert_route()
                 if _epr is not None:
                     ffn.ep_world = _epr.world
-                    ffn.ep_rank = 0
+                    # Which rank this block is. Hardcoding 0 made every card serve rank
+                    # 0's contiguous block and no card serve the rest: with world=2 the
+                    # first 192 experts were computed twice and the last 192 never, and
+                    # the answer looked plausible because a MoE layer with half its
+                    # experts still produces well-scaled activations.
+                    #
+                    # The rank follows the device the block lives on. A block's device is
+                    # known after placement, so resolve it now and fall back to 0 only when
+                    # the device is not one of the route's (CPU-resident layer, or a
+                    # single-card machine where world==1 and the value never matters).
+                    _dev = getattr(b, "_device", None)
+                    _rank = 0
+                    if _dev is not None:
+                        _ds = str(_dev)
+                        if _ds in _epr.devices:
+                            _rank = _epr.devices.index(_ds)
+                    ffn.ep_rank = _rank
                     ffn._ep_route = _epr
                 # DEFAULT OFF: the background fetch races the main-thread reads and made
                 # the same MoE layer produce different values for different sequence

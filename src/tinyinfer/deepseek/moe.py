@@ -821,9 +821,27 @@ class MoE:
         # process per rank; the ranks here are devices inside one process, so the sum is
         # a device-to-device add. _ep_partials is filled by the caller that drives the
         # per-rank passes; a single rank simply has nothing to add.
-        _partials = getattr(self, "_ep_partials", None)
-        if _partials:
+        # Expert parallelism: each rank computed a DISJOINT subset of the experts, so the
+        # layer output is the sum of the ranks' partial outputs -- not a concatenation
+        # (that would double the rows) and not any single one (that would silently drop
+        # every expert another rank owned).
+        #
+        # The ranks are devices inside ONE process, so the sum is a device-to-device add
+        # and there is no collective to call: everything each rank produced has to be
+        # handed to whoever sums them. That is what _ep_partials is: a list each rank
+        # appends its own y to, which the driver then reduces.
+        #
+        # It used to be read here but never written anywhere in the tree, so world>1
+        # returned only its own rank's contribution and the other ranks' experts were
+        # dropped without an error. Filling it here is what makes the read meaningful.
+        _bucket = getattr(self, "_ep_partials", None)
+        if _world > 1 and _bucket is not None:
+            _bucket.append(y)
+        if _bucket:
             from ..ep import reduce_partials
 
-            y = reduce_partials(list(_partials) + [y], target_device=y.device)
+            _all = list(_bucket)
+            if len(_all) > 1:
+                y = reduce_partials(_all, target_device=y.device)
+                _bucket.clear()
         return y.to(x.dtype).view(shape)
