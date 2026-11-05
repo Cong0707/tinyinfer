@@ -697,6 +697,14 @@ class MoE:
                             # be six blocking rec.tensor(...).to(target) copies per expert =
                             # 480 synchronous pageable copies per decode step, which was the
                             # single largest host cost in the step.
+                            #
+                            # Caching here (the fused branch above does) was tried and is
+                            # NOT safe: an Expert's fp4 tuple holds views into the 4-deep
+                            # _blob_stage ring, so a cached entry can outlive the bytes it
+                            # points at. That is the same hazard that makes the planner
+                            # refuse a small VRAM slot pool. Measured difference from adding
+                            # the lookup: 819ms -> 793ms, inside run-to-run noise, against a
+                            # correctness risk.
                             e = self._expert_from_rec(rec)
                             if _single and i in _wsum:
                                 # one row, one expert: accumulate straight into y instead
