@@ -899,7 +899,7 @@ class Engine:
         # dynamically by VramSlotCache, where any expert can land in any slot on any card.
         # Printing it as "the placement plan" made it look like the two agreed.
         _slots = getattr(getattr(self, "expert_store", None), "slots", None)
-        _real = getattr(_slots, "total_slots", None)
+        _real = getattr(_slots, "slots", None)
         _note = (f" (static reference only; decode uses {_real} dynamic slots)"
                  if _real else "")
         print(f"[tinyinfer] expert placement plan: {desc}{_note}", flush=True)
