@@ -36,6 +36,11 @@ class Gate:
         self.route_scale = cfg.route_scale
 
     def forward(self, x: torch.Tensor, image_mask: torch.Tensor | None = None):
+        # Host-side routing was tried here and reverted: computing the gate on the CPU is
+        # arithmetically correct (indices and weights match the GPU path exactly on real
+        # activations) and 0.29ms/layer, but it has to bring the activation down from the
+        # GPU first, and that D2H sync costs more than the GPU matmul it replaces.
+        # Measured: 788ms -> 879ms per token.
         logits = F.linear(x.float(), self.weight)  # gate_temp == 1.0 in the released config
         # vLLM's router does softplus(x).sqrt() + bias + top-k + renormalise + routing
         # scale in one kernel. The vision path is excluded: it picks a different bias per
