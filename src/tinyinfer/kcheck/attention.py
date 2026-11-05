@@ -69,5 +69,58 @@ def _prefill_vs_stepwise(report):
                 note='(shares the KV cache, different code paths)')
 
 
+def _compressed(report):
+    """The other attention path: latent compressor + indexer instead of a plain window.
+
+    34 of the 40 layers use this one, so it is the path a decode actually spends its time
+    in; the same prefill/stepwise invariant has to hold or the cached latents drift.
+    """
+    try:
+        import pathlib
+
+        import torch
+
+        from ..config import TinyConfig
+        from ..deepseek.compressed_attention import MLACompressedAttention
+        from ..weights import ShardStore
+    except Exception as exc:
+        report.add(Case('compressed_attention', f'unavailable: {exc!r}', False))
+        return
+    if not torch.cuda.is_available():
+        report.add(Case('compressed_attention', 'skipped (no CUDA device)', True))
+        return
+    model = os.environ.get('TI_MODEL')
+    if not model or not os.path.isdir(model):
+        report.add(Case('compressed_attention', 'skipped (set TI_MODEL)', True))
+        return
+
+    cfg = TinyConfig.from_hf(pathlib.Path(model))
+    store = ShardStore(model)
+    lid = next(i for i, r in enumerate(cfg.compress_ratios) if r != 0)
+    torch.manual_seed(1)
+    T = 6
+    x = torch.randn(1, T, cfg.dim, dtype=torch.bfloat16, device='cuda') * 0.02
+
+    attn = MLACompressedAttention(store, lid, cfg)
+    # same placement note as the window path: Block owns device movement, not the module
+    for _name, _v in list(vars(attn).items()):
+        if _name.startswith('_'):
+            continue
+        if torch.is_tensor(_v):
+            setattr(attn, _name, _v.to('cuda'))
+        elif hasattr(_v, 'to'):
+            try:
+                _v.to('cuda')
+            except Exception:
+                pass
+    attn.reset()
+    batched = attn.forward(x, 0)
+    attn.reset()
+    stepwise = torch.cat([attn.forward(x[:, t:t + 1], t) for t in range(T)], dim=1)
+    check_close(report, 'compressed_attention prefill == stepwise decode',
+                stepwise, batched, rtol=3e-2, note='(latent cache + indexer)')
+
+
 def register(report) -> None:
     _prefill_vs_stepwise(report)
+    _compressed(report)
