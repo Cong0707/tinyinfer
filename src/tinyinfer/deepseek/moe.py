@@ -454,11 +454,23 @@ class MoE:
             # Whatever differs is data dependent, so this stays on the reference until
             # that is found. The cost is that gemv_fp4 (hence tilelang) is still imported
             # on this path.
+            # Set TI_QUANT_CHECK=1 to run fp4_native.quantize_act_checked, which compares
+            # the native quantiser against the reference on REAL activations and reports
+            # the first mismatch. It returns the reference's answer, so a checked run stays
+            # numerically correct; it is not on by default and not the fast path.
             try:
-                from .gemv_fp4 import quantize_act
+                if __import__("os").environ.get("TI_QUANT_CHECK") == "1":
+                    from .fp4_native import quantize_act_checked as quantize_act
+                else:
+                    from .gemv_fp4 import quantize_act
 
                 _aq, _asc = quantize_act(xf, xf.size(-1))
-            except Exception:
+            except Exception as _exc:
+                if __import__("os").environ.get("TI_QUANT_CHECK") == "1":
+                    import traceback as _tb
+
+                    print(f"[quant-fail] {_exc!r}", flush=True)
+                    _tb.print_exc()
                 _aq = _asc = None
 
         # per-expert (token, slot) selection computed once and reused by both passes
