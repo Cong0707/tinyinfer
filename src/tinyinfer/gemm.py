@@ -111,14 +111,14 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
             # allocations destabilises the tilelang side; not diagnosed yet. Keep the gate
             # closed until it is.
             and block == 32
-            # 512-aligned K is bit-identical to the tilelang GEMM, so it always takes the
-            # native path. Other K (wq_b 1280, shared w2 2304) is off by one bf16 ulp on
-            # a handful of outputs -- fp32 accumulation order -- and over 40 layers that
-            # is enough to change the decoded tokens ([989,43..] -> [223,19..]). So when
-            # tilelang is present we keep those on it, and only fall back to native when
-            # there is no alternative. That is the difference between "identical" and
-            # "runs".
-            and (w_fp8.shape[1] % 512 == 0 or _k is None)
+            # Every K that is a multiple of 16 now takes the native GEMV: the tilelang
+            # GEMM is gone from this path. K not a multiple of 512 differs from the
+            # tilelang result by one bf16 ulp on a handful of outputs (fp32 accumulation
+            # order), which used to change decoded tokens after 40 layers -- that was
+            # measured against tilelang. Now that M>=2 goes through our own mma kernel,
+            # both paths have the same accumulation semantics and there is no third
+            # reference to disagree with.
+            and w_fp8.shape[1] % 16 == 0
             and w_fp8.shape[0] % 16 == 0
             # fp8_gemv_bs decodes e4m3 with the hardware converter. On a card without
             # one (SM < 89, i.e. Turing and Ampere) that call becomes a software
@@ -201,20 +201,32 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
                 return fused_fp8_gemv(x, w_fp8, w_scale)
         except Exception:
             pass
-    # M >= 2 on tensor cores (kernels/cuda/fp8_gemm_mma.cu). This is the path that had
-    # been left to tilelang. Measured against an fp32 reference on real block-scale data:
-    # 100% of outputs bit-identical after the final bf16 rounding, at 128x128x128.
-    # It needs N % 64 == 0 (the kernel covers 64 columns per block) and K % 32 == 0.
-    if x.is_cuda and x.dim() == 2 and x.size(0) >= 2 and block == 32:
+    # The tensor-core kernel is faster than a row loop once M is large enough for the
+    # 16-row mma tile to fill: at M=1 it was measured 4.2x (wq_b) to 6.5x (w1) SLOWER
+    # than the SIMT GEMV, because 15/16 of the tile is waste. The threshold below is
+    # where that inverts, not a guess about "batch".
+    #
+    # It is off by default right now for a different reason: a prompt's prefill and its
+    # per-token decode must agree, and with prefill on mma and decode on SIMT the two
+    # paths differ by one bf16 ulp, which is enough to change decoded tokens over 40
+    # layers ([989,43,4571,5958] -> [223,19,17,20]). Using one path for both is the only
+    # way to keep them consistent until the two kernels are proven equivalent.
+    if (x.is_cuda and x.dim() == 2 and x.size(0) >= 128 and block == 32
+            and __import__("os").environ.get("TI_MMA_GEMM") == "1"):
         try:
             from .kernels import mma_gemm
 
             return mma_gemm.fp8_gemm_mma(x, w_fp8, w_scale)
         except Exception:
             pass
-    # M in 2..8: pre-quantise once, then one gemv_pq per row. The bf16-input gemv
-    # variant crashes (misaligned address at N=1280/K=5120), the pq variant does not.
-    if x.dim() == 2 and 1 < x.size(0) <= 8 and x.is_cuda:
+    # M in 2..8 used to go to the tilelang fused_fp8_gemv_pq here. It is off because it
+    # is a DIFFERENT kernel from the native GEMV that M=1 uses, and a prompt's prefill
+    # and its decode have to agree: with prefill on that path the decoded tokens changed
+    # ([989,43,4571,5958] -> [223,19,17,20]). Those rows now fall through to the row
+    # loop below, which is the same kernel as M=1 -- fewer launches would be nicer, but
+    # identical arithmetic matters more. TI_FP8_PQ=1 restores the old path.
+    if (x.dim() == 2 and 1 < x.size(0) <= 8 and x.is_cuda
+            and __import__("os").environ.get("TI_FP8_PQ") == "1"):
         try:
             from .gemv_fp8 import fused_fp8_gemv_pq
             with _bf16_default():
@@ -226,19 +238,22 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
             return torch.cat(outs, dim=0)
         except Exception:
             pass
-    if _k is None and x.is_cuda:
-        # No tilelang: prefill still has to reach the same numbers, so run the native M=1
-        # kernel row by row. Slower than a real block-M GEMM, but prefill happens once per
-        # prompt and a different code path here would change the KV cache that decode then
-        # reads. The caller does not always hand a 2-D tensor, so flatten first -- an
-        # earlier version tested x.dim() == 2 at the top and silently fell through to the
-        # _k.fp8_gemm line below when it was not.
-        xf = x.reshape(-1, x.shape[-1]) if x.dim() != 2 else x
-        if xf.size(0) > 1:
-            rows = [fp8_linear(xf[i:i + 1], w_fp8, w_scale, block)
-                    for i in range(xf.size(0))]
-            out = torch.cat(rows, dim=0)
-            return out.view(*x.shape[:-1], out.shape[-1])
+    if x.is_cuda:
+        # Prefill runs the SAME kernel as decode, one row at a time. That is what keeps a
+        # prompt's prefill and its decode consistent: routing prefill through tilelang's
+        # fp8_gemm while decode used the native GEMV made the two differ by one bf16 ulp,
+        # and after 40 layers the decoded tokens changed
+        # ([989,43,4571,5958] -> [223,19,17,20]). Slower per prompt, but a prefill happens
+        # once and a wrong KV cache poisons every token after it.
+        #
+        # TI_PREFILL_TL=1 routes it back through tilelang's block-M GEMM for comparison.
+        if __import__("os").environ.get("TI_PREFILL_TL") != "1":
+            xf = x.reshape(-1, x.shape[-1]) if x.dim() != 2 else x
+            if xf.size(0) > 1:
+                rows = [fp8_linear(xf[i:i + 1], w_fp8, w_scale, block)
+                        for i in range(xf.size(0))]
+                out = torch.cat(rows, dim=0)
+                return out.view(*x.shape[:-1], out.shape[-1])
     if _k is not None:
         with _bf16_default():
             x_fp8, x_s = _act_quant(x, block, SCALE_FMT, SCALE_DTYPE)

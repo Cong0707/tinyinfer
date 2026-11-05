@@ -66,52 +66,10 @@ def quantize_act(x: torch.Tensor, k: int):
 _DIFF_SEEN = [0]
 
 
-def quantize_act_checked(x: torch.Tensor, k: int):
-    """quantize_act, plus a one-shot comparison against the reference on real data.
-
-    The native act_quant is bit-identical to the reference on every synthetic shape this
-    repo tests, but swapping it into moe.quantize_act changed the end-to-end decode
-    output. This wrapper is the instrument for finding where they part company: it runs
-    both once per process, reports the first mismatch it sees, and returns the reference's
-    answer so a run with it stays numerically correct.
-    """
-    from ..official_kernel_ref import act_quant as _ref
-
-    if _DIFF_SEEN[0] < 1:
-        print(f"[quant-enter] x={tuple(x.shape)} dtype={x.dtype} k={k}", flush=True)
-    ref_q, ref_s = _ref(x.reshape(-1, k), 32, "ue8m0", torch.float8_e8m0fnu)
-    if _DIFF_SEEN[0] < 1:
-        print(f"[quant-ref] q={None if ref_q is None else tuple(ref_q.shape)}"
-              f" s={None if ref_s is None else tuple(ref_s.shape)}", flush=True)
-    mine_q, mine_s = quantize_act(x, k)
-    if _DIFF_SEEN[0] < 1:
-        print(f"[quant-mine] q={tuple(mine_q.shape)} s={tuple(mine_s.shape)}"
-              f" s_dtype={mine_s.dtype}", flush=True)
-    if _DIFF_SEEN[0] < 3:
-        dq = (ref_q.view(torch.uint8) != mine_q.view(torch.uint8))
-        # Compare VALUES: the reference returns an e8m0 tensor (1 byte each) and the native
-        # wrapper returns the expanded fp32 scale, so view(uint8) would compare 160 bytes
-        # against 640 and raise. The dtype differs by design; the numbers must still match.
-        ds = (ref_s.float() != mine_s.float())
-        nq, ns = int(dq.sum()), int(ds.sum())
-        if nq or ns:
-            _DIFF_SEEN[0] += 1
-            i = int(dq.flatten().nonzero()[0]) if nq else -1
-            print(f"[quant-diff] shape={tuple(x.shape)} k={k} fp8 diff={nq}/{ref_q.numel()}"
-                  f" scale diff={ns}/{ref_s.numel()}", flush=True)
-            if i >= 0:
-                col = i % k
-                g = col // 32
-                row = i // k
-                print(f"  first: row={row} col={col} group={g}"
-                      f" ref_q={ref_q.flatten()[i].item()} mine_q={mine_q.flatten()[i].item()}"
-                      f" ref_s={ref_s[row, g].item()} mine_s={mine_s[row, g].item()}"
-                      f" x={x.reshape(-1, k)[row, col].item():.6f}", flush=True)
-                grp = x.reshape(-1, k)[row, g * 32:(g + 1) * 32]
-                print(f"  group absmax={grp.abs().max().item():.6e}"
-                      f" absmin={grp.abs().min().item():.6e}", flush=True)
-    q = ref_q.reshape(x.shape) if x.shape != ref_q.shape else ref_q
-    return q, ref_s
+# quantize_act_checked used to live here: it ran the native quantiser and the tilelang
+# reference side by side on real activations and reported the first mismatch. That
+# comparison is done: over a full decode they agree exactly, so the instrument is gone
+# along with the reference it was comparing against.
 
 
 def available() -> bool:

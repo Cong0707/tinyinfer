@@ -13,9 +13,10 @@ def fp4_act_quant(x, block_size: int = 32, inplace: bool = False,
     if (not x.is_cuda or x.dtype != torch.bfloat16 or block_size not in (16, 32)
             or k % block_size or scale_dtype not in
             (torch.float8_e8m0fnu, torch.float8_e4m3fn)):
-        from ..official_kernel_ref import fp4_act_quant as _ref
-
-        return _ref(x, block_size, inplace, scale_dtype)
+        raise NotImplementedError(
+            f"fp4_act_quant native kernel cannot serve this request "
+            f"(cuda={x.is_cuda} dtype={x.dtype} block={block_size} "
+            f"scale_dtype={scale_dtype}); the tilelang reference path has been removed")
 
     use_e8m0 = 1 if scale_dtype == torch.float8_e8m0fnu else 0
     z = x.contiguous()

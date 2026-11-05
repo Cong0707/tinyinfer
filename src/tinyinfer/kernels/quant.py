@@ -57,9 +57,16 @@ def act_quant(x: torch.Tensor, block_size: int = 128, scale_fmt=None,
         and _native_ok()
     )
     if not use_native:
-        from ..official_kernel_ref import act_quant as _ref
-
-        return _ref(x, block_size, scale_fmt, scale_dtype, inplace)
+        # No tilelang fallback: the reference implementation was a tilelang kernel, and
+        # the whole point of this module is to remove that dependency. If the native
+        # kernel cannot serve the request, say exactly which precondition failed -- a
+        # silent import of official_kernel_ref would reintroduce the dependency and also
+        # change the numbers, because that path is a different implementation.
+        raise NotImplementedError(
+            f"act_quant native kernel cannot serve this request "
+            f"(cuda={x.is_cuda} dtype={x.dtype} block={block_size} K={k} "
+            f"scale_dtype={scale_dtype} scale_fmt={scale_fmt} native_ok={_native_ok()}); "
+            f"the tilelang reference path has been removed")
 
     z = x.contiguous()
     n = z.numel() // k
