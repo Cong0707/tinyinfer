@@ -3737,7 +3737,18 @@ def selftest(tmpdir: str | Path | None = None) -> bool:
         if ctx is not None:
             import gc
             gc.collect()
-            ctx.cleanup()
+            # Windows will not unlink a file that still has an open handle, and a reader
+            # closed a moment ago can hold one until its worker threads unwind. A failure
+            # to remove the temp directory is not a failure of anything the selftest
+            # checks, so it must not shadow a passing result with PermissionError.
+            import shutil
+            try:
+                ctx.cleanup()
+            except Exception:
+                try:
+                    shutil.rmtree(ctx.name, ignore_errors=True)
+                except Exception:
+                    pass
 
 
 def _selftest_body(root: Path, opened: list[Any]) -> None:
@@ -3835,17 +3846,28 @@ def _selftest_body(root: Path, opened: list[Any]) -> None:
                                     cache_bytes=2 * blob.total_bytes, policy="arc",
                                     vram_slots=4, device="cpu")
     opened.append(store3)
-    staged = store3.prefetch_to_vram(0, [0, 1])
-    assert staged == 2, staged
-    assert store3.slots.staged_count == 2
+    # prefetch_to_vram SUBMITS work and returns 0 -- it is deliberately asynchronous so
+    # the RAM fetch and the DMA proceed while the caller computes. The count it used to
+    # return (and this assert used to check) is only known once the futures settle, so
+    # wait for them here via the same path fetch() uses.
+    store3.prefetch_to_vram(0, [0, 1])
+    still = store3._settle_pending([(0, 0), (0, 1)])
+    assert not still, still
+    assert store3.slots.staged_count == 2, store3.slots.staged_count
     entries_before = len(store3.ram)
     recs = store3.fetch(0, [2], cache=False)
     assert len(recs) == 1 and store3.stats()["stream_reads"] == 1
     assert len(store3.ram) == entries_before, "cache=False must not admit"
     store3.release(recs)
+    # Inside the context the slot is IN_USE (not merely staged); releasing it drops the
+    # reference but KEEPS the bytes, because keeping them is the entire point of the slot
+    # pool -- the next token's identical expert should hit. The old assert here expected
+    # the slot to be gone after the context, which is the opposite of the design.
     with store3.experts(0, [0]) as recs:
         assert store3.slots.is_staged(0, 0) is False
-    assert not store3.slots.has(0, 0) or store3.slots.staged_count == 1
+        assert store3.slots.has(0, 0) is True
+    assert store3.slots.has(0, 0) is True
+    assert store3.slots.staged_count >= 1
 
     budget = TierBudget.plan()
     assert budget.ram_expert_entries > 0

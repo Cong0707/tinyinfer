@@ -24,6 +24,8 @@ jobs:
           pip install -e '.[dev]'
       - name: pytest (no GPU: anything that needs CUDA skips itself)
         run: python -m pytest tests -x -q --ignore=tests/test_server.py
+      - name: loading selftest (expert store, cache, VRAM slots, planner)",
+        run: python -c "import sys; sys.path.insert(0,'src'); from tinyinfer.loading import selftest; assert selftest()"
       - name: planner and EP arithmetic
         run: |
           python - <<'PY'
