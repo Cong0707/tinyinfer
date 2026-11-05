@@ -56,7 +56,11 @@ def quantize_act(x: torch.Tensor, k: int):
 
     flat = x.reshape(-1, k) if x.dim() != 2 else x
     q, s = act_quant(flat, 32, "ue8m0", torch.float8_e8m0fnu)
-    return q, _scale(s)
+    # Return the scale as e8m0, exactly like gemv_fp4.quantize_act does. Expanding it to
+    # fp32 here looked harmless (the values are identical), but the downstream kernels
+    # take different code paths for the two dtypes and the end-to-end decode diverged
+    # ([989,43,...] -> [95991,...]). Keep the contract identical instead.
+    return q, s
 
 
 _DIFF_SEEN = [0]
@@ -73,11 +77,22 @@ def quantize_act_checked(x: torch.Tensor, k: int):
     """
     from ..official_kernel_ref import act_quant as _ref
 
+    if _DIFF_SEEN[0] < 1:
+        print(f"[quant-enter] x={tuple(x.shape)} dtype={x.dtype} k={k}", flush=True)
     ref_q, ref_s = _ref(x.reshape(-1, k), 32, "ue8m0", torch.float8_e8m0fnu)
+    if _DIFF_SEEN[0] < 1:
+        print(f"[quant-ref] q={None if ref_q is None else tuple(ref_q.shape)}"
+              f" s={None if ref_s is None else tuple(ref_s.shape)}", flush=True)
     mine_q, mine_s = quantize_act(x, k)
+    if _DIFF_SEEN[0] < 1:
+        print(f"[quant-mine] q={tuple(mine_q.shape)} s={tuple(mine_s.shape)}"
+              f" s_dtype={mine_s.dtype}", flush=True)
     if _DIFF_SEEN[0] < 3:
         dq = (ref_q.view(torch.uint8) != mine_q.view(torch.uint8))
-        ds = (ref_s.view(torch.uint8) != mine_s.view(torch.uint8))
+        # Compare VALUES: the reference returns an e8m0 tensor (1 byte each) and the native
+        # wrapper returns the expanded fp32 scale, so view(uint8) would compare 160 bytes
+        # against 640 and raise. The dtype differs by design; the numbers must still match.
+        ds = (ref_s.float() != mine_s.float())
         nq, ns = int(dq.sum()), int(ds.sum())
         if nq or ns:
             _DIFF_SEEN[0] += 1

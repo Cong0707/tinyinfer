@@ -295,7 +295,7 @@ class MLACompressedAttention:
             # of the stored value, not an optimisation
             if getattr(self, "quant", False) and latent.is_cuda:
                 from ..nn import apply_rope as _apply_rope
-                from ..official_kernel_ref import fp4_act_quant
+                from ..kernels.fp4q import fp4_act_quant
                 # One RoPE row per latent group; group j rotates at its window's first
                 # token position. With per-row positions the rows differ, so this becomes
                 # a gather instead of an arange (a batched call can hold one sequence at

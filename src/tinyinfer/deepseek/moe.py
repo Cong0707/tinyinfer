@@ -458,11 +458,17 @@ class MoE:
             # the native quantiser against the reference on REAL activations and reports
             # the first mismatch. It returns the reference's answer, so a checked run stays
             # numerically correct; it is not on by default and not the fast path.
+            # Native quantiser. gemv_fp4.quantize_act imports tilelang at module scope, so
+            # on a deployment without it this whole branch silently produced _aq = None
+            # (the except below) and surfaced later as "NoneType has no attribute dim".
+            # The native path was verified against the reference on REAL activations
+            # (TI_QUANT_CHECK=1, zero fp8 or scale differences over a full decode), not
+            # just synthetic shapes.
             try:
                 if __import__("os").environ.get("TI_QUANT_CHECK") == "1":
                     from .fp4_native import quantize_act_checked as quantize_act
                 else:
-                    from .gemv_fp4 import quantize_act
+                    from .fp4_native import quantize_act
 
                 _aq, _asc = quantize_act(xf, xf.size(-1))
             except Exception as _exc:
