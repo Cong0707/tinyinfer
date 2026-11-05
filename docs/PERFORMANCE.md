@@ -1,66 +1,118 @@
 # Performance in one page
 
-## What a token costs (measured, 4.5GB/s disk)
+Every number here was measured on the development box (RTX 5060 Laptop, 8GB VRAM,
+47GB RAM, PCIe 4.0 x8) with `scripts/bench.py` and the profiles noted inline. Numbers
+that were NOT measured say so.
 
-| term | bytes | time |
+## Current state
+
+    decode    807 ms/token = 1.24 tok/s   (782-878 across runs)
+    output    [223, 19, 17, 20] for the reference prompt, stable across runs
+
+## Where a decode token goes
+
+    component              ms     note
+    H2D (Memcpy HtoD)     808     19.2 GB at 23.8 GB/s = 93% of the link
+    compute                62     all kernels together
+    host sync               8     CPU waits; the rest of the step is GPU-bound
+
+The step is GPU-bound and the GPU is waiting on DMA. Total bytes moved per token:
+
+    streamed layers   30 x 204MB  =  6.3 GB
+    routed experts   240 x 18.8MB =  4.5 GB
+    measured total               = 19.2 GB   (1.85x the sum above)
+
+The 1.85x is understood but not fixed -- see "Known waste" below.
+
+## What the link can actually do
+
+    pinned -> device     28.5 GB/s   (hardware ceiling on this box)
+    pageable -> device   12.4 GB/s
+    copy_ dispatch       40-56 us per call, at any size
+    _async_h2d           56 us for 1MB, then bandwidth-bound
+
+Small transfers are NOT slower per byte: 240 separate 18.8MB copies run at 28.5 GB/s,
+the same as one 4.5GB copy. Fragmentation costs launch overhead, not bandwidth. A
+measured consequence: coalescing each layer's 28 tensors into 3 runs would cut DMA
+count 9x, but it needs the host addresses to be contiguous, and on Windows they are not
+(see below).
+
+## Known waste: 240 expert visits become 480 DMAs
+
+`TI_SERVE_BATCH=3` serves the 6 routed experts of a layer in two batches of three. The
+fused branch checks `_expert_cache` before materialising an expert; the per-expert
+branch does not, so each batch re-runs the DMA. Measured: 12 `_expert_from_rec` calls
+per layer against 6 experts.
+
+Adding the lookup measured 819ms -> 793ms, which is inside run-to-run noise. It was
+NOT kept: an Expert's fp4 tuple holds views into the 4-deep `_blob_stage` ring, so a
+cached entry can outlive its bytes. That is the same hazard the planner cites when it
+refuses a small VRAM slot pool (12 slots made two identical greedy runs disagree).
+
+## Platform limits found (Windows, not design flaws)
+
+**Host addresses are scattered.** A layer's 28 tensors span 2.4 TB of virtual address
+space after `cudaHostAlloc`, so `pool_base + offset == data_ptr` is false and the
+zero-copy path never engages. On Linux the mapping is contiguous and the path works.
+
+**`__constant__` arrays do not survive `cuModuleLoadData`.** The initialiser lives in a
+host ELF section the cubin does not carry, so the kernel reads garbage. Measured once as
+every output being ~1e36. Plain `__device__` file-scope arrays work.
+
+**`cudaHostAlloc` above ~24GB fails.** The pinned pool caps there regardless of RAM.
+
+## Hardware the planner targets
+
+`python scripts/predict.py --model <dir>` prints this table from the checkpoint's real
+sizes and the planner's own solver:
+
+    card   layers  stream  slots  mtp  expertGB/tok  H2D ms   bound
+       8    11/40    29       0   off          4.20     340      IO
+      24    40/40     0     241   on           0.00       0  compute
+      32    40/40     0     561   on           0.00       0  compute
+      80    40/40     0    2480   on           0.00       0  compute
+     141    40/40     0    4919   on           0.00       0  compute
+
+A decode token touches at most topk(6) x 40 layers = 240 distinct experts. At 24GB the
+slot pool covers 241, so the 296GB expert table is served without crossing PCIe at all.
+vLLM needs the whole 303GB resident for the same model, i.e. eight H200s.
+
+## Measured trade-offs, with the losing side kept
+
+| change | result | kept? |
 | --- | --- | --- |
-| routed experts (6 x 40 x 18.8MB) | 4.5GB | 1.00s at 4.5GB/s |
-| streamed layers (36 x 166MB H2D) | 6.0GB | 0.23s at 26.5GB/s |
-| attention + MoE + head | - | ~0.4s at this size |
-| **total** | | **1.66s = 0.60 tok/s** |
+| host cache 16GB -> 8GB (slab 0/30 -> 30/30) | 787 -> 857 ms | no, cache wins |
+| tensor-core GEMM at M=1 | 4.2-6.5x slower than SIMT | no, gated at M>=128 |
+| CPU-side MoE routing | 788 -> 879 ms | no, the D2H sync costs more than the matmul |
+| fused gate/up GEMV, M=1 | 374 -> 249 us per expert | **yes** |
+| coalesced layer transfer (Windows) | cannot engage | no, needs Linux |
 
-The floor is 1.23s (0.81 tok/s) before compute. Nothing in software goes below it without
-fewer routed experts or more VRAM; docs/lower_bounds.md has the arithmetic.
+## Expert routing has no strong hot spot
 
-## What changes it
+6000 expert visits over 20 tokens, 383 distinct experts:
 
-| lever | effect |
-| --- | --- |
-| disk speed | linear on the 1.0s expert term; a 1.4GB/s volume gives 2.5-3s steps |
-| resident layers (+1) | -6ms/token (one fewer 166MB H2D) |
-| expert cache hit rate | each hit removes 18.8MB of disk read |
-| top-k 6 -> 4 | ~-0.3s/token, visibly degraded output (not usable) |
-| prefill chunk | long prompts use chunk=1 (exact) until the batch path is fixed |
+    top 10% of experts   22.3% of visits
+    top 20%               38.4%
+    top 30%               51.6%
+    top 50%               72.7%
 
-## Where time is not spent any more
+A typical MoE puts 60-80% of visits in its top 20%; this model is unusually flat, which
+is why the host cache saturates at an 87% hit rate and why prefetching buys little.
+Adjacent-token route overlap (Jaccard) is 0.068 against a 0.0068 random baseline --
+real but far too small to predict the next token's experts from.
 
-- RoPE table: was 256MB/layer streamed (9.2GB/token), now a shared constant.
-- Small-M GEMV: one launch per row -> one launch per batch (1.6x, exact).
-- Expert activation quantisation: once per layer instead of once per expert per row.
-- Indexer mask: cached per (start_pos, s, t, ratio) instead of rebuilt per layer.
-- Session reset: no longer rebuilds the pinned slab (it leaked/freed the host grant).
-- fp4 GEMV: software-pipelined over the k blocks, 1.11x and bit-identical (rel 0).
+## MTP (speculative decode)
 
-## Where an 8GB decode step goes (measured with TI_MOE_PROF=1, disk 1.5GB/s)
+Drafting `1 + 5a` tokens per main forward, at acceptance `a`, divides the expert traffic
+by that factor:
 
-| phase | ms/token | what it is |
-| --- | --- | --- |
-| expert fetch | ~1400 | 6 experts x 40 layers from disk, ~32% cache hit |
-| expert serve | ~180 | 18 GEMVs per layer plus the RAM->VRAM copy of the blobs |
-| streamed layers | ~240 | 36 x 166MB H2D |
-| gate + bincount + shared | ~120 | routing and its host sync |
-| attention + head + hc | ~60 | compute |
+    a=0.3  -45%    a=0.5  -61%    a=0.7  -69%    a=0.9  -75%
 
-The serve term is mostly **the host-to-device copy of the expert weights** (113MB per
-layer at 26.5GB/s is 4.3ms of the 4.6ms), which is why more VRAM slots help: a slot hit
-removes that copy. On a card where the experts are resident the term disappears, which is
-what the 24GB plan buys (docs/HARDWARE.md).
+On an 8GB card the three draft stages do not fit (measured: CUDA allocator assert), and
+the planner turns speculation off below 16GB. It is on by default at 24GB and above.
 
-## How to measure it yourself
+## Kernel conformance
 
-    PYTHONPATH=src python -m tinyinfer.bench --model <dir>
-
-The output includes the disk rate measured in the same run; compare tok/s only against
-runs with a similar disk rate, otherwise compare the ratio to the 1.23s floor.
-## Prefill (measured)
-
-| prompt | path | time | per token |
-| --- | --- | --- | --- |
-| 12 tokens | chunk=1 (exact path) | 18.3s | 1.52s |
-| 12 tokens | chunk=4 | 11.6s | 0.97s |
-| 63 tokens | default chunk (8) | 79.7s | 1.27s |
-
-The gain is smaller than the chunk factor because prefill is also expert-IO bound; the
-chunk only dedups routing and amortises the per-block layer streaming. The chunked path
-is what `generate()` uses by default and it answers correctly; `TI_PREFILL_CHUNK=1`
-forces the exactly reference-matching path when a caller needs it (docs/analysis.md §13).
+`python scripts/check_kernels.py` runs 29 cases covering the quantisers, the three GEMV
+kernels, the tensor-core GEMM, sparse attention and the VRAM slot state machine. Every
+native kernel that runs on the decode path has a reference comparison there.
