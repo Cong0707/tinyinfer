@@ -90,19 +90,36 @@ _FP8_NATIVE = None
 
 
 def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, block: int = 32) -> torch.Tensor:
+    # Cast BEFORE the fast path decides anything. act_quant only has a native
+    # kernel for bf16 input; handing it fp32 falls back to the tilelang one, which
+    # raises ImportError on a deployment without tilelang and looks exactly like
+    # "the fast path is broken". The cast used to sit below the branch.
+    if x.dtype != torch.bfloat16:
+        x = x.to(torch.bfloat16)
     if (x.is_cuda and x.dim() == 2 and x.size(0) == 1
             # K need not be a multiple of 512: the kernel rounds its warp iterations up
             # and handles a short tail. That matters because two of the largest
             # projections are NOT 512-aligned -- wq_b is K=1280 (42 MB) and the shared
             # expert's w2 is K=2304 -- and they used to fall through to the block_M=32
             # GEMM, which is the slowest thing left in the decode step.
-            # NOTE: keep 512. Relaxing to %16 for wq_b (K=1280) was tried and REVERTED:
-            # the kernel's tail path produced [989, 43, 1970, 304] and a 10.8s step. The
-            # tail branch is never even entered at K=1280 (the first 16 lanes are all
-            # full), so whatever is wrong is elsewhere -- wq_b's scale layout or the
-            # fp8_gemm it was compared against, not the short-tail arithmetic.
-            and block == 32 and w_fp8.shape[1] % 512 == 0
-            and w_fp8.shape[0] % 32 == 0
+            # K must be a multiple of 512. The kernel itself handles other K correctly
+            # (wq_b at K=1280: 124us vs 253us, 1 element out of 32768 off by one bf16
+            # ulp; w2 at K=2304: bit-identical), but enabling it here makes the TILELANG
+            # kernels that still run start throwing: profile shows 90 calls into
+            # tvm_ffi/error.py:_parse_backtrace and 303 re-resolutions of the executable,
+            # 79ms each, turning a 0.8s step into 10.7s. Something about the fast path's
+            # allocations destabilises the tilelang side; not diagnosed yet. Keep the gate
+            # closed until it is.
+            and block == 32
+            # 512-aligned K is bit-identical to the tilelang GEMM, so it always takes the
+            # native path. Other K (wq_b 1280, shared w2 2304) is off by one bf16 ulp on
+            # a handful of outputs -- fp32 accumulation order -- and over 40 layers that
+            # is enough to change the decoded tokens ([989,43..] -> [223,19..]). So when
+            # tilelang is present we keep those on it, and only fall back to native when
+            # there is no alternative. That is the difference between "identical" and
+            # "runs".
+            and (w_fp8.shape[1] % 512 == 0 or _k is None)
+            and w_fp8.shape[0] % 16 == 0
             # fp8_gemv_bs decodes e4m3 with the hardware converter. On a card without
             # one (SM < 89, i.e. Turing and Ampere) that call becomes a software
             # sequence per element and this kernel loses to the plain GEMM it replaces,
@@ -126,7 +143,12 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
                            w_scale.view(torch.uint8).reshape(-1),
                            y, int(n), int(k)])
             return y.view(1, n)
-        except Exception:
+        except Exception as _exc:
+            if __import__("os").environ.get("TI_FP8_DEBUG") == "1":
+                import traceback as _tb
+
+                print(f"[fp8-fast-fail] {_exc!r}", flush=True)
+                _tb.print_exc()
             pass
 
     """C = x @ w_fp8.T with blockwise fp8 activation quant (official kernel path).
@@ -134,8 +156,6 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
     decode (M==1) dispatches to the fused GEMV kernel (~1.8x faster than the
     block_M=32 GEMM, which wastes 31/32 of the tile); prefill keeps the GEMM.
     """
-    if x.dtype != torch.bfloat16:
-        x = x.to(torch.bfloat16)
     # decode (M==1): the fused GEMV kernel when it is available. NOTE: looping
     # fused_fp8_gemv for M in 2..8 crashes (misaligned address inside
     # gemv_bf16_kernel at N=1280/K=5120), so small-M fp8 stays on the GEMM for now.
@@ -223,7 +243,10 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
         # fp8 path, so say which it is instead of recursing forever.
         raise RuntimeError(
             f"fp8_linear: no path for M=1 (is_cuda={x.is_cuda} dim={x.dim()} "
-            f"block={block} w={tuple(w_fp8.shape)} native={_fp8_native()} k={_k is not None})")
+            f"M={x.size(0)} block={block} w={tuple(w_fp8.shape)} "
+            f"K%16={(w_fp8.shape[1] % 16)} N%16={(w_fp8.shape[0] % 16)} "
+            f"native={_fp8_native()} k={_k is not None} "
+            f"xdt={x.dtype} wdt={w_fp8.dtype})")
     rows = [fp8_linear(xf[i:i + 1], w_fp8, w_scale, block) for i in range(xf.size(0))]
     out = torch.cat(rows, dim=0)
     return out.view(*x.shape[:-1], out.shape[-1])
