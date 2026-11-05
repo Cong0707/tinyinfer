@@ -33,8 +33,15 @@ _*.json
 serve.log
 serve.err.log
 
-# 厂商参考实现（DeepSeek 官方 minimal inference），仅本地比对用，不随本仓库分发
-reference/
+# 厂商参考实现（DeepSeek 官方 minimal inference）。整目录是本地比对用的，但
+# kernels/sparse_attn.py 和好几处 attention 直接 import 它的 act_quant /
+# fp4_act_quant，所以 kernel.py 是硬依赖——排除它会让 clone 下来的仓库在 prefill
+# 阶段 ImportError。只把这一个文件纳入版本控制。
+reference/*
+!reference/official/
+reference/official/*
+!reference/official/kernel.py
+reference/official/__pycache__/
 
 # 早期 kernel 实验（import 会失败，不是引擎的一部分）
 prototypes/

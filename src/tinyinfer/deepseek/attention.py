@@ -323,7 +323,7 @@ class MLAWindowAttention:
             # the reference ALWAYS round-trips the window KV through fp8 (post-RoPE):
             # that is the form the cache holds. The old "kv.dtype != bfloat16" guard
             # silently skipped it for bf16 inputs, which is where layer 0 diverged.
-            from ..official_kernel_ref import act_quant
+            from ..kernels.quant import act_quant
             kv = act_quant(kv, 32, "ue8m0", torch.float8_e8m0fnu, True)
 
         old = self._kv_window
@@ -381,7 +381,7 @@ class MLAWindowAttention:
         # grouped einsum; skipping the round trip is a ~4.8% output difference, so it is
         # part of the reference semantics rather than an optimisation
         if getattr(self, "quant", False) and o.is_cuda:
-            from ..official_kernel_ref import act_quant
+            from ..kernels.quant import act_quant
             o = act_quant(o, 32, "ue8m0", torch.float8_e8m0fnu, True)
         if getattr(self, "_wo_parallel", False) and getattr(self.wo_a, "is_sharded", False):
             # wo_a's contracted dimension (o_lora_rank) is what gets split, so each card

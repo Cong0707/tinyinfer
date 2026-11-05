@@ -29,6 +29,12 @@ dependencies = [
     "huggingface-hub>=0.24",
     "numpy>=1.26",
     "psutil>=5.9",
+    # Hard dependency, not optional: kernels/sparse_attn.py and the fp8/fp4 quant entry
+    # points in deepseek/attention.py + compressed_attention.py call into the vendored
+    # official kernel.py, which is written in tilelang. Measured by blocking the import:
+    # the engine raises ImportError during prefill, it does not fall back to torch.
+    # It JIT-compiles on first use, so a CUDA toolkit must be present at runtime too.
+    "tilelang>=0.1.15",
 ]
 
 [project.optional-dependencies]

@@ -23,6 +23,12 @@ try:
 except Exception:  # pragma: no cover
     _k = None
 
+# Block quantisation has a native implementation (kernels/cuda/act_quant.cu) that is
+# bit-identical to the reference's; it is used for every act_quant call below so the
+# decode path does not need tilelang's JIT. _k is still what provides fp8_gemm/fp4_gemm
+# for the M>1 fallback (prefill), so tilelang remains required for prefill only.
+from .kernels.quant import act_quant as _act_quant  # noqa: E402
+
 # HF's V4.1 fp8 blocks use ue8m0 scales (see official model.py globals)
 SCALE_FMT = "ue8m0"
 SCALE_DTYPE = torch.float8_e8m0fnu
@@ -83,7 +89,7 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
         try:
             from .kernels import native
 
-            aq, asc = _k.act_quant(x, block, SCALE_FMT, SCALE_DTYPE)
+            aq, asc = _act_quant(x, block, SCALE_FMT, SCALE_DTYPE)
             n, k = w_fp8.shape
             y = torch.empty(n, device=x.device, dtype=torch.bfloat16)
             native.launch(native.kernel("fp8_gemv_bs", "fp8_gemv_bs"),
@@ -121,7 +127,7 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
                 from .official_kernels import gemv_fp8_block
 
                 with _bf16_default():
-                    x_fp8, x_s = _k.act_quant(x, block, SCALE_FMT, SCALE_DTYPE)
+                    x_fp8, x_s = _act_quant(x, block, SCALE_FMT, SCALE_DTYPE)
                 out = gemv_fp8_block(x_fp8, w_fp8, x_s.float().reshape(1, -1),
                                      w_scale.float(), block)
                 if out is not None:
@@ -155,7 +161,7 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
         try:
             from .gemv_fp8 import fused_fp8_gemv_pq
             with _bf16_default():
-                x_fp8, x_s = _k.act_quant(x, block, SCALE_FMT, SCALE_DTYPE)
+                x_fp8, x_s = _act_quant(x, block, SCALE_FMT, SCALE_DTYPE)
             outs = []
             for i in range(x.size(0)):
                 outs.append(fused_fp8_gemv_pq(
@@ -164,7 +170,7 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
         except Exception:
             pass
     with _bf16_default():
-        x_fp8, x_s = _k.act_quant(x, block, SCALE_FMT, SCALE_DTYPE)
+        x_fp8, x_s = _act_quant(x, block, SCALE_FMT, SCALE_DTYPE)
         return _k.fp8_gemm(x_fp8, x_s, w_fp8, w_scale, SCALE_DTYPE, block_size=block)
 
 
@@ -203,7 +209,7 @@ def fp4_linear(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor, act_
             except Exception:
                 pass
     with _bf16_default():
-        x_fp8, x_s = _k.act_quant(x, act_block, SCALE_FMT, SCALE_DTYPE)
+        x_fp8, x_s = _act_quant(x, act_block, SCALE_FMT, SCALE_DTYPE)
         out = _k.fp4_gemm(x_fp8, x_s, w_fp4, w_scale, SCALE_DTYPE, act_block_size=act_block)
     # same story as gemv_fp4._keep: the tilelang GEMM launches itself, so the allocator
     # has no record of the expert weights it is still reading

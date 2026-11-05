@@ -242,7 +242,7 @@ class MLACompressedAttention:
         # the form the cache holds. Order matters: skipping the round trip is a ~4.7%
         # output difference, and doing it before the rotation is a different value again.
         if getattr(self, "quant", False) and kv.is_cuda:
-            from ..official_kernel_ref import act_quant
+            from ..kernels.quant import act_quant
             kv = act_quant(kv, 32, "ue8m0", torch.float8_e8m0fnu, True)
 
         old = self._kv_window if self._kv_window is not None else kv.new_empty(b, 0, self.head_dim)
@@ -414,7 +414,7 @@ class MLACompressedAttention:
         # grouped einsum; skipping the round trip is a ~4.8% output difference, so it is
         # part of the reference semantics rather than an optimisation
         if getattr(self, "quant", False) and o.is_cuda:
-            from ..official_kernel_ref import act_quant
+            from ..kernels.quant import act_quant
             o = act_quant(o, 32, "ue8m0", torch.float8_e8m0fnu, True)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
         out = _lin(self.wo_b, o.flatten(2))
