@@ -65,13 +65,13 @@ extern "C" __global__ void fp8_gemv_bs(
     const int niter = (k_dim + 511) >> 9;   // 512 k per warp-iteration, rounded up
     for (int it = 0; it < niter; ++it) {
         const int kbase = (it << 9) + (lane << 4);
-        // continue, NOT break: the tail iteration is short for the high lanes only, and a
-        // divergent break leaves those lanes out of the __shfl_down_sync at the end of the
-        // kernel (all 32 must participate). Measured with break: wrong tokens and a
-        // 10.8s step, because the shuffle then reads undefined lanes.
-        if (kbase >= k_dim) continue;
-        const int grp = (it << 4) + (lane >> 1);   // 32-k group of kbase
-        const bool full = (kbase + 16) <= k_dim;
+        // No continue: this loop now contains a __shfl_xor_sync, and every __shfl*_sync
+        // in the warp requires ALL 32 lanes to reach it. Skipping ahead on the tail lanes
+        // hung the kernel outright (the test never returned). The guard is a bool instead,
+        // and the tail lanes simply contribute zero.
+        const bool valid = (kbase < k_dim);
+        const int grp = valid ? ((it << 4) + (lane >> 1)) : 0;
+        const bool full = valid && (kbase + 16) <= k_dim;
 
         float av[16];
         if (full) {
@@ -99,15 +99,23 @@ extern "C" __global__ void fp8_gemv_bs(
                 part += av[4 * i] * wv[0] + av[4 * i + 1] * wv[1]
                       + av[4 * i + 2] * wv[2] + av[4 * i + 3] * wv[3];
             }
-        } else {
+        } else if (valid) {
             for (int j = 0; j < 16; ++j) {
                 const int kk = kbase + j;
                 if (kk >= k_dim) break;
                 part += av[j] * e4m3_one(wr[kk]);
             }
         }
-        acc += part * asc * wsc;
+        // Each lane applies its own group's scale, then the warp reduces. Pairing the two
+        // lanes into (x1+x2)*s was tried to match tilelang's (sum of 32 k) * scale, and it
+        // BROKE the shapes that used to be bit-identical: end to end went from
+        // [989,43,4571,5958] to [989,19923,201,19923]. Whatever tilelang's gemm does
+        // internally, it is not that, so this stays as the verified form.
+        if (valid) acc += part * asc * wsc;
     }
+    // Warp reduce. The groups are already summed in the same order as tilelang's
+    // k loop within each lane; a fully serial k-order reduce was tried and is far
+    // too slow (one shuffle per 32-k group, ~160 per call).
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
     if (lane == 0) y[n] = __float2bfloat16(acc);
 }
