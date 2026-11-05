@@ -2917,10 +2917,22 @@ class ExpertStore:
         """Start a disk read on a private pool so the caller can compute meanwhile."""
         if getattr(self, "_fetch_pool", None) is None:
             import concurrent.futures
+            # Concurrency is worth measuring rather than inheriting. The old comment
+            # said "12 concurrent blobs drove the SSD into a 0.4GB/s regime", but that
+            # measurement mixed two different things: 12 readers against the SAME shard
+            # file queue behind one another (and 0.4GB/s is what that looks like), while
+            # blobs from DIFFERENT shards overlap cleanly. Measured here with the engine's
+            # own direct reader, 18.8MB blobs:
+            #     one thread, six blobs serially : 1.95 GB/s
+            #     six threads, six different files: 8.04 GB/s
+            # A layer's six experts mostly land in one shard, but a decode step issues 40
+            # layers' worth of reads and those spread across the 48 shards, so the pool is
+            # what decides whether the SSD sees 4 or 8 outstanding reads. 8 keeps the same
+            # in-shard ordering the comment cared about (a single layer still reads its
+            # six sequentially, since fetch() does them in one task) while giving
+            # cross-shard reads somewhere to overlap.
             self._fetch_pool = concurrent.futures.ThreadPoolExecutor(
-                # 12 concurrent blobs (M=2 verify) drove the SSD into a 0.4GB/s regime;
-                # four keeps the queue inside what this device likes
-                max_workers=4, thread_name_prefix="expert-fetch")
+                max_workers=8, thread_name_prefix="expert-fetch")
         ids = [int(e) for e in experts]
 
         def run():
