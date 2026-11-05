@@ -111,6 +111,15 @@ by that factor:
 On an 8GB card the three draft stages do not fit (measured: CUDA allocator assert), and
 the planner turns speculation off below 16GB. It is on by default at 24GB and above.
 
+**The acceptance rate has not been measured here, and cannot be on this box.** A draft
+takes its input from the hidden states of the last layers (see
+`dspark_target_layer_ids`), so `_draft` returns an empty list unless all 40 layers ran --
+running the engine with 2 or 10 layers therefore exercises the fallback, not the
+speculation. Verified with 2 layers: `speculative_generate` returns the same 6/6 tokens
+as plain decoding, which pins the draft/verify/truncate logic but says nothing about `a`.
+The percentages above are therefore arithmetic from the `1 + 5a` structure, not a
+measurement. Measuring `a` needs a card that holds the full model plus the draft stages.
+
 ## Kernel conformance
 
 `python scripts/check_kernels.py` runs 29 cases covering the quantisers, the three GEMV
