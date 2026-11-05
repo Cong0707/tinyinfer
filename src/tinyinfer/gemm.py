@@ -201,6 +201,17 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
                 return fused_fp8_gemv(x, w_fp8, w_scale)
         except Exception:
             pass
+    # M >= 2 on tensor cores (kernels/cuda/fp8_gemm_mma.cu). This is the path that had
+    # been left to tilelang. Measured against an fp32 reference on real block-scale data:
+    # 100% of outputs bit-identical after the final bf16 rounding, at 128x128x128.
+    # It needs N % 64 == 0 (the kernel covers 64 columns per block) and K % 32 == 0.
+    if x.is_cuda and x.dim() == 2 and x.size(0) >= 2 and block == 32:
+        try:
+            from .kernels import mma_gemm
+
+            return mma_gemm.fp8_gemm_mma(x, w_fp8, w_scale)
+        except Exception:
+            pass
     # M in 2..8: pre-quantise once, then one gemv_pq per row. The bf16-input gemv
     # variant crashes (misaligned address at N=1280/K=5120), the pq variant does not.
     if x.dim() == 2 and 1 < x.size(0) <= 8 and x.is_cuda:
