@@ -110,6 +110,28 @@ def gemv_fp4_m8_kernel(N: int, K: int, M: int, rows: int = 8):
     return main
 
 
+def _w4a8_native(aq, asc, w_fp4, ws, n: int, k: int):
+    """fp8-activation x fp4-weight GEMV on our own kernel; None when not applicable.
+
+    Returns [1, N] bf16, or None so the caller falls back to the tilelang kernel.
+    """
+    try:
+        if not aq.is_cuda or k % 32 or n <= 0:
+            return None
+        from ..kernels import native
+
+        out = torch.empty(n, dtype=torch.bfloat16, device=aq.device)
+        native.launch(native.kernel("gemv_fp4_w4a8", "gemv_fp4_w4a8"),
+                      ((n + 7) // 8,), (256,),
+                      [aq.reshape(-1), asc.reshape(-1).float(),
+                       w_fp4.view(torch.uint8).reshape(-1) if w_fp4.dtype != torch.uint8
+                       else w_fp4.reshape(-1),
+                       ws.reshape(-1), out, 1, int(n), int(k)])
+        return out.view(1, n)
+    except Exception:
+        return None
+
+
 def gemv_fp4_pq(aq: torch.Tensor, asc: torch.Tensor, w_fp4: torch.Tensor,
                  w_scale: torch.Tensor, ws: torch.Tensor | None = None) -> torch.Tensor:
     """GEMV with a pre-quantised activation: aq [K] fp8, asc [K // 32] fp32.
@@ -120,12 +142,19 @@ def gemv_fp4_pq(aq: torch.Tensor, asc: torch.Tensor, w_fp4: torch.Tensor,
     """
     n, k2 = w_fp4.shape
     k = k2 * 2
-    out = torch.empty(n, device=aq.device, dtype=torch.bfloat16)
     if ws is None:
         ws = _scale(w_scale)
     # asc is already fp32 from quantize_act; .float() on it was ~240 no-op aten calls
     # per decode step
     asc2 = asc if asc.dtype == torch.float32 else asc.float()
+    # Native first (kernels/cuda/gemv_fp4_w4a8.cu): measured bit-identical to the tilelang
+    # kernel below on real expert weights (experts 0, 1 and 34 of layer 3: maxdiff 0.0),
+    # and it removes the tilelang JIT from the decode path. The tilelang version stays as
+    # the fallback for shapes the native one does not cover.
+    out = _w4a8_native(aq, asc2, w_fp4, ws, n, k)
+    if out is not None:
+        return out
+    out = torch.empty(n, device=aq.device, dtype=torch.bfloat16)
     gemv_fp4_kernel_v2(n, k)(aq.reshape(-1), asc2.reshape(-1), w_fp4, ws, out)
     _keep(aq, asc2, w_fp4, ws, out)
     return out.view(1, n)
