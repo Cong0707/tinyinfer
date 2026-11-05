@@ -894,7 +894,15 @@ class Engine:
         for d in self._expert_dev.values():
             counts[d] = counts.get(d, 0) + 1
         desc = ", ".join(f"cuda:{d}: {c} experts" for d, c in sorted(counts.items()))
-        print(f"[tinyinfer] expert placement plan: {desc}", flush=True)
+        # Say what this actually is. _expert_dev is a static per-(layer, expert) card
+        # assignment, and nothing in the decode path reads it: expert placement is done
+        # dynamically by VramSlotCache, where any expert can land in any slot on any card.
+        # Printing it as "the placement plan" made it look like the two agreed.
+        _slots = getattr(getattr(self, "expert_store", None), "slots", None)
+        _real = getattr(_slots, "total_slots", None)
+        _note = (f" (static reference only; decode uses {_real} dynamic slots)"
+                 if _real else "")
+        print(f"[tinyinfer] expert placement plan: {desc}{_note}", flush=True)
 
     def expert_device(self, layer_id: int, expert_id: int) -> int:
         """Which card an expert is planned on (0 when single-GPU or unplanned)."""
