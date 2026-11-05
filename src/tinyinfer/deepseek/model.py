@@ -36,8 +36,18 @@ def set_weight(owner, name: str, tensor) -> None:
     cur = getattr(owner, name, None)
     if isinstance(cur, torch.nn.Parameter):
         cur.data = tensor
-        return
-    setattr(owner, name, tensor)
+    else:
+        setattr(owner, name, tensor)
+    # QuantLinear carries a separate `parts` tuple describing the (device, weight, scale)
+    # layout -- one entry per card. flat streaming swaps a layer's bytes through this
+    # function and can only reach the attribute, never that tuple, so a streamed layer's
+    # parts kept pointing at its construction-time host copy. The owner is the only thing
+    # that can know how to reconcile them, and a sharded layer must NOT be touched here
+    # (its parts are the multi-card placement, not a cache), so this is a hook rather than
+    # logic: QuantLinear re-syncs a single-part tuple and ignores everything else.
+    _sync = getattr(owner, "_sync_parts_from_weight", None)
+    if _sync is not None:
+        _sync()
 
 
 class Block(HCBlockMixin):

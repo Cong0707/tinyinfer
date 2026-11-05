@@ -76,6 +76,18 @@ class QuantLinear:
             self._bf16 = self._bf16.to(device)
         return self
 
+    def _sync_parts_from_weight(self) -> None:
+        """Re-point a single-part `parts` at the current .weight/.scale.
+
+        Called by set_weight() (deepseek/model.py) when flat streaming swaps a layer's
+        bytes. A sharded layer is left alone: there `parts` IS the multi-card placement,
+        and rewriting it from one attribute would drop the other cards' slices.
+        """
+        if len(self.parts) == 1:
+            p = self.parts[0]
+            if p[1] is not self.weight or p[2] is not self.scale:
+                self.parts = [(self.weight.device, self.weight, self.scale)]
+
     # ---- compute ----
     def _one(self, x: torch.Tensor, weight, scale) -> torch.Tensor:
         if self._bf16 is not None:
