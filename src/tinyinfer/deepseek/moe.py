@@ -153,20 +153,13 @@ class Expert:
         The quantiser does not depend on the expert, so serving six experts repeated it
         six times (48 rows at prefill); it is now computed once per layer.
         """
-        # Native first: gemv_fp4 imports tilelang at module scope, so on a deployment
-        # without tilelang this import is the thing that fails even though the kernel it
-        # wraps no longer needs tilelang.
-        try:
-            from .fp4_native import gemv_fp4_pq
-            gemv_fp4_m8 = None
-            try:
-                from .gemv_fp4 import gemv_fp4_m8 as _tl_m8
+        # Our own w4a8 kernel. gemv_fp4 (the tilelang one) is no longer imported here at
+        # all: its module-level tilelang import was the thing that failed on a deployment
+        # without tilelang, and its kernel computes a different quantisation scheme
+        # (w4a16) from the one the checkpoints define.
+        from .fp4_native import gemv_fp4_pq
 
-                gemv_fp4_m8 = _tl_m8
-            except Exception:
-                pass
-        except Exception:
-            from .gemv_fp4 import gemv_fp4_m8, gemv_fp4_pq
+        gemv_fp4_m8 = None
 
         # Several tokens of one chunk can route to the same expert: the single-row GEMV
         # flattens a [rows, K] activation into the kernel's [K] slot and reads it wrong,
@@ -199,7 +192,7 @@ class Expert:
             # before and decode keeps it for the few experts it serves.
             ws = getattr(self, "_ws_cache", None)
             if ws is None:
-                from .gemv_fp4 import _scale
+                from .fp4_native import _scale
 
                 ws = self._ws_cache = (_scale(s1), _scale(s2), _scale(s3))
         gate = _lin(aq, asc, w1, s1, ws[0]).float()
@@ -648,7 +641,7 @@ class MoE:
                                 self._fused_checked = True
                                 import sys as _sys
 
-                                from .gemv_fp4 import gemv_fp4_pq
+                                from .fp4_native import gemv_fp4_pq
 
                                 _e0 = _exps[0]
                                 _f0 = _e0.fp4

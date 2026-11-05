@@ -292,26 +292,28 @@ def fp4_linear(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor, act_
         except Exception:
             pass
     if x.dim() == 2 and 0 < x.size(0) <= 8 and x.is_cuda:
-        # same block_M=32 waste as fp8: at M=2 the GEMM took 334ms/layer. Rows are done
-        # one at a time with the single-row kernel: gemv_fp4_m8's multi-row grid was
-        # measured 35% off on some (weight, row) pairs, and a chunk only has a handful
-        # of rows per expert, so exactness wins over the launch count.
+        # Native first: fp4_native is our own w4a8 kernel (fp8 activation x fp4 weight),
+        # which is the arithmetic the checkpoints define. gemv_fp4 is the tilelang one and
+        # sits behind it as a fallback only.
         try:
-            from .deepseek.gemv_fp4 import gemv_fp4_m8, gemv_fp4_pq, quantize_act
-            aq, asc = quantize_act(x, x.size(-1))
-            if aq.size(0) > 1 and __import__("os").environ.get("TI_MULTIROW_GEMV") == "1":
-                return gemv_fp4_m8(aq, asc, w_fp4, w_scale)
+            from .deepseek import fp4_native
+
+            aq, asc = fp4_native.quantize_act(x, x.size(-1))
             if aq.size(0) > 1:
-                out = [gemv_fp4_pq(aq[i], asc[i], w_fp4, w_scale) for i in range(aq.size(0))]
+                out = [fp4_native.gemv_fp4_pq(aq[i], asc[i], w_fp4, w_scale)
+                       for i in range(aq.size(0))]
                 return torch.cat(out, 0)
-            return gemv_fp4_pq(aq[0], asc[0], w_fp4, w_scale)
+            return fp4_native.gemv_fp4_pq(aq[0], asc[0], w_fp4, w_scale)
         except Exception:
-            try:
-                from .deepseek.gemv_fp4 import gemv_fp4
-                rows = [gemv_fp4(x[i:i + 1], w_fp4, w_scale) for i in range(x.size(0))]
-                return rows[0] if len(rows) == 1 else torch.cat(rows, dim=0)
-            except Exception:
-                pass
+            pass
+    if x.dim() == 2 and 0 < x.size(0) <= 8 and x.is_cuda:
+        try:
+            from .deepseek import fp4_native
+            rows = [fp4_native.gemv_fp4_pq(*fp4_native.quantize_act(x[i:i + 1], x.size(-1)),
+                                           w_fp4, w_scale) for i in range(x.size(0))]
+            return rows[0] if len(rows) == 1 else torch.cat(rows, dim=0)
+        except Exception:
+            pass
     with _bf16_default():
         x_fp8, x_s = _act_quant(x, act_block, SCALE_FMT, SCALE_DTYPE)
         out = _k.fp4_gemm(x_fp8, x_s, w_fp4, w_scale, SCALE_DTYPE, act_block_size=act_block)
