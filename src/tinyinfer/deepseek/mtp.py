@@ -148,7 +148,7 @@ class MTPAttention(MLAWindowAttention):
             torch.arange(n_hist, device=x.device),
             n_hist + torch.arange(s, device=x.device),
         ]).view(1, 1, -1).expand(b, s, -1).contiguous()
-        from ..kernels import sparse_attn_dispatch
+        from ..kernels.sparse_attn import sparse_attn_dispatch
         o = sparse_attn_dispatch(q, kv_att, self.sink, idxs, self.scale)
         apply_rope(o[..., -rd:], freqs, inverse=True)
         o = o.view(b, s, self.o_groups, -1)
