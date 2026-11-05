@@ -32,8 +32,9 @@ def gemv_fp4_pq(aq, asc, w_fp4, w_scale, ws=None):
     k = k2 * 2
     if ws is None:
         ws = _scale(w_scale)
-    if ws.size(0) != n:
-        ws = ws.view(-1, ws.size(-1)).repeat_interleave(32, 0)[:n]
+    # No repeat_interleave here: gemv_fp4_pq's caller already hands an [N, K/32] scale
+    # (the broadcast form belongs to gemv_fp4(), which takes the packed [N/32, nb] one).
+    # Adding it here expanded a scale that was already correct and changed the output.
     asc2 = asc if asc.dtype == torch.float32 else asc.float()
     out = torch.empty(n, dtype=torch.bfloat16, device=aq.device)
     wb = w_fp4 if w_fp4.dtype == torch.uint8 else w_fp4.view(torch.uint8)

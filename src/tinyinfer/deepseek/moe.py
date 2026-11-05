@@ -153,7 +153,20 @@ class Expert:
         The quantiser does not depend on the expert, so serving six experts repeated it
         six times (48 rows at prefill); it is now computed once per layer.
         """
-        from .gemv_fp4 import gemv_fp4_m8, gemv_fp4_pq
+        # Native first: gemv_fp4 imports tilelang at module scope, so on a deployment
+        # without tilelang this import is the thing that fails even though the kernel it
+        # wraps no longer needs tilelang.
+        try:
+            from .fp4_native import gemv_fp4_pq
+            gemv_fp4_m8 = None
+            try:
+                from .gemv_fp4 import gemv_fp4_m8 as _tl_m8
+
+                gemv_fp4_m8 = _tl_m8
+            except Exception:
+                pass
+        except Exception:
+            from .gemv_fp4 import gemv_fp4_m8, gemv_fp4_pq
 
         # Several tokens of one chunk can route to the same expert: the single-row GEMV
         # flattens a [rows, K] activation into the kernel's [K] slot and reads it wrong,
@@ -435,8 +448,15 @@ class MoE:
         # repeated it 6x per token / 48x at prefill
         _aq = _asc = None
         if use_fp4_kernel and active:
+            # NOTE: do NOT swap this to fp4_native.quantize_act. Measured: the end-to-end
+            # decode output changes ([989,43,...] -> [95991,...]) even though the native
+            # act_quant is bit-identical to the reference on every synthetic shape tested.
+            # Whatever differs is data dependent, so this stays on the reference until
+            # that is found. The cost is that gemv_fp4 (hence tilelang) is still imported
+            # on this path.
             try:
                 from .gemv_fp4 import quantize_act
+
                 _aq, _asc = quantize_act(xf, xf.size(-1))
             except Exception:
                 _aq = _asc = None
