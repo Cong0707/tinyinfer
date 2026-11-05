@@ -31,6 +31,13 @@ __device__ __forceinline__ void e4m3x4(unsigned int raw, float* o) {
     o[0] = f0.x; o[1] = f0.y; o[2] = f1.x; o[3] = f1.y;
 }
 
+// one packed e4m3 byte -> float, for the scalar tail path (K not a multiple of 512)
+__device__ __forceinline__ float e4m3_one(unsigned char b) {
+    float o;
+    e4m3x4((unsigned int)b, &o);
+    return o;
+}
+
 }  // namespace
 
 extern "C" __global__ void fp8_gemv_bs(
@@ -49,32 +56,55 @@ extern "C" __global__ void fp8_gemv_bs(
     const unsigned char* wsr = ws + (long long)(n >> 5) * nb;
 
     float acc = 0.f;
-    const int niter = k_dim >> 9;           // 512 k per warp-iteration
+    // K need not be a multiple of 512: the loop rounds up and the last iteration handles
+    // a short tail. That matters because two of the largest projections are NOT 512-
+    // aligned -- wq_b is K=1280 (42 MB) and the shared expert's w2 is K=2304 -- and they
+    // would otherwise fall through to the block_M=32 GEMM, the slowest thing left in the
+    // decode step. A 16-byte vector load past the end of K would walk off the tensor, so
+    // an incomplete lane group reads scalar instead.
+    const int niter = (k_dim + 511) >> 9;   // 512 k per warp-iteration, rounded up
     for (int it = 0; it < niter; ++it) {
         const int kbase = (it << 9) + (lane << 4);
+        // continue, NOT break: the tail iteration is short for the high lanes only, and a
+        // divergent break leaves those lanes out of the __shfl_down_sync at the end of the
+        // kernel (all 32 must participate). Measured with break: wrong tokens and a
+        // 10.8s step, because the shuffle then reads undefined lanes.
+        if (kbase >= k_dim) continue;
         const int grp = (it << 4) + (lane >> 1);   // 32-k group of kbase
+        const bool full = (kbase + 16) <= k_dim;
 
-        // activation: 16 bytes, four hardware converts
-        const uint4 araw = *(const uint4*)(a + kbase);
         float av[16];
-        {
+        if (full) {
+            const uint4 araw = *(const uint4*)(a + kbase);
             const unsigned int* u = reinterpret_cast<const unsigned int*>(&araw);
 #pragma unroll
             for (int i = 0; i < 4; ++i) e4m3x4(u[i], av + 4 * i);
+        } else {
+            for (int j = 0; j < 16; ++j) {
+                const int kk = kbase + j;
+                av[j] = (kk < k_dim) ? e4m3_one(a[kk]) : 0.f;
+            }
         }
         const float asc = e8m0(as[grp]);
         const float wsc = e8m0(wsr[grp]);
 
-        // weights: 16 bytes, four hardware converts, dot with the activation
-        const uint4 wraw = *(const uint4*)(wr + kbase);
-        const unsigned int* u = reinterpret_cast<const unsigned int*>(&wraw);
         float part = 0.f;
+        if (full) {
+            const uint4 wraw = *(const uint4*)(wr + kbase);
+            const unsigned int* u = reinterpret_cast<const unsigned int*>(&wraw);
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            float wv[4];
-            e4m3x4(u[i], wv);
-            part += av[4 * i] * wv[0] + av[4 * i + 1] * wv[1]
-                  + av[4 * i + 2] * wv[2] + av[4 * i + 3] * wv[3];
+            for (int i = 0; i < 4; ++i) {
+                float wv[4];
+                e4m3x4(u[i], wv);
+                part += av[4 * i] * wv[0] + av[4 * i + 1] * wv[1]
+                      + av[4 * i + 2] * wv[2] + av[4 * i + 3] * wv[3];
+            }
+        } else {
+            for (int j = 0; j < 16; ++j) {
+                const int kk = kbase + j;
+                if (kk >= k_dim) break;
+                part += av[j] * e4m3_one(wr[kk]);
+            }
         }
         acc += part * asc * wsc;
     }

@@ -35,7 +35,24 @@ SCALE_DTYPE = torch.float8_e8m0fnu
 
 
 def available() -> bool:
-    return _k is not None
+    """True when the fp8 kernels can run.
+
+    NOT "tilelang imported". fp8_linear's decode path (M=1) is the native fp8_gemv_bs
+    kernel and needs no tilelang at all; gating on _k made every QuantLinear fall back to
+    dequantise-then-matmul, which is a DIFFERENT computation -- measured: a run with
+    tilelang blocked produced [2058, 3] where the fp8 path produces [989, 43].
+    tilelang is still needed for the M>1 (prefill) branch, and that is the branch that
+    falls back to _k.fp8_gemm.
+    """
+    if _k is not None:
+        return True
+    try:
+        from .kernels import native
+
+        native.kernel("fp8_gemv_bs", "fp8_gemv_bs")
+        return True
+    except Exception:
+        return False
 
 
 def _bf16_default():
@@ -74,9 +91,18 @@ _FP8_NATIVE = None
 
 def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, block: int = 32) -> torch.Tensor:
     if (x.is_cuda and x.dim() == 2 and x.size(0) == 1
+            # K need not be a multiple of 512: the kernel rounds its warp iterations up
+            # and handles a short tail. That matters because two of the largest
+            # projections are NOT 512-aligned -- wq_b is K=1280 (42 MB) and the shared
+            # expert's w2 is K=2304 -- and they used to fall through to the block_M=32
+            # GEMM, which is the slowest thing left in the decode step.
+            # NOTE: keep 512. Relaxing to %16 for wq_b (K=1280) was tried and REVERTED:
+            # the kernel's tail path produced [989, 43, 1970, 304] and a 10.8s step. The
+            # tail branch is never even entered at K=1280 (the first 16 lanes are all
+            # full), so whatever is wrong is elsewhere -- wq_b's scale layout or the
+            # fp8_gemm it was compared against, not the short-tail arithmetic.
             and block == 32 and w_fp8.shape[1] % 512 == 0
             and w_fp8.shape[0] % 32 == 0
-            and __import__("os").environ.get("TI_FP8_NEW", "1") != "0"
             # fp8_gemv_bs decodes e4m3 with the hardware converter. On a card without
             # one (SM < 89, i.e. Turing and Ampere) that call becomes a software
             # sequence per element and this kernel loses to the plain GEMM it replaces,
@@ -169,9 +195,38 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
             return torch.cat(outs, dim=0)
         except Exception:
             pass
-    with _bf16_default():
-        x_fp8, x_s = _act_quant(x, block, SCALE_FMT, SCALE_DTYPE)
-        return _k.fp8_gemm(x_fp8, x_s, w_fp8, w_scale, SCALE_DTYPE, block_size=block)
+    if _k is None and x.is_cuda:
+        # No tilelang: prefill still has to reach the same numbers, so run the native M=1
+        # kernel row by row. Slower than a real block-M GEMM, but prefill happens once per
+        # prompt and a different code path here would change the KV cache that decode then
+        # reads. The caller does not always hand a 2-D tensor, so flatten first -- an
+        # earlier version tested x.dim() == 2 at the top and silently fell through to the
+        # _k.fp8_gemm line below when it was not.
+        xf = x.reshape(-1, x.shape[-1]) if x.dim() != 2 else x
+        if xf.size(0) > 1:
+            rows = [fp8_linear(xf[i:i + 1], w_fp8, w_scale, block)
+                    for i in range(xf.size(0))]
+            out = torch.cat(rows, dim=0)
+            return out.view(*x.shape[:-1], out.shape[-1])
+    if _k is not None:
+        with _bf16_default():
+            x_fp8, x_s = _act_quant(x, block, SCALE_FMT, SCALE_DTYPE)
+            return _k.fp8_gemm(x_fp8, x_s, w_fp8, w_scale, SCALE_DTYPE, block_size=block)
+    # No tilelang, or the caller's shape fell through the branches above: the only kernel
+    # left is the native M=1 one, so run it row by row. Same numbers as the block-M GEMM
+    # (it is the same maths, one row at a time), just slower.
+    xf = x.reshape(-1, x.shape[-1]) if x.dim() != 2 else x
+    if xf.size(0) == 1:
+        # A single row got past every fp8 branch above: either the weight shape fails the
+        # %16 checks, the card has no native e4m3 converter, or x is not CUDA. Falling
+        # back to dequantise-then-matmul silently would produce different numbers than the
+        # fp8 path, so say which it is instead of recursing forever.
+        raise RuntimeError(
+            f"fp8_linear: no path for M=1 (is_cuda={x.is_cuda} dim={x.dim()} "
+            f"block={block} w={tuple(w_fp8.shape)} native={_fp8_native()} k={_k is not None})")
+    rows = [fp8_linear(xf[i:i + 1], w_fp8, w_scale, block) for i in range(xf.size(0))]
+    out = torch.cat(rows, dim=0)
+    return out.view(*x.shape[:-1], out.shape[-1])
 
 
 def fp4_linear(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor, act_block: int = 32) -> torch.Tensor:
