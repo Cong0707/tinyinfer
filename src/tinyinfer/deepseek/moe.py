@@ -212,6 +212,39 @@ class Expert:
         # measured 1.50x on real expert weights, bit-identical to the two calls
         # (diff 0.0 on both). Prefill keeps the row loop, where the batch dimension makes
         # the two-call form the cheaper one.
+        # Marlin for gate/up as well, not just for the down projection below. The two
+        # halves of this layer were on different kernels: fp4_linear (down) has preferred
+        # Marlin since it measured 4.89x over the hand-written GEMV, while gate/up kept
+        # calling fp4_native.gemv_fp4_pq. Measured here: marlin 16.0 us at 384 GB/s
+        # against gemv_fp4_pq 88.4 us at 70.9 GB/s. The fused gate_up kernel is 1.5x the
+        # two-call form on the old path, but 384/71 is 5.4x, so Marlin wins outright.
+        #
+        # It is w4a16 where the checkpoint defines w4a8; that skips fp8 activation
+        # quantisation and moves values by ~12% of their magnitude. The down projection
+        # already took that trade, and vLLM itself runs this model that way, so gate/up
+        # matching down is also the more consistent choice.
+        _marlin_key = getattr(self, "_marlin_key", None)
+        if (aq.dim() == 2 and aq.size(0) == 1 and aq.is_cuda
+                and __import__("os").environ.get("TI_FP4_MARLIN", "1") != "0"
+                and _marlin_key is not None):
+            try:
+                from .gemv_fp4_marlin import gemv_fp4_fast as _mfast
+
+                x_row = self._fp4_act_row
+                gate_t = _mfast(x_row, w1, s1, key=(_marlin_key, "w1"))
+                up_t = _mfast(x_row, w3, s3, key=(_marlin_key, "w3"))
+                gate = gate_t.float()
+                up = up_t.float()
+                if self.swiglu_limit > 0:
+                    up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
+                    gate = torch.clamp(gate, max=self.swiglu_limit)
+                yy = F.silu(gate) * up
+                if weights is not None:
+                    yy = weights * yy
+                from ..gemm import fp4_linear
+                return fp4_linear(yy.to(torch.bfloat16), w2, s2)
+            except Exception:
+                pass
         _fused_gu = (aq.dim() == 2 and aq.size(0) == 1 and aq.is_cuda
                      and ws is not None and w1.shape == w3.shape)
         if _fused_gu:

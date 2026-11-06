@@ -1470,8 +1470,13 @@ __global__ void Marlin(
       if (has_bias && last) {
         c_scalar_t2 tmp_bias = b_bias[0];
         if constexpr (m_block_size_8) {
+          // b_bias is in the OUTPUT dtype, not the activation dtype. Those differ when
+          // the activation is fp8 (w4a8: scalar_t = e4m3, c_scalar_t = bf16), and the
+          // reinterpret_cast below then feeds a fp8 byte to a bf16 conversion. vLLM
+          // never hits this because it does not instantiate an fp8-activation Marlin;
+          // the instantiation added in instances.cu does.
           tmp_bias = Cdtype::num2num2(
-              reinterpret_cast<scalar_t*>(&b_bias[0])[(threadIdx.x % 8) / 4]);
+              reinterpret_cast<c_scalar_t*>(&b_bias[0])[(threadIdx.x % 8) / 4]);
         }
         res = __hadd2(res, tmp_bias);
       }
