@@ -50,3 +50,15 @@ prototypes/
 # 不入库，但要跟着源码目录放，tinyinfer 优先从包内加载。
 src/tinyinfer/_C_stable_libtorch.pyd
 src/tinyinfer/_moe_C_stable_libtorch.pyd
+# Build artefacts. cubins come from scripts/build_native.ps1, the DLL from
+# scripts/build_cutlass_gemm.sh; neither is a source file and both are rebuilt
+# per architecture, so committing them pins the repo to one box.
+build/
+*.cubin
+*.dll
+*.lib
+*.exp
+
+# Python bytecode
+__pycache__/
+*.pyc

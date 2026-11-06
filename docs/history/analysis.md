@@ -795,7 +795,7 @@ Practical use: `eng.save_checkpoint(path)` after a prefill, then `eng.load_check
 in the next turn and continue from `len(prefix)`. Both require tier 2 (the default).
 
 
-### Verified end to end (examples/multi_turn.py)
+### Verified end to end (scripts/examples/multi_turn.py)
 
     Q: What is the capital of France?      ->  (saved 16.9MB prefix checkpoint)
     Q: What is its population?              ->  1,000,000
@@ -857,7 +857,7 @@ importantly the HTTP path costs ~2x the engine path for the same work (107.8s ag
 for 10+6 tokens through `Engine.generate`). The overhead is in the server's own loop
 (per-token text decoding for streaming deltas, request bookkeeping), not in the model.
 
-Position: the engine-level mechanism is verified (`examples/multi_turn.py`, 51s -> 30.9s ->
+Position: the engine-level mechanism is verified (`scripts/examples/multi_turn.py`, 51s -> 30.9s ->
 28.9s); the HTTP wiring stays opt-in and off by default, and the server's per-token overhead
 is now the more valuable thing to fix than the prefix logic. Recorded rather than papered
 over.
@@ -987,7 +987,7 @@ prefix (the exact token ids of the next request's prompt) instead of the generat
 small but real change, and it is what the verification uncovered.
 
 Functionally the path is fine (both answers are sensible); it just does not save the
-prefill. The in-process mechanism (examples/multi_turn.py) does, because there the caller
+prefill. The in-process mechanism (scripts/examples/multi_turn.py) does, because there the caller
 controls the exact token ids.
 
 
@@ -1004,7 +1004,7 @@ not capture the flat-stream state / ring position, or the restore happens before
 lazy flat setup has run for this process.
 
 **Position:** `TI_SERVER_PREFIX` stays off by default. The in-process multi-turn path
-(`examples/multi_turn.py`, 51s -> 30.9s -> 28.9s with correct answers) remains the verified
+(`scripts/examples/multi_turn.py`, 51s -> 30.9s -> 28.9s with correct answers) remains the verified
 way to reuse a prefix, and making the HTTP variant correct is a concrete follow-up rather
 than a finished feature. Recording this so nobody enables it on the strength of the timing
 alone.

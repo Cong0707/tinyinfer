@@ -8,7 +8,7 @@
 | Prefill / decode / streaming | works |
 | Multi-session (generate twice on one engine) | works (logit drift is a known open item) |
 | HTTP server `/health` + `/generate` | verified end to end |
-| Benchmark / examples | `python -m tinyinfer.bench`, `examples/*.py` |
+| Benchmark / examples | `python -m tinyinfer.bench`, `scripts/examples/*.py` |
 | Test suite | passes (2 xfail: session drift, one-shot vs stepwise) |
 
 ## Measured performance
@@ -134,7 +134,7 @@ hardware.
 `Enginesave_checkpoint(path)` after a prefill captures the conversation prefix in 16.9MB;
 `load_checkpoint` restores it in ~0.01s, so later turns only prefill the new text instead
 of the whole transcript (a 23-token prefix costs 43.5s to prefill). Verified with
-`examples/multi_turn.py`: population -> 1,000,000, Hamlet -> Shakespeare, no re-prefill.
+`scripts/examples/multi_turn.py`: population -> 1,000,000, Hamlet -> Shakespeare, no re-prefill.
 `generate(..., start_pos=, keep_session=)` are the two API additions it needs. The HTTP
 server does not wire this up yet (single request at a time).
 ## Serve path (fixed this round)

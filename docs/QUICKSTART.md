@@ -115,6 +115,6 @@ A conversation prefix costs ~43s to prefill and checkpoints to 16.9MB that resto
     out = eng.generate(new_ids, max_new_tokens=16,
                        start_pos=len(ids), keep_session=True)
 
-`examples/multi_turn.py` is the runnable version. (The HTTP server does not wire this up
+`scripts/examples/multi_turn.py` is the runnable version. (The HTTP server does not wire this up
 yet; it takes one request at a time.)
 
