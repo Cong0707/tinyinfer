@@ -119,6 +119,13 @@ def available(name: str, func: str | None = None) -> bool:
 # torch.ops._C 8.3us for the same 4096-wide rms_norm), because every call re-tests each
 # argument's type and re-allocs the pointer array. A BoundLaunch caches the geometry and
 # the argument kinds, so the steady state is one list comprehension plus cuLaunchKernel.
+import threading as _threading
+
+# (stream_handle, c_void_p, Stream object) per thread. Keeping the Stream alive matters:
+# the handle is a raw address into it.
+_STREAM_CACHE: dict[int, tuple[int, object, object]] = {}
+
+
 class BoundLaunch:
     """A kernel + signature + launch geometry, pre-resolved for repeated calls."""
 
@@ -172,10 +179,18 @@ class BoundLaunch:
                 raw[i] = a & 0xFFFFFFFF
         ptrs = self._ptrs
         if stream is None:
-            # A fresh c_void_p every call: cuLaunchKernel takes the argument block by
-            # pointer and the driver may write through it, so a cached object reused
-            # across launches would be mutated under us.
-            stream = ctypes.c_void_p(int(torch.cuda.current_stream().cuda_stream))
+            # cache the Stream wrapper per thread and only touch a plain attribute; the
+            # valiation is against torch's own notion of the current stream, so graph
+            # capture and user stream switches are still seen
+            tid = _threading.get_ident()
+            ent = _STREAM_CACHE.get(tid)
+            cur = torch.cuda.current_stream()
+            raw = int(cur.cuda_stream)
+            if ent is None or ent[0] != raw:
+                stream = ctypes.c_void_p(raw)
+                _STREAM_CACHE[tid] = (raw, stream, cur)
+            else:
+                stream = ent[1]
         gx, gy, gz = self._grid
         bx, by, bz = self._block
         rc = _lib().cuLaunchKernel(self._fn, gx, gy, gz, bx, by, bz, self._shared,
