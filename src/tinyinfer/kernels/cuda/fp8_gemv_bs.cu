@@ -69,19 +69,47 @@ extern "C" __global__ void fp8_gemv_bs(
     // decode step. A 16-byte vector load past the end of K would walk off the tensor, so
     // an incomplete lane group reads scalar instead.
     const int niter = (k_dim + 511) >> 9;   // 512 k per warp-iteration, rounded up
+    // Software-pipelined loads. The loop body is load-then-use, so on a cold run -- which
+    // is every decode, since each expert weight is a first touch out of HBM -- the full
+    // HBM latency of each load sits exposed between iterations. That is worth a lot:
+    // measured on the decode shapes the kernel delivers ~192 GB/s in situ against the
+    // 323-395 GB/s it reaches when the data is warm. Issuing the next iteration's two
+    // 16-byte vector loads before consuming the current pair lets them overlap with the
+    // decode and the FMA of the current one.
+    //
+    // Nothing about the arithmetic moves: same iterations, same accumulation order, same
+    // tail handling. Only the load is hoisted.
+    uint4 a_pre, w_pre;
+    bool full_pre = false, valid_pre = false;
+    int grp_pre = 0;
+#define TI_PREFETCH(IT)                                                          \
+    do {                                                                         \
+        const int _kb = ((IT) << 9) + (lane << 4);                               \
+        valid_pre = (_kb < k_dim);                                               \
+        grp_pre = valid_pre ? (((IT) << 4) + (lane >> 1)) : 0;                   \
+        full_pre = valid_pre && (_kb + 16) <= k_dim;                             \
+        if (full_pre) {                                                          \
+            a_pre = *(const uint4*)(a + _kb);                                    \
+            w_pre = *(const uint4*)(wr + _kb);                                   \
+        }                                                                        \
+    } while (0)
+
+    TI_PREFETCH(0);
     for (int it = 0; it < niter; ++it) {
+        const uint4 araw = a_pre;
+        const uint4 wraw = w_pre;
         const int kbase = (it << 9) + (lane << 4);
-        // No continue: this loop now contains a __shfl_xor_sync, and every __shfl*_sync
-        // in the warp requires ALL 32 lanes to reach it. Skipping ahead on the tail lanes
-        // hung the kernel outright (the test never returned). The guard is a bool instead,
-        // and the tail lanes simply contribute zero.
-        const bool valid = (kbase < k_dim);
-        const int grp = valid ? ((it << 4) + (lane >> 1)) : 0;
-        const bool full = valid && (kbase + 16) <= k_dim;
+        // No continue: this loop contains a __shfl_xor_sync, and every __shfl*_sync in the
+        // warp requires ALL 32 lanes to reach it. Skipping ahead on the tail lanes hung the
+        // kernel outright (the test never returned). The guard is a bool instead, and the
+        // tail lanes simply contribute zero.
+        const bool valid = valid_pre;
+        const int grp = grp_pre;
+        const bool full = full_pre;
+        if (it + 1 < niter) TI_PREFETCH(it + 1);
 
         float av[16];
         if (full) {
-            const uint4 araw = *(const uint4*)(a + kbase);
             const unsigned int* u = reinterpret_cast<const unsigned int*>(&araw);
 #pragma unroll
             for (int i = 0; i < 4; ++i) e4m3x4(u[i], av + 4 * i);
@@ -96,7 +124,6 @@ extern "C" __global__ void fp8_gemv_bs(
 
         float part = 0.f;
         if (full) {
-            const uint4 wraw = *(const uint4*)(wr + kbase);
             const unsigned int* u = reinterpret_cast<const unsigned int*>(&wraw);
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
