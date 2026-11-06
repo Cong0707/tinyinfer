@@ -208,14 +208,14 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
     # paths differ by one bf16 ulp, which is enough to change decoded tokens over 40
     # layers ([989,43,4571,5958] -> [223,19,17,20]). Using one path for both is the only
     # way to keep them consistent until the two kernels are proven equivalent.
-    # 128 is a CORRECTNESS bound, not just a performance one. The kernel strides whole
-    # 16-row mma tiles and one block covers BLOCK_M=128 rows via its 8 warps; a block whose
-    # rows run past M returns early, so M not a multiple of 128 is fine (the tail block
-    # simply stops). But with M < 128 the first block is the only one and only its leading
-    # warps do any work -- rows 16..127 are never written, and the caller reads whatever
-    # torch.empty left there. Keeping the threshold at 128 is what makes the guard
-    # correct; it happens to also be where the kernel stops losing to the SIMT GEMV.
-    if (x.is_cuda and x.dim() == 2 and x.size(0) >= 128 and block == 32
+    # Threshold is 64, not 128: the kernel masks every warp by its own row range
+    # (warp_active / rows_lo / rows_hi), so a partial last block is safe and M only has to
+    # cover one 16-row tile. Measured on [*,2304,5120]:
+    #     M=1    mma 119.3 us   vs SIMT GEMV  40.4 us   -> GEMV wins, M=1 stays on it
+    #     M=64   mma 128.3 us   vs 64 rows   = 2.6 ms   -> 20x
+    #     M=128  mma 153.7 us   vs 128 rows  = 5.1 ms   -> 33x
+    # The crossover sits between 1 and 64, so anything a prefill chunk produces is a win.
+    if (x.is_cuda and x.dim() == 2 and x.size(0) >= 64 and block == 32
             and __import__("os").environ.get("TI_MMA_GEMM") == "1"):
         try:
             from .kernels import mma_gemm
@@ -336,20 +336,18 @@ def fp4_linear(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor,
             return rows[0] if len(rows) == 1 else torch.cat(rows, dim=0)
         except Exception:
             pass
-    # Prefill (M > 8). This used to hand off to the vendor's tilelang fp4_gemm; that
-    # code is external material and no longer lives in this repository, so the native
-    # tensor-core GEMM takes over. it needs M >= 128, which a prefill chunk satisfies.
-    if x.is_cuda and x.dim() == 2 and x.size(0) >= 128:
-        try:
-            from .kernels import mma_gemm
-
-            return mma_gemm.fp4_gemm_mma(x, w_fp4, w_scale)
-        except Exception:
-            pass
-    # Any remaining M: row by row on the native GEMV. This is the prefill path a short
-    # prompt takes (M in 9..127), and a chunk routes 1-2 rows per expert anyway, so the
-    # per-row form is what the shape actually wants. It is also the fallback that made
-    # dropping the vendor GEMM possible at all.
+    # No tensor-core path for fp4. There was a call to mma_gemm.fp4_gemm_mma here, but
+    # that function does not exist (mma_gemm only exports fp8_gemm_mma), so the try/except
+    # below silently swallowed the AttributeError and every M fell through to the row
+    # loop -- the comment claimed a tensor-core GEMM was taking over and nothing was.
+    #
+    # It is not worth building one for this path. A routed expert's fp4 matrix only ever
+    # sees the tokens that picked it: a chunk of 930 tokens spreads over 384 experts, so
+    # an expert gets ~14 rows, well under the M where mma beats a GEMV (see the crossover
+    # measurements above fp8_linear). The fp8 projections are where a large M appears and
+    # where TI_MMA_GEMM matters.
+    #
+    # Any remaining M: row by row on the native GEMV.
     if x.is_cuda and x.dim() == 2:
         from .deepseek import fp4_native
 
