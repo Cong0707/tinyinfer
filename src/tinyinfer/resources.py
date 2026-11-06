@@ -569,11 +569,16 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
             if _slots2 >= need_slots:
                 embed_gpu, head_gpu, resident, slots = _eg, _hg, _r2, _slots2
                 break
-    # 8 is the measured sweet spot for this model's tilelang kernel set (a wave of 8
-    # needs ~1.6GB of workspace and 165s for a 21-token prompt on 8GB; 16 needs 63s but
-    # pages). Larger waves only pay on cards with room to spare.
+    # The wave size is whatever the spare VRAM can hold at WS_PER_TOKEN each; the lower
+    # bound keeps a chunk from degenerating into single rows. The old upper bound of 64
+    # came from a measurement of the tilelang kernel set ("a wave of 8 needs ~1.6GB and
+    # 165s for a 21-token prompt on 8GB; 16 needs 63s but pages") -- that code is gone
+    # and the bound was capping every large card at 64 tokens per wave, which is also
+    # below the M that makes the tensor-core prefill path worthwhile. Leave the ceiling
+    # high enough that the spare-VRAM formula decides: on this 8 GB box it still lands
+    # on 8, and a 141 GB card gets waves in the hundreds.
     chunk = int(max(0.0, spare * (1.0 - SLOT_FRACTION)) // max(1.0, WS_PER_TOKEN))
-    chunk = max(8, min(64, chunk))
+    chunk = max(8, min(4096, chunk))
 
     # ---- host side: leave the page cache and the CPU tables their memory -----------
     # The expert cache is not free: every GB it takes is a GB the OS cannot use to keep
