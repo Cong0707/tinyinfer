@@ -449,9 +449,14 @@ class MoE:
             # modulo split only for the legacy distributed path. The distinction
             # matters: modulo scatters each rank's expert blobs across the whole file,
             # so every rank's reads are strided where contiguous blocks are sequential.
-            _route = getattr(self, "_ep_route", None)
-            if _route is not None:
-                active = [i for i in active if _route.rank_of(i) == _rank]
+            # NOT _route: that name already holds the routed expert ids pulled off the
+            # device at line ~437, and the decode path below enumerates it to build
+            # _groups. Reusing it here shadowed the id list with an ExpertRoute and made
+            # every ep_world>1 decode die at "TypeError: 'NoneType' object is not
+            # iterable" -- which is why expert parallelism has never actually run.
+            _epr = getattr(self, "_ep_route", None)
+            if _epr is not None:
+                active = [i for i in active if _epr.rank_of(i) == _rank]
             else:
                 active = [i for i in active if (i % _world) == _rank]
         self._last_ids = list(active)  # already the unique routed set (one host sync total)
