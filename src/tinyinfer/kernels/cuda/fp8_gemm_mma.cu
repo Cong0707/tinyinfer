@@ -27,7 +27,15 @@ namespace {
 constexpr int WARP_M = 16;    // rows per mma
 constexpr int WARP_N = 8;     // cols per mma
 constexpr int WARP_K = 32;    // k per mma, also one scale block
-constexpr int NB = 8;         // mma tiles per warp along N (=> 64 cols)
+#ifndef TI_MMA_NB
+#define TI_MMA_NB 4
+#endif
+// mma tiles per warp along N. This is the knob that sets the grid size: with BLOCK_M=128
+// and 8 warps per block the whole M=128 problem is 36 blocks (N/64), i.e. 1.4 blocks per
+// SM on a 26-SM part -- 11 warps resident out of a possible 64, 17% occupancy. Halving
+// NB to 4 doubles the block count to 72 and lifts occupancy to ~34% without touching the
+// arithmetic: each block still computes whole mma tiles, just fewer of them.
+constexpr int NB = TI_MMA_NB;
 constexpr int BLOCK_M = 128;  // 8 warps stacked along M
 
 __device__ __forceinline__ float e8m0_val(unsigned char b) {
@@ -54,11 +62,17 @@ __device__ __forceinline__ void mma_m16n8k32(float d[4], const uint32_t a[4],
 // B  [N, K]     e4m3
 // BS [N/32, K/32] e8m0
 // C  [M, N]     bf16
+//
+// Built for the whole Turing..GB300 range, so the body is guarded: mma.sync with e4m3
+// operands is an sm_89 feature and ptxas rejects it outright for the sm_75 and sm_86
+// passes of a fatbin. On those targets this compiles to an empty kernel; the host side
+// gates the call on the device capability (gemm._fp8_native), so it is never reached.
 extern "C" __global__ void fp8_gemm_mma(
     const unsigned char* __restrict__ A, const unsigned char* __restrict__ AS,
     const unsigned char* __restrict__ B, const unsigned char* __restrict__ BS,
     __nv_bfloat16* __restrict__ C,
     int M, int N, int K) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int g = lane >> 2;
@@ -132,4 +146,5 @@ extern "C" __global__ void fp8_gemm_mma(
                 C[(long long)(m0 + g + 8) * N + col + 1] = __float2bfloat16(acc[nb][3]);
         }
     }
+#endif
 }

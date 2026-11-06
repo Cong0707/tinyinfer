@@ -59,6 +59,7 @@ $rename = @{ "instances" = "marlin_fp4"; "repack" = "marlin_repack" }
 # powershell -File passes "-Only a,b,c" as one string; split it so both call styles work.
 $Only = @($Only | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 
+$script:failed = @()
 $files = Get-ChildItem $cuda -Recurse -Filter *.cu
 if ($Only.Count -gt 0) {
     $files = $files | Where-Object { $Only -contains $_.BaseName -or $Only -contains $rename[$_.BaseName] }
@@ -87,9 +88,15 @@ foreach ($f in $files) {
         # line and leaves only the summary count.
         $log = Join-Path $out ("_fail_" + $name + ".txt")
         $outTxt | Out-File -FilePath $log -Encoding utf8
-        $outTxt | Where-Object { $_ -match "error" } | Select-Object -First 12
-        Write-Output ("full log: " + $log)
-        throw "nvcc failed for $name"
+        $script:failed += $name
+        Write-Output ("{0,-20} FAILED  ({1})" -f $mod, $f.Directory.Name)
+        $outTxt | Where-Object { $_ -match "error" } | Select-Object -First 3
+        continue
     }
+    Remove-Item (Join-Path $out ("_fail_" + $name + ".txt")) -ErrorAction SilentlyContinue
     Write-Output ("{0,-20} {1,8} bytes  ({2})" -f $mod, (Get-Item $dst).Length, $f.Directory.Name)
+}
+if ($script:failed.Count -gt 0) {
+    Write-Output ("failed: " + ($script:failed -join ", "))
+    exit 1
 }
