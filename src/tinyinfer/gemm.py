@@ -336,8 +336,33 @@ def fp4_linear(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor,
             return rows[0] if len(rows) == 1 else torch.cat(rows, dim=0)
         except Exception:
             pass
+    # Prefill (M > 8). This used to hand off to the vendor's tilelang fp4_gemm; that
+    # code is external material and no longer lives in this repository, so the native
+    # tensor-core GEMM takes over. it needs M >= 128, which a prefill chunk satisfies.
+    if x.is_cuda and x.dim() == 2 and x.size(0) >= 128:
+        try:
+            from .kernels import mma_gemm
+
+            return mma_gemm.fp4_gemm_mma(x, w_fp4, w_scale)
+        except Exception:
+            pass
+    # Any remaining M: row by row on the native GEMV. This is the prefill path a short
+    # prompt takes (M in 9..127), and a chunk routes 1-2 rows per expert anyway, so the
+    # per-row form is what the shape actually wants. It is also the fallback that made
+    # dropping the vendor GEMM possible at all.
+    if x.is_cuda and x.dim() == 2:
+        from .deepseek import fp4_native
+
+        rows = [fp4_native.gemv_fp4_pq(*fp4_native.quantize_act(x[i:i + 1], x.size(-1)),
+                                       w_fp4, w_scale)
+                for i in range(x.size(0))]
+        return rows[0] if len(rows) == 1 else torch.cat(rows, dim=0)
     with _bf16_default():
         x_fp8, x_s = _act_quant(x, act_block, SCALE_FMT, SCALE_DTYPE)
+        if _k is None:
+            raise RuntimeError(
+                "fp4_linear: no path for this shape (not CUDA and the vendor reference "
+                f"kernel is gone): M={x.size(0)} K={w_fp4.shape[1] * 2} N={w_fp4.shape[0]}")
         out = _k.fp4_gemm(x_fp8, x_s, w_fp4, w_scale, SCALE_DTYPE, act_block_size=act_block)
     # same story as gemv_fp4._keep: the tilelang GEMM launches itself, so the allocator
     # has no record of the expert weights it is still reading

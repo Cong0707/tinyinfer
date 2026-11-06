@@ -168,11 +168,17 @@ so **0.0907 tok/s per GB/s** is the ceiling. Applied to the cards this engine ta
 
 | card | bandwidth | ceiling at 100% | measured here | achieved share |
 | --- | ---: | ---: | ---: | ---: |
-| RTX 2080 Ti | 616 GB/s | 55.9 tok/s | not measured | -- |
-| RTX 5060 Laptop (this box, 8 GB) | 384 GB/s | 34.8 tok/s | 1.26 tok/s | 3.6% |
-| RTX 5060 (desktop) | 448 GB/s | 40.7 tok/s | not measured | -- |
-| RTX 5090 (32 GB) | 1792 GB/s | 162.6 tok/s | not measured | -- |
-| RTX PRO 6000 Blackwell | 1792 GB/s | 162.6 tok/s | not measured | -- |
+| card | VRAM | bandwidth | ceiling at 100% | measured here | share |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| RTX 2080 Ti | 11 GB | 616 GB/s | 55.9 tok/s | not measured | -- |
+| RTX 5060 Laptop (this box) | 8 GB | 384 GB/s | 34.8 tok/s | 1.26 tok/s | 3.6% |
+| RTX 5060 desktop | 8 GB | 448 GB/s | 40.7 tok/s | not measured | -- |
+| RTX 5090 | 32 GB | 1792 GB/s | 162.6 tok/s | not measured | -- |
+| RTX PRO 6000 Blackwell | 96 GB | 1792 GB/s | 162.6 tok/s | not measured | -- |
+| H100 SXM | 80 GB | 3350 GB/s | 304.0 tok/s | not measured | -- |
+| H100 NVL | 94 GB | 3900 GB/s | 353.9 tok/s | not measured | -- |
+| H200 SXM / NVL | 141 GB | 4800 GB/s | 435.6 tok/s | not measured | -- |
+| B300 SXM | 288 GB | 8000 GB/s | 726.0 tok/s | not measured | -- |
 
 Two things follow, and the second is the important one.
 
