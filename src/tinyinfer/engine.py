@@ -332,8 +332,18 @@ class Engine:
                     # covers the build window. 1.6x left the pool too short for the slab
                     # itself (measured "slab unavailable" -> the per-tensor fallback, which
                     # then needed a bigger prefill workspace and OOM'd).
+                    # Reserve what the slab actually needs, not as much as the pool will
+                    # give: the old upper bound was (free - 192MB), so on a pool that is
+                    # both cache and slab the two reservations together could exceed it --
+                    # observed as cache 15.6GB + reserve 6.7GB against a 20.8GB pool, which
+                    # left the slab 0 bytes and pushed all 30 streamed layers onto the
+                    # per-tensor copy path (1167 DMAs per decode step, 458ms of GPU time).
                     _slab_reserve = min(int(_slab_need * 1.15) + (1 << 30),
                                         max(0, self.host_pool.free - 192 * (1 << 20)))
+                    # whatever the cache does not claim must stay free for the slab
+                    if self.host_pool is not None:
+                        _slab_reserve = min(_slab_reserve,
+                                            max(0, self.host_pool.free - (192 << 20)))
                 _cache_pool = None
                 _cache_bytes = max(192 << 20, int(_plan_cache))
                 _ov = __import__("os").environ.get("TI_CACHE_GB")
@@ -367,7 +377,18 @@ class Engine:
                     # the slab 8 of 30 layers and decode sits at 519ms/step with 88% hit;
                     # 12GB lets the slab cover every streamed layer. TI_CACHE_CAP_GB
                     # exposes the split.
-                    _cap_gb = float(__import__("os").environ.get("TI_CACHE_CAP_GB", "16"))
+                    # 12, not 16. Measured sweep on this box (8GB VRAM, 47GB RAM):
+                    #   cap=16  814 ms   0/30 layers on the slab
+                    #   cap=12  784 ms   4/30
+                    #   cap=10  785 ms  14/30
+                    #   cap= 8  825 ms  24/30   (cache starts missing too often)
+                    #   cap= 6 1059 ms    all
+                    #   cap= 4 1222 ms    all
+                    # The slab ends the per-tensor copy path (1167 DMAs -> one per layer
+                    # per step) but the cache prevents reads, so there is an interior
+                    # optimum; 12 and 10 tie, and 12 leaves more of the pool free for the
+                    # layer weights the build has not read yet.
+                    _cap_gb = float(__import__("os").environ.get("TI_CACHE_CAP_GB", "12"))
                     _pool_avail = min(_pool_avail, int(_cap_gb * (1 << 30)))
                     _cache_bytes = min(_ov_bytes, _pool_avail) if _ov_bytes else _pool_avail
                     _slot = self.host_pool.alloc(_cache_bytes)
