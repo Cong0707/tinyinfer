@@ -145,3 +145,50 @@ are both hardware:
                                (see docs/vs-vllm.md for the per-size measurement)
 
 Neither is a software problem. Everything above was measured trying to find one anyway.
+
+## Bandwidth efficiency, not tokens per second
+
+`tok/s` is a property of the box, not of the engine: the same kernel that runs at 1.26
+tok/s on a 384 GB/s laptop part runs 5x faster on a 1792 GB/s desktop card with nothing
+about the code changed. The scale-free statement is how much of the available memory
+bandwidth the engine converts into tokens.
+
+Both derive from one number -- the bytes a token must move:
+
+    time_per_token = bytes_per_token / achieved_bandwidth
+    tok/s per GB/s = 1 / bytes_per_token[GB]
+
+For this model (475.3 GB, 40 layers, topk 6 of 384 experts):
+
+    routed experts      240 x 18.8 MB  = 4.51 GB
+    non-expert weights   40 layers     = 6.51 GB
+    total                              = 11.02 GB per token
+
+so **0.0907 tok/s per GB/s** is the ceiling. Applied to the cards this engine targets:
+
+| card | bandwidth | ceiling at 100% | measured here | achieved share |
+| --- | ---: | ---: | ---: | ---: |
+| RTX 2080 Ti | 616 GB/s | 55.9 tok/s | not measured | -- |
+| RTX 5060 Laptop (this box, 8 GB) | 384 GB/s | 34.8 tok/s | 1.26 tok/s | 3.6% |
+| RTX 5060 (desktop) | 448 GB/s | 40.7 tok/s | not measured | -- |
+| RTX 5090 (32 GB) | 1792 GB/s | 162.6 tok/s | not measured | -- |
+| RTX PRO 6000 Blackwell | 1792 GB/s | 162.6 tok/s | not measured | -- |
+
+Two things follow, and the second is the important one.
+
+**300 tok/s is out of reach on one card.** It needs 300 x 11.02 = 3307 GB/s; nothing in
+that table exceeds 1792, so the fastest card listed caps at 162.6 tok/s even at perfect
+bandwidth utilisation.
+
+**The 8 GB box sits at 3.6% of its ceiling, and that number is not a kernel verdict.**
+Those 11.02 GB do not live in this device's HBM: 4.51 GB of experts comes from disk and
+the 30 streamed layers cross PCIe every token. `perf_counter` around the calls gives
+memcpy 421.9 ms against 96.2 ms of kernels, so the compute that does run on-device moves
+11.02 GB in 96.2 ms = 114 GB/s, which is **30% of the 384 GB/s** -- the same order as the
+vLLM kernels this was ported from.
+
+The honest way to read a new card is therefore: its bandwidth times 0.0907 for the
+ceiling, then times whatever share of that bandwidth the kernels actually convert. Today
+the second factor is about 0.30 on device-resident work and much lower end-to-end,
+because the machine -- not the engine -- is moving most of the bytes.
+
