@@ -21,7 +21,7 @@
 跑一遍验证：
 
 ```
-python scripts/check_kernels.py              # 78 个 kernel 一致性用例
+python scripts/check_kernels.py              # 89 个 kernel 一致性用例
 python -m pytest tests -q --ignore=tests/test_server.py   # 50 个
 python -c "import sys; sys.path.insert(0,'src'); from tinyinfer.loading import selftest; assert selftest()"
 python scripts/predict.py --model <dir>      # 各档显卡的规划表

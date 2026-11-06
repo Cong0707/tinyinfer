@@ -88,7 +88,7 @@ keying, and needs a fix that does not also drop the fused path.)
 
     python -m pytest tests -q --ignore=tests/test_server.py   # 50 cases
     python -c "import sys; sys.path.insert(0,'src'); from tinyinfer.loading import selftest; assert selftest()"
-    python scripts/check_kernels.py                          # 78 conformance cases
+    python scripts/check_kernels.py                          # 89 conformance cases
     python scripts/predict.py --model <dir>                  # planner table
 
 The decode reference is `scripts/bench.py`; run it standalone, not inside another
