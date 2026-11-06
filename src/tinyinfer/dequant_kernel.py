@@ -11,10 +11,11 @@ def dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     if I % 32 or O % 32:
         raise ValueError(f'dequant_fp8 needs O%32==0 and I%32==0, got O={O} I={I}')
     out = torch.empty((O, I), dtype=torch.bfloat16, device=weight.device)
-    # grid: x covers I in 16-element steps (256 threads), y covers O in 8-row tiles
-    # 32x8 = 256 threads: 32 lanes cover 512 of I in 16-element steps, 8 rows of O
-    grid = ((((I // 16) + 31) // 32), (O + 7) // 8)
-    b = native.bind('dequant_fp8', 'dequant_fp8', grid, (32, 8), 'TTOii')
+    # One thread per 32-element scale block; the kernel strides over blocks itself, so the
+    # grid only needs enough blocks to fill the SMs.
+    blocks = O * (I // 32)
+    grid = (min(4096, (blocks + 255) // 256),)
+    b = native.bind('dequant_fp8', 'dequant_fp8', grid, (256,), 'TTOii')
     b(weight.view(torch.uint8), scale.view(torch.uint8), out, int(O), int(I),
       stream=None)
     return out
