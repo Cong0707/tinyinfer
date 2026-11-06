@@ -109,6 +109,34 @@ MoE    专家按 id % world 分给各卡，shared expert 只在 rank 0，
 是否切 `wo_a`，而存下来的权重永远是 2 维 —— 于是 `wo_a` 从来没被切过、`wo_b` 却被
 切了，单卡测不出来，`tp>1` 直接形状不匹配。
 
+## 多卡：一个已修、一个未完成
+
+**已修**：`wo_a`/`wo_b` 的切分（见上）。
+
+**未完成**：EP 的驱动层。`moe.py` 的归约逻辑是完整的 ——
+
+```python
+_bucket = getattr(self, "_ep_partials", None)
+if _world > 1 and _bucket is not None:
+    _bucket.append(y)
+if _bucket:
+    y = reduce_partials(list(_bucket), ...)
+```
+
+但 `_ep_partials` 在整个仓库里**没有任何地方被创建**。注释说它「is filled by the caller
+that drives the per-rank passes」—— 那个 caller 不存在。
+
+后果：`ep_world > 1` 时 `_bucket` 恒为 None，归约被跳过，每层只返回**本 rank 拥有的
+那部分专家**的结果（`active` 已经被 `i % world == rank` 过滤），其余 rank 的专家被
+静默丢弃。单卡 `ep_world == 1` 不受影响，所以本机永远测不出来。
+
+要补上它需要：在一个进程内对每个 rank 各跑一遍该层的 `ffn.forward`（每次把
+`ffn.ep_rank` 设成对应值、把激活送到那张卡、把该 rank 的专家结果收集回来），最后
+`reduce_partials` 求和。涉及的跨卡激活复制和专家存储寻址目前也没有现成路径，所以这
+是一个待实现的功能，不是一行修补。
+
+**在那之前 `ep_world > 1` 不可用。** 多卡部署要么先用 TP-only（`tp.py` 那条路，已修
+切分），要么先把这段补完。
 ## 跨硬件的两处分歧（未修复，需要知道）
 
 1. `expert_slots == 0`（8 GB 这类卡）decode 走 fused w4a8；有槽位的卡走 Marlin w4a16。
