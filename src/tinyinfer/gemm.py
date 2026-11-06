@@ -287,17 +287,6 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
 
 def fp4_linear(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor, act_block: int = 32) -> torch.Tensor:
     """C = x @ w_fp4.T with fp8 activation quant, fp4 weight (official kernel path)."""
-    # vLLM's Marlin streams the expert weights at 284 GB/s on this card where the
-    # hand-written GEMV manages 59 -- it is the same matrix, decoded in ldmatrix
-    # fragments off a four-stage cp.async pipeline instead of by scalar loads. Route
-    # the small-M case there and keep the fp8 path as the fallback.
-    if x.is_cuda and x.dim() == 2 and 0 < x.size(0) <= 8:
-        try:
-            from .deepseek.gemv_fp4_marlin import gemv_fp4_fast as _marlin_gemv
-
-            return _marlin_gemv(x, w_fp4, w_scale)
-        except Exception:
-            pass
     if x.dim() == 2 and 0 < x.size(0) <= 8 and x.is_cuda:
         # Native first: fp4_native is our own w4a8 kernel (fp8 activation x fp4 weight),
         # which is the arithmetic the checkpoints define. gemv_fp4 is the tilelang one and

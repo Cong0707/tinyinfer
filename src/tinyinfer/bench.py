@@ -115,7 +115,13 @@ def main() -> None:
         "first_forward_s": round(first_s, 2),
         "warm_prefill_s": round(warm_prefill_s, 2),
         "decode_step_s": [round(s, 3) for s in steps],
-        "decode_tok_per_s": round(1.0 / (sum(steps) / max(1, len(steps))), 3),
+        # Two numbers, because averaging over the cold step is misleading: the first
+        # decode forward pays for the ring buffers and the expert cache coming up, and
+        # measured 2.0s against a 1.2s steady state on this box. Reporting only the mean
+        # gave 0.752 tok/s where the engine actually sustains 0.83+.
+        "decode_tok_per_s_mean": round(1.0 / (sum(steps) / max(1, len(steps))), 3),
+        "decode_tok_per_s_steady": round(1.0 / (sum(steps[1:]) / max(1, len(steps) - 1)), 3)
+        if len(steps) > 1 else None,
         "expert_cache_hit": None if hit is None else round(hit, 3),
         "expert_cache_entries": entries,
         "disk_gb_s": round(_disk_rate(args.model), 2),
