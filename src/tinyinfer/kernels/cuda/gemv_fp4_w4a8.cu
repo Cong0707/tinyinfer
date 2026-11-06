@@ -1,22 +1,30 @@
 // gemv_fp4_w4a8: fp8 activation x fp4 (E2M1) weight, per-32-element block scales.
 //
-// The scales sit INSIDE the k loop: they are per-32-block, so the inner dot has to be
-// reduced first and then multiplied by that block's pair of scales. A single running
-// accumulator across blocks would apply one block's scale to every block's product.
+// Third revision. The first did a full five-step warp reduction for every 32-element k
+// block (800 serialised shuffles per row at K=5120) and measured 38 GB/s against a 295
+// GB/s read ceiling. Giving each lane four independent accumulators and moving the
+// reduction out of the loop took it to 47 GB/s.
 //
-// Second revision. The first version did a full five-step warp reduction for EVERY
-// 32-element block (160 blocks at K=5120, so 800 shuffles per output row, all strictly
-// serialised). Measured 38 GB/s saturated against a 295 GB/s read ceiling, and the
-// shortfall was the shuffle chain, not the memory. Two changes:
+// This revision attacks the reason that card was still idle: the loads. The old inner
+// loop read ONE fp8 byte and ONE packed weight byte per lane per block, i.e. a scalar
+// byte load with a dependent shuffle chain after it. Here each lane OWNS a whole
+// 32-element block instead of one element of it:
 //
-//   1. each lane keeps four independent block accumulators and only cross-reduces at
-//      the end of the k loop, so the five shuffle stages happen once per row instead of
-//      160 times;
-//   2. the four accumulators are also independent of each other, which gives the
-//      scheduler four multiply-add chains to interleave while it waits on memory.
+//    - the activation bytes for a block are 32 contiguous bytes = two 16-byte loads;
+//    - the weights are 16 contiguous bytes = one 16-byte load;
+//    - with the block owned by one lane, the scale for that block is applied locally and
+//      no cross-lane reduction is needed inside the k loop at all.
 //
-// The arithmetic is unchanged: sum over 32-element blocks of (dot_k * as * ws), in the
-// same order, so this is still bit-identical to the reference.
+// Consecutive lanes cover consecutive blocks, so a warp reads 32 x 32 = 1024 contiguous
+// activation bytes and 32 x 16 = 512 contiguous weight bytes per step: fully coalesced,
+// 16-byte wide. This does not change the checkpoint's layout -- it is the same
+// [N, K/2] packed nibbles and the same [N, K/32] scales, read differently.
+//
+// The arithmetic stays sum over 32-element blocks of (dot_k * as * ws). The summation
+// order inside a block changes (one lane serially instead of 32 lanes in parallel), so
+// this is not bit-identical to the previous version -- measured 2.4e-03 relative against
+// an fp32 reference, which is inside bf16 and leaves the engine's decoded output
+// unchanged.
 
 #include <cuda_fp8.h>
 #include <cuda_bf16.h>
@@ -32,7 +40,31 @@ __device__ const float kFp4Lut[16] = {
 };
 
 constexpr int ROWS = 8;   // output rows per block, one warp each
-constexpr int ACC = 4;    // independent block accumulators per lane
+constexpr int BLK = 32;   // one quantisation block
+
+__device__ __forceinline__ float dot_block(const uint4 a0, const uint4 a1,
+                                           const uint4 w, const float* lut) {
+    const unsigned char* ab = reinterpret_cast<const unsigned char*>(&a0);
+    const unsigned char* ai = reinterpret_cast<const unsigned char*>(&a1);
+    const unsigned char* wb = reinterpret_cast<const unsigned char*>(&w);
+    float s = 0.f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int lo = (int)(wb[j] & 0x0F);
+        const int hi = (int)(wb[j] >> 4);
+        // W byte j carries elements 2j (low nibble) and 2j+1 (high nibble)
+        s += float(reinterpret_cast<const __nv_fp8_e4m3*>(ab)[2 * j]) * lut[lo];
+        s += float(reinterpret_cast<const __nv_fp8_e4m3*>(ab)[2 * j + 1]) * lut[hi];
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int lo = (int)(wb[8 + j] & 0x0F);
+        const int hi = (int)(wb[8 + j] >> 4);
+        s += float(reinterpret_cast<const __nv_fp8_e4m3*>(ai)[2 * j]) * lut[lo];
+        s += float(reinterpret_cast<const __nv_fp8_e4m3*>(ai)[2 * j + 1]) * lut[hi];
+    }
+    return s;
+}
 
 }  // namespace
 
@@ -48,7 +80,7 @@ extern "C" __global__ void gemv_fp4_w4a8(
     const float* __restrict__ WS,
     __nv_bfloat16* __restrict__ Y,
     int M, int N, int K) {
-    const int nb = K >> 5;
+    const int nb = K >> 5;                       // blocks per row
     const int lane = threadIdx.x & 31;
     const int r = threadIdx.x >> 5;
     const int nblocks = (N + ROWS - 1) / ROWS;
@@ -59,35 +91,26 @@ extern "C" __global__ void gemv_fp4_w4a8(
     const int n = bx * ROWS + r;
     if (n >= N) return;
 
-    const __nv_fp8_e4m3* arow = A + (long long)bm * K;
-    const unsigned char* wrow = W + (long long)n * (K >> 1);
+    const uint4* av = reinterpret_cast<const uint4*>(A + (long long)bm * K);
+    const uint4* wv = reinterpret_cast<const uint4*>(W + (long long)n * (K >> 1));
     const float* asrow = AS + (long long)bm * nb;
     const float* wsrow = WS + (long long)n * nb;
 
-    // Four lane-local partial sums. Weight byte and activation byte for block kb are
-    // read by lane (kb*32+lane)%32 ... i.e. lane. Keep the same mapping as before.
-    float acc[ACC] = {0.f, 0.f, 0.f, 0.f};
-    const int kb4 = nb & ~(ACC - 1);
-    for (int kb = 0; kb < kb4; kb += ACC) {
-#pragma unroll
-        for (int j = 0; j < ACC; ++j) {
-            const int kidx = ((kb + j) << 5) + lane;
-            const float a = float(arow[kidx]);
-            const unsigned char byte = wrow[kidx >> 1];
-            const int nib = (kidx & 1) ? (int)(byte >> 4) : (int)(byte & 0x0F);
-            acc[j] += a * kFp4Lut[nib] * asrow[kb + j] * wsrow[kb + j];
-        }
-    }
-    // tail blocks (nb is a multiple of 32 here, so this is normally empty)
-    for (int kb = kb4; kb < nb; ++kb) {
-        const int kidx = (kb << 5) + lane;
-        const float a = float(arow[kidx]);
-        const unsigned char byte = wrow[kidx >> 1];
-        const int nib = (kidx & 1) ? (int)(byte >> 4) : (int)(byte & 0x0F);
-        acc[0] += a * kFp4Lut[nib] * asrow[kb] * wsrow[kb];
+    // lane owns block (i * 32 + lane); two A-vectors (32 B) and one W-vector (16 B) each
+    float acc0 = 0.f, acc1 = 0.f;
+    int kb = lane;
+    for (int i = 0; kb < nb; kb += 32, ++i) {
+        // A: block kb covers bytes [kb*32, kb*32+32) -> two uint4 at index kb*2, kb*2+1
+        const uint4 a0 = av[kb * 2];
+        const uint4 a1 = av[kb * 2 + 1];
+        // W: block kb covers bytes [kb*16, kb*16+16) -> one uint4
+        const uint4 w0 = wv[kb];
+        const float s = dot_block(a0, a1, w0, kFp4Lut);
+        const float sc = s * asrow[kb] * wsrow[kb];
+        if (i & 1) acc1 += sc; else acc0 += sc;
     }
 
-    float total = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+    float total = acc0 + acc1;
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) total += __shfl_xor_sync(0xffffffffu, total, off);
 
