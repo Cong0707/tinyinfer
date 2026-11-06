@@ -24,8 +24,26 @@ ms), so it stays on. Thread count is saturated at 8: 8/16/32 readers give 2.88/2
 GB/s. A naive test that reads the same files twice measures 5.03 GB/s -- that is the OS
 page cache, not the disk.
 
-**Cache hit rate: 52.5% is the ceiling.** Simulated over 12 decode steps (2880 expert
-visits) with a perfect LRU:
+**Cache hit rate: measured curve, and 16 GB is the right place to stop.** Real tokens,
+eight generated steps, from an empty cache, identical output at every size:
+
+    TI_CACHE_GB   hit rate   disk GB   marginal
+     2            0.118       79.23
+     4            0.235       72.40    +5.8 pp/GB, -3.41 GB disk/GB
+     8            0.484       55.88    +6.2 pp/GB, -4.13 GB disk/GB
+    16            0.683       38.07    +2.5 pp/GB, -2.23 GB disk/GB
+    24            0.685       37.96    +0.0 pp/GB, -0.01 GB disk/GB
+
+16 GB is the default and it is where returns collapse; 24 GB buys 39 more entries and
+0.2 points while taking 8 GB away from the streaming slab. Note that 8 GB of cache holds
+3% of the 15360 experts yet gets 48% of visits -- the routing distribution is far more
+head-heavy than uniform, which is why the curve is so steep at the bottom.
+
+The perfect-LRU simulation below is what an earlier version of this file used; it is kept
+because it shows the ceiling the policy is measured against, but the real ARC policy beats
+it (68.3% against 65.3% at equal capacity), so the measured row above is the one to quote.
+
+Simulated over 12 decode steps (2880 expert visits) with a perfect LRU:
 
     cap=  400 ( 7.3 GB): 31.7%
     cap=  862 (15.8 GB): 49.3%    <- the current plan
