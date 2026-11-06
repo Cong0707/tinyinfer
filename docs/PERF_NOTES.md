@@ -88,6 +88,27 @@ nvcc 默认的 FMA 收缩会悄悄改掉结果。`hc_split.cu` 就是这么做�
   所以 decode 留在 GEMV。默认仍由 `TI_MMA_GEMM=1` 显式打开，因为 prefill 走 mma
   会改变解码出的 token。
 
+## 多卡布局（照 vLLM 的 TP + EP）
+
+attention 是 TP（每卡持有部分 head），MoE 是 EP（每卡持有部分专家，输出相加）：
+
+```
+wq_a   column-parallel  [dim -> q_lora_rank]          每卡一段输出
+wq_b   column-parallel  [q_lora -> n_local_heads]     n_local_heads = n_heads / world
+wo_a   column-parallel  [o_groups, o_lora_rank]       每卡一组内的 o_lora 切片
+wo_b   row-parallel     [o_groups*o_lora_rank -> dim] + all_reduce
+wkv    复制（只有一个 KV head，切了就要换 attention 布局）
+MoE    专家按 id % world 分给各卡，shared expert 只在 rank 0，
+       输出进 _ep_partials 由驱动层求和（ep.reduce_partials）
+```
+
+**这里的坑：`wo_a` 存的是 2 维 `[o_groups*o_lora_rank, dim]`，`o_groups` 是慢变维、
+`o_lora_rank` 是组内快变维。** 所以切 o_lora 不能写成 `w[:, lo:hi]`（那是取每组的
+前 k 个），必须 reshape 成 `[groups, per, rest]` 再切。`tp.shard_grouped` 就是干这个
+的，两个 attention 类都用它。之前 `_shard_for_tp` 用一个 `w.dim() == 3` 的守卫来决定
+是否切 `wo_a`，而存下来的权重永远是 2 维 —— 于是 `wo_a` 从来没被切过、`wo_b` 却被
+切了，单卡测不出来，`tp>1` 直接形状不匹配。
+
 ## 跨硬件的两处分歧（未修复，需要知道）
 
 1. `expert_slots == 0`（8 GB 这类卡）decode 走 fused w4a8；有槽位的卡走 Marlin w4a16。
