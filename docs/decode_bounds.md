@@ -37,6 +37,14 @@ about 6% of a token, for 11.7 GB more RAM on a 47.2 GB box. The ceiling comes fr
 model's routing, not the implementation: 15360 experts exist, a token touches 240 of them,
 and the chance the next token touches the same ones is what it is.
 
+**The load shape matters and this table is the pessimistic one.** Feeding twelve
+consecutive token ids (500, 501, ...) instead of tokens the model chose for itself moves
+the same measurement from 49% to 74%, because adjacent ids produce similar hidden states
+and therefore correlated routing. Real decoding looks like the model choosing, so 49-52%
+is the number to quote; 74% is an artefact of a synthetic input. For what it is worth, on
+the correlated load ARC measures 72.9% against a perfect-LRU 65.3% at equal capacity, so
+the adaptive policy is doing better than the textbook one.
+
 **Launch overhead: 6.1 ms, already at the driver floor.** 370 launches per token at
 16.5 us each is cuLaunchKernel itself -- measured by timing submissions without
 synchronising. Even reducing launch count to zero (impossible) would only buy 18%.
