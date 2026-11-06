@@ -847,6 +847,19 @@ class Engine:
         if self.pool is None or not self.devices or len(self.devices) < 2:
             self._ep_route = None
             return None
+        # EP is off unless asked for, because the half of it that makes it correct is not
+        # implemented. `MoE.forward` narrows `active` to the experts this rank owns
+        # (`i % ep_world == ep_rank`) and relies on a driver that runs every rank and sums
+        # the partials through `_ep_partials` -- and nothing in the tree creates that
+        # bucket, nor can it: ExpertStore.fetch_async has no device argument, so a rank's
+        # experts always land on the one card the layer lives on, and there is no way to
+        # compute another card's share. Enabling it therefore computes half the experts
+        # and silently drops the rest, which is worse than not using it: with EP off every
+        # layer computes all six experts and the result is correct, it just costs the
+        # duplicate weights. Turn it on only once a per-rank driver exists.
+        if __import__("os").environ.get("TI_EP") != "1":
+            self._ep_route = None
+            return None
         try:
             from .ep import ExpertRoute
 
@@ -857,6 +870,10 @@ class Engine:
             route = ExpertRoute(n, [f"cuda:{d.index}" for d in self.devices], caps)
             self._ep_route = route
             print(f"[tinyinfer] {route.summary()}", flush=True)
+            print("[tinyinfer] WARNING: TI_EP=1 forces expert parallelism, but the per-rank "
+                  "driver is not implemented -- each layer will compute only its own "
+                  "rank's experts and the rest are dropped. Output WILL be wrong.",
+                  flush=True)
             return route
         except Exception as exc:
             print(f"[tinyinfer] expert-parallel routing skipped ({exc!r})", flush=True)
