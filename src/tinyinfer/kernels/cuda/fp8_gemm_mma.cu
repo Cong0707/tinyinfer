@@ -80,13 +80,36 @@ extern "C" __global__ void fp8_gemm_mma(
 
     const int m0 = blockIdx.y * BLOCK_M + warp * WARP_M;
     const int n0 = blockIdx.x * (WARP_N * NB);
-    if (m0 >= M) return;
+    // No early return: the loop below has a __syncthreads, and a warp that bailed out of
+    // it deadlocks the block. Out-of-range work is masked instead.
+    const bool warp_active = (m0 < M);
 
     const int nb_k = K >> 5;
+    const int ncol = WARP_N * NB;          // columns this block owns
+
+    // All BLOCK_M rows of a block read the SAME weight columns: the warps are stacked
+    // along M, so before this staging each of the 8 warps fetched the block's weight tile
+    // from global on its own, 8x the necessary traffic. One tile is ncol x 32 bytes =
+    // 1 KB, small enough to double-buffer and keep the next k-block's fetch in flight.
+    __shared__ __align__(16) uint8_t sB[2][WARP_N * NB * 32];
+
+#define TI_STAGE_B(ST, KB)                                                       \
+    do {                                                                         \
+        const int _kb = (KB) << 5;                                               \
+        for (int t = threadIdx.x; t < ncol * 8; t += blockDim.x) {               \
+            const int _col = t >> 3;                                             \
+            const int _off = (t & 7) << 2;                                       \
+            const int _n = n0 + _col;                                            \
+            const uint32_t _v = (_n < N)                                          \
+                ? *(const uint32_t*)(B + (long long)_n * K + _kb + _off)         \
+                : 0u;                                                            \
+            *(uint32_t*)(sB[ST] + _col * 32 + _off) = _v;                         \
+        }                                                                        \
+    } while (0)
 
     // start a little clear of the end so __shfl and the writes stay in range
-    const bool rows_lo = (m0 + g) < M;
-    const bool rows_hi = (m0 + g + 8) < M;
+    const bool rows_lo = warp_active && (m0 + g) < M;
+    const bool rows_hi = warp_active && (m0 + g + 8) < M;
 
     float acc[NB][4];
 #pragma unroll
@@ -94,7 +117,11 @@ extern "C" __global__ void fp8_gemm_mma(
 #pragma unroll
         for (int j = 0; j < 4; ++j) acc[i][j] = 0.f;
 
+    int cur = 0;
+    TI_STAGE_B(0, 0);
     for (int kb = 0; kb < nb_k; ++kb) {
+        __syncthreads();                       // sB[cur] is ready for every warp
+        if (kb + 1 < nb_k) TI_STAGE_B(1 - cur, kb + 1);
         const int kbase = kb << 5;
 
         uint32_t a[4];
@@ -113,22 +140,24 @@ extern "C" __global__ void fp8_gemm_mma(
 #pragma unroll
         for (int nb = 0; nb < NB; ++nb) {
             const int n = n0 + nb * WARP_N + g;
-            if (n >= N) continue;
+            // every lane must reach the mma; a column past N was staged as zero
+            const uint32_t* sp =
+                reinterpret_cast<const uint32_t*>(sB[cur] + (nb * WARP_N + g) * 32);
             uint32_t b[2];
-            b[0] = *(const uint32_t*)(B + (long long)n * K + kbase + q * 4);
-            b[1] = *(const uint32_t*)(B + (long long)n * K + kbase + q * 4 + 16);
+            b[0] = sp[q];
+            b[1] = sp[q + 4];
 
             float d[4];
             mma_m16n8k32(d, a, b);
 
-            // scale for this block; bs is per 32 columns, and this lane's columns
-            // are q*2 and q*2+1, which always fall in the same 32-group
-            const float bs_n = e8m0_val(BS[(long long)(n >> 5) * nb_k + kb]);
+            const float bs_n = (n < N)
+                ? e8m0_val(BS[(long long)(n >> 5) * nb_k + kb]) : 0.f;
             acc[nb][0] += d[0] * as_lo * bs_n;
             acc[nb][1] += d[1] * as_lo * bs_n;
             acc[nb][2] += d[2] * as_hi * bs_n;
             acc[nb][3] += d[3] * as_hi * bs_n;
         }
+        cur ^= 1;
     }
 
 #pragma unroll
