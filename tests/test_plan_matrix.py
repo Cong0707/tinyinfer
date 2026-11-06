@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "tools" / "plan_matrix.py"
+SCRIPT = ROOT / "scripts" / "plan_matrix.py"
 
 
 def test_matrix_json_is_well_formed():

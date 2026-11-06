@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-EX = ROOT / "examples"
+EX = ROOT / "scripts" / "examples"
 
 
 def _load(name: str):
