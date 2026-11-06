@@ -21,19 +21,17 @@ _ops_mod = None
 
 
 def _ops():
-    """Import the vendored vLLM extension lazily so the engine still runs without it."""
+    """The vendored extension used to be probed here; it has moved out of the repo.
+
+    Every kernel this module needs (marlin_fp4, marlin_repack, marlin_prep_scales) is
+    built from kernels/cuda/marlin/ and launched through native.py, so there is nothing
+    to import. Kept as a function because available() reports on it.
+    """
     global _ops_mod
     if _ops_mod is None:
-        last = None
-        for mod in ("tinyinfer._C_stable_libtorch", "vllm._C_stable_libtorch"):
-            try:
-                __import__(mod)  # registers torch.ops._C
-                _ops_mod = torch.ops._C
-                break
-            except Exception as exc:  # pragma: no cover - depends on the install
-                last = exc
-        if _ops_mod is None:
-            raise last if last is not None else RuntimeError("vLLM extension unavailable")
+        raise RuntimeError(
+            "the vendored vLLM extension is no longer shipped; the native Marlin "
+            "kernels in kernels/cuda/marlin/ are the only path")
     return _ops_mod
 
 

@@ -1,4 +1,4 @@
-﻿"""vLLM-derived kernels, ported into native/ and called through the driver API.
+"""vLLM-derived kernels, ported into native/ and called through the driver API.
 
 These are ports, not calls into vLLM's binary. Each one's source lives in
 src/tinyinfer/native/vllm_*.cu with its upstream file and the changes noted at the
@@ -80,14 +80,12 @@ def _ops():
         # this file) so the engine does not depend on the vllm Python package being
         # installed. torch must be imported first: its __init__ registers the DLL
         # search directories the extension needs on Windows.
+        # The vendored pyd used to be probed here as a fallback. It is external build
+        # output (36MB of vLLM's compiled extension) and has moved out of this
+        # repository, so there is nothing to probe: every kernel this module exposes is
+        # ported into kernels/cuda/ and launched through native.py. The function stays
+        # because callers ask whether the pyd is present, and "no" is now the answer.
         _OPS = None
-        for mod in ("tinyinfer._C_stable_libtorch", "vllm._C_stable_libtorch"):
-            try:
-                __import__(mod)
-                _OPS = torch.ops._C
-                break
-            except Exception:
-                continue
     return _OPS
 
 
