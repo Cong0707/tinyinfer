@@ -154,7 +154,7 @@ def act(gu: torch.Tensor, w_exp: torch.Tensor, limit: float = 0.0):
         fn = native.BoundLaunch(_kernel("moe_act6"),
                                 ((n + 255) // 256, n_exp, 1), (256,), "TOTifi")
         _BOUND[key] = fn
-    fn(gu, w_exp.contiguous(), out, n, float(limit), n_exp, stream=0)
+    fn(gu, w_exp.contiguous(), out, n, float(limit), n_exp, stream=None)
     return out
 
 
@@ -180,7 +180,7 @@ def act_quant(gu: torch.Tensor, w_exp: torch.Tensor, limit: float = 0.0):
         fn = native.BoundLaunch(_kernel("moe_act_q6"),
                                 (n // 32, n_exp, 1), (32,), "TOTOifi")
         _BOUND[key] = fn
-    fn(gu, w_exp.contiguous(), aq, asc, n, float(limit), n_exp, stream=0)
+    fn(gu, w_exp.contiguous(), aq, asc, n, float(limit), n_exp, stream=None)
     return aq.view(torch.float8_e4m3fn), asc.view(torch.float8_e8m0fnu)
 
 

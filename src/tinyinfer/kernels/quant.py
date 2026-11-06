@@ -49,7 +49,7 @@ def _launch(x: torch.Tensor, out, scale, entry: str) -> None:
         _BOUND[key] = fn
     # 1e-4 is the reference's floor (official_kernel_ref: T.max(amax, 1e-4)); using 1e-8
     # changed the decode output on real weights.
-    fn(x, out, scale, int(n), int(k), 1e-4)
+    fn(x, out, scale, int(n), int(k), 1e-4, stream=None)
 
 
 def act_quant(x: torch.Tensor, block_size: int = 128, scale_fmt=None,

@@ -46,6 +46,9 @@ def _sinkhorn_host(mixes, hc_scale, hc_base, hc_mult, iters, eps):
     return pre, post, comb
 
 
+_BOUND: dict = {}
+
+
 def _native_sinkhorn(mixes, hc_scale, hc_base, hc_mult, iters, eps):
     """pre/post on the device, the hc x hc Sinkhorn in the hand-written kernel."""
     from ..kernels import native
@@ -58,9 +61,16 @@ def _native_sinkhorn(mixes, hc_scale, hc_base, hc_mult, iters, eps):
             + hc_base[2 * hc:].view(hc, hc)).contiguous()
     out = torch.empty_like(comb)
     n = int(b * s)
-    fn = native.kernel("sinkhorn", "sinkhorn_hc")
-    native.launch(fn, ((n + 63) // 64,), (64,),
-                  [comb, out, n, hc, int(iters), float(eps)])
+    # Bound launcher: sinkhorn_hc runs twice per layer (80 times per decode step) and the
+    # generic launch path charges ~19 us of argument marshalling for a kernel that does a
+    # 4x4 normalisation loop. Keyed on the geometry, which only depends on the batch shape.
+    key = ("sinkhorn_hc", n, hc)
+    fn = _BOUND.get(key)
+    if fn is None:
+        fn = native.BoundLaunch(native.kernel("sinkhorn", "sinkhorn_hc"),
+                                ((n + 63) // 64,), (64,), "TOiiif")
+        _BOUND[key] = fn
+    fn(comb, out, n, hc, int(iters), float(eps), stream=None)
     return pre, post, out
 
 
