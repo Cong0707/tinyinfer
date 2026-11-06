@@ -91,6 +91,17 @@ def register(report) -> None:
     except Exception as exc:
         report.add(Case('moe_gemv act', f'raised {exc!r}', False))
 
+    # --- acc: y += sum over experts; dst is FP32 (the kernel accumulates in fp32) ---
+    try:
+        src_rows = torch.randn(n_exp, n, dtype=torch.bfloat16, device='cuda')
+        y0 = torch.randn(n, dtype=torch.float32, device='cuda')
+        y = y0.clone()
+        moe_gemv.acc(src_rows, y, n_exp)
+        want_acc = y0 + src_rows.float().sum(0)
+        check_close(report, 'moe_gemv acc', y, want_acc, rtol=2e-2)
+    except Exception as exc:
+        report.add(Case('moe_gemv acc', f'raised {exc!r}', False))
+
     # --- act_quant: the same, then block-32 fp8 quantisation in the same launch ---
     try:
         q, s = moe_gemv.act_quant(gu, we, limit)
