@@ -21,6 +21,11 @@ from ..config import TinyConfig
 from ..quant import dequant_fp4_block, dequant_fp8_block
 from ..weights import ShardStore
 
+# Diagnostic switch for expert parallelism, read once: the per-layer printout below is
+# useful while EP is being finished but must cost nothing on a normal run (a getenv per
+# forward would be a syscall per layer).
+_EP_DBG = __import__("os").environ.get("TI_EP_DBG") == "1"
+
 # Bound launchers for swiglu_scale, keyed by element count (the grid depends on it).
 _SWIGLU_BOUND: dict = {}
 
@@ -533,6 +538,12 @@ class MoE:
                     _wsum[_e] = weights[0, _cols[0]].view(1, 1)
                 else:
                     _wsum[_e] = weights[0][_cols].sum().view(1, 1)
+
+        if _EP_DBG:
+            print(f"[epdbg] rank={_rank}/{_world} active={active} "
+                  f"route={_route} groups={dict(_groups)} "
+                  f"wsum={{{', '.join(f'{k}: {float(v):.4f}' for k, v in _wsum.items())}}}",
+                  flush=True)
 
         def sel_of(i: int):
             s = sels.get(i)
