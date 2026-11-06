@@ -137,6 +137,31 @@ that drives the per-rank passes」—— 那个 caller 不存在。
 
 **在那之前 `ep_world > 1` 不可用。** 多卡部署要么先用 TP-only（`tp.py` 那条路，已修
 切分），要么先把这段补完。
+## cutlass 的 sm120 blockwise 示例在本机跑不通（记下来，别再试）
+
+`examples/87a_blackwell_geforce_fp8_bf16_gemm_blockwise` 用 `-arch=sm_120a` 能编过，
+但**任何尺寸**跑起来都是 `exit=0xC0000409`。compute-sanitizer 报的是
+`Misaligned shared or local address`。
+
+排除项：
+
+* 不是 smem 超限。默认 tile 128x128x128 x3 stage 的 A+B 是 96 KB，optin 上限 99 KB，
+  看起来溢出，但把 tile 的 K 改成 64（A+B 降到 48 KB）重编后**一样崩**。
+* 不是尺寸边界。M/N/K 从 128 到 1024、任意组合都崩；M=64 时只是 `can_implement`
+  拒绝（程序正常退出）。
+
+它用的是 `SM120_16x8x32_TN` + `SM90_TMA_LOAD` + `SM90_U32x2_STSM_N`，也就是
+**TMA 路径**。而我们自己手写的 `fp8_gemm_mma`（纯 `mma.sync`，无 TMA）在这张卡上
+kcheck 89/89 正常。所以更像是 TMA/stmatrix 在这张 Laptop sm120 上的问题，不是
+cutlass 本身在 sm120 上不能用 —— H100/B300 的 TMA 是正常工作的。
+
+**本机无法验证 UMMA/TMA 路径。** 手写 `mma.sync` 的 17.8 TFLOPS 大概就是这条指令
+在这个形状下的上限（更快的 tcgen05/UMMA 只能走 cutlass 那条路）。所以 prefill 的
+算力提升必须在专业卡上验。
+
+另外：这个示例**不要在唯一一张卡上反复跑**，更不要叠 compute-sanitizer —— 它会重放
+出错的 kernel，我这么干把整机搞到必须重启。
+
 ## 跨硬件的两处分歧（未修复，需要知道）
 
 1. `expert_slots == 0`（8 GB 这类卡）decode 走 fused w4a8；有槽位的卡走 Marlin w4a16。
