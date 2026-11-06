@@ -23,14 +23,15 @@ def fp8_gemm_mma(x, w_fp8, w_scale, block: int = 32):
 
     k = int(x.size(-1))
     n = int(w_fp8.size(0))
-    if k % 32 or n % 64:
-        raise ValueError(f'fp8_gemm_mma needs K%32==0 and N%64==0, got K={k} N={n}')
+    if k % 32 or n % 8:
+        raise ValueError(f'fp8_gemm_mma needs K%32==0 and N%8==0, got K={k} N={n}')
     rows = x.size(0) if x.dim() == 2 else 1
-    if rows < 128:
-        # See the note in gemm.fp8_linear: a block covers 128 rows with 8 warps, and a
-        # partial first block only writes its leading warps. Silently returning a tensor
-        # with 112 unwritten rows is worse than making the caller take the GEMV path.
-        raise ValueError(f'fp8_gemm_mma needs M>=128, got M={rows}')
+    if rows < 64:
+        # A block covers BLOCK_M=64 rows with 4 warps; each warp writes its own 16 rows
+        # with bounds checks, so a partial last block is fine but a block whose leading
+        # warps are the only ones alive would leave rows unwritten. Below one block, take
+        # the GEMV path instead.
+        raise ValueError(f'fp8_gemm_mma needs M>=64, got M={rows}')
 
     xf = x.reshape(-1, k) if x.dim() != 2 else x
     if xf.dtype != torch.bfloat16:
@@ -38,7 +39,15 @@ def fp8_gemm_mma(x, w_fp8, w_scale, block: int = 32):
     aq, asc = act_quant(xf, 32, 'ue8m0', torch.float8_e8m0fnu)
 
     out = torch.empty(xf.size(0), n, dtype=torch.bfloat16, device=xf.device)
-    grid = ((n + 63) // 64, (xf.size(0) + 127) // 128)
-    native.launch(native.kernel('fp8_gemm_mma', 'fp8_gemm_mma'), grid, (256,),
+    # These MUST match the constants in kernels/cuda/fp8_gemm_mma.cu: a block covers
+    # BLOCK_M rows with (BLOCK_M/16) warps, and each warp covers WARP_N*NB columns. When
+    # they drift the launch simply does less work than asked -- which reads as a large
+    # speedup and a NaN result, exactly what happened when NB changed from 8 to 1 here
+    # without this grid following it.
+    _BLOCK_M, _WARP_M, _WARP_N, _NB = 128, 16, 8, 4
+    _BCOL = _WARP_N * _NB
+    grid = ((n + _BCOL - 1) // _BCOL, (xf.size(0) + _BLOCK_M - 1) // _BLOCK_M)
+    threads = (_BLOCK_M // _WARP_M) * 32
+    native.launch(native.kernel('fp8_gemm_mma', 'fp8_gemm_mma'), grid, (threads,),
                   [aq, asc, w_fp8, w_scale, out, int(xf.size(0)), n, k])
     return out.view(*x.shape[:-1], n)

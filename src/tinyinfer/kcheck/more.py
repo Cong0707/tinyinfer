@@ -124,9 +124,14 @@ def _fp8_gemm_mma_case(report):
         asf = torch.randint(120, 130, (m, k // 32), dtype=torch.uint8, device='cuda')
         bsf = torch.randint(120, 130, (n // 32, k // 32), dtype=torch.uint8, device='cuda')
         c = torch.empty(m, n, dtype=torch.bfloat16, device='cuda')
-        # grid: 64 columns and 128 rows per block (8 warps x one 16-row mma tile each)
+        # grid must match kernels/cuda/fp8_gemm_mma.cu: BLOCK_M=128 rows per block
+        # (8 warps x one 16-row mma tile each) and NB=4 mma tiles of 8 columns per warp,
+        # i.e. 32 columns per block. These are compile-time constants on one side and
+        # literals here, so they have to be changed together -- when NB went 8 -> 4 this
+        # case kept launching N/64 blocks and the kernel wrote only half the output,
+        # which surfaced as a NaN rather than a wrong number.
         native.launch(native.kernel('fp8_gemm_mma', 'fp8_gemm_mma'),
-                      ((n + 63) // 64, (m + 127) // 128), (256,),
+                      ((n + 31) // 32, (m + 127) // 128), (256,),
                       [a, asf, b, bsf, c, m, n, k])
         af = a.view(torch.float8_e4m3fn).float()
         bf = b.view(torch.float8_e4m3fn).float()
