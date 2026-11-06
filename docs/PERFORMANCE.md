@@ -12,17 +12,25 @@ that were NOT measured say so.
 ## Where a decode token goes
 
     component              ms     note
-    H2D (Memcpy HtoD)     808     19.2 GB at 23.8 GB/s = 93% of the link
+    disk reads            672     2.52 GB at 3.75 GB/s, 47.7% RAM-cache hit
     compute                62     all kernels together
-    host sync               8     CPU waits; the rest of the step is GPU-bound
+    PCIe to device          ~0     experts are consumed from pinned host bytes
+    host sync / rest       55
 
-The step is GPU-bound and the GPU is waiting on DMA. Total bytes moved per token:
+The step is disk-bound. Measured with the expert store's own counters over one decode
+step:
 
-    streamed layers   30 x 204MB  =  6.3 GB
-    routed experts   240 x 18.8MB =  4.5 GB
-    measured total               = 19.2 GB   (1.85x the sum above)
+    expert bytes read from disk   2.52 GB   (47.7% served from the RAM cache)
+    bytes crossing PCIe           0.00 GB   (experts are read straight from pinned
+                                             host memory by the kernel)
 
-The 1.85x is understood but not fixed -- see "Known waste" below.
+2.52 GB at the measured 3.75 GB/s is 672 ms of the 789 ms step. The GPUs are idle waiting
+for the disk, not for the link.
+
+A profiling run shows ~1.2 s attributed to `Memcpy HtoD` over the same step. That number
+is misleading: an isolated pinned->device copy costs 3-4 us of fixed overhead plus
+~28 GB/s of bandwidth (0.3 MB in 14.8 us, 18.8 MB in 695 us), so the attributions are
+queued time on the copy stream while the disk read is in flight, not transfer time.
 
 ## What the link can actually do
 
