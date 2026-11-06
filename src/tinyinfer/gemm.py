@@ -295,18 +295,21 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
 def fp4_linear(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor,
                act_block: int = 32, key=None) -> torch.Tensor:
     """C = x @ w_fp4.T with fp8 activation quant, fp4 weight (official kernel path)."""
-    # Marlin first when the vendored extension is present. Measured on a real expert
-    # matrix [2304, 5120]: marlin 16.5 us / 379 GB/s against the hand-written GEMV's
-    # 80.9 us / 77.5 GB/s -- 4.89x. The gap is structural (ldmatrix fragments fed by a
-    # four-stage cp.async pipeline vs scalar loads), not tuning.
+    # Native w4a8 FIRST. This is the arithmetic the checkpoint defines (fp8 activation
+    # quantisation x fp4 weight), and it is what the fused MoE path already runs on cards
+    # with no expert slots. Putting Marlin's w4a16 in front of it made the same weights
+    # produce different tokens on different hardware: measured with TI_SLOTS=6 on this box,
+    # out went from [223,19,17,20] to [14,342,4571,1017].
     #
-    # It is w4a16 where the checkpoint is w4a8, so the values differ by ~12% of their
-    # magnitude. That is the fp8 activation quantisation being skipped, which is a
-    # precision difference rather than a wrong answer -- and it is the path vLLM itself
-    # takes for this model. TI_FP4_MARLIN=0 forces the GEMV when bit-comparability with
-    # the quantised path matters more than speed.
+    # The choice used to go the other way because the hand-written GEMV measured
+    # 80.9 us / 77.5 GB/s against Marlin's 16.5 us / 379 GB/s (4.89x). That gap is gone:
+    # the kernel is now 20.9 us / 300 GB/s (one lane per 32-element scale group, e8m0
+    # scales read directly, fp4 table in shared memory, activation staged in shared
+    # memory), so the 3% it still gives up to Marlin does not pay for a different answer
+    # across hardware. Marlin stays as a fallback, and TI_FP4_MARLIN=1 puts it back in
+    # front.
     if x.dim() == 2 and 0 < x.size(0) <= 8 and x.is_cuda:
-        if __import__('os').environ.get('TI_FP4_MARLIN', '1') != '0':
+        if __import__('os').environ.get('TI_FP4_MARLIN', '0') == '1':
             try:
                 from .deepseek.gemv_fp4_marlin import gemv_fp4_fast as _marlin_gemv
 
@@ -314,9 +317,6 @@ def fp4_linear(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor,
             except Exception:
                 pass
     if x.dim() == 2 and 0 < x.size(0) <= 8 and x.is_cuda:
-        # Native first: fp4_native is our own w4a8 kernel (fp8 activation x fp4 weight),
-        # which is the arithmetic the checkpoints define. gemv_fp4 is the tilelang one and
-        # sits behind it as a fallback only.
         try:
             from .deepseek import fp4_native
 
