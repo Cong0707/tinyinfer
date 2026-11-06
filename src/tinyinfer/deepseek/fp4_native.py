@@ -49,7 +49,11 @@ def _e8m0_launcher(n: int, k: int):
     # K=5120 -- far below the 48 KB a launch gets without raising the function attribute.
     # (Raising it to the device maximum instead made cuFuncSetAttribute return 1, and
     # setting it per shape lowered the ceiling for larger K launchers already bound.)
-    bound = native.bind("gemv_fp4_w4a8", "gemv_fp4_w4a8_e8m0", ((n + 7) // 8,), (256,),
+    # 4 rows per block (128 threads), matching TI_FP4_ROWS in gemv_fp4_w4a8.cu. The
+    # reduction is warp-local, so this is only a packing choice, and 4 nearly doubles the
+    # throughput against 8: measured [2304,5120] 25.0 us / 251 GB/s at ROWS=8 versus
+    # 14.4 us / 434 GB/s at ROWS=4 (weights rotating over 8 copies to stay out of L2).
+    bound = native.bind("gemv_fp4_w4a8", "gemv_fp4_w4a8_e8m0", ((n + 3) // 4,), (128,),
                         "TOOOOiii", shared=smem)
     _E8M0_BOUND[key] = bound
     return bound
@@ -81,8 +85,9 @@ def gemv_fp4_pq(aq, asc, w_fp4, w_scale, ws=None):
     asc2 = asc if asc.dtype == torch.float32 else asc.float()
     out = torch.empty(n, dtype=torch.bfloat16, device=aq.device)
     wb = w_fp4 if w_fp4.dtype == torch.uint8 else w_fp4.view(torch.uint8)
+    # Same ROWS=4 packing as the e8m0 entry point above (see TI_FP4_ROWS).
     native.launch(native.kernel("gemv_fp4_w4a8", "gemv_fp4_w4a8"),
-                  ((n + 7) // 8,), (256,),
+                  ((n + 3) // 4,), (128,),
                   [aq.reshape(-1), asc2.reshape(-1), wb.reshape(-1),
                    ws.reshape(-1), out, 1, int(n), int(k)])
     return out.view(1, n)

@@ -39,7 +39,14 @@ __device__ const float kFp4Lut[16] = {
     0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
 };
 
-constexpr int ROWS = 8;   // output rows per block, one warp each
+// Output rows per block, one warp each. The reduction is warp-local, so this only
+// changes how rows are packed onto the SMs; 4 doubles the block count against 8, which
+// fills the wave tail on a 26-SM part (same argument as fp8_gemv_bs, measured there as
+// 307.9 -> 322.4 GB/s going 16 -> 8).
+#ifndef TI_FP4_ROWS
+#define TI_FP4_ROWS 4
+#endif
+constexpr int ROWS = TI_FP4_ROWS;
 constexpr int BLK = 32;   // one quantisation block
 
 __device__ __forceinline__ float dot_block(const uint4 a0, const uint4 a1,

@@ -61,8 +61,9 @@ def _gemv_w4a8(report):
         aq = torch.randint(0, 120, (k,), dtype=torch.uint8, device='cuda')
         asc = (torch.rand(k // 32, device='cuda') * 0.2 + 0.01).to(torch.float32)
         out = torch.empty(n, dtype=torch.bfloat16, device='cuda')
+        # grid/block must match TI_FP4_ROWS in gemv_fp4_w4a8.cu (4 rows per block)
         native.launch(native.kernel('gemv_fp4_w4a8', 'gemv_fp4_w4a8'),
-                      ((n + 7) // 8,), (256,),
+                      ((n + 3) // 4,), (128,),
                       [aq, asc, w.reshape(-1), ws.reshape(-1), out, 1, n, k])
         want = _ref_w4a8(aq, asc, w, ws)
         check_close(report, f'gemv_fp4_w4a8 [{n},{k}]', out, want, rtol=3e-2)
