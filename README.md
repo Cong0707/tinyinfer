@@ -6,7 +6,26 @@
 捕获。模型只提供与架构相关的一切：权重布局、一层的前向、embedding 与 head。
 两者之间的契约在 `src/tinyinfer/protocol.py`。
 
-这就是为什么同一套代码既能跑 510GB 的 DeepSeek，也能跑 51.8GB 的 Qwen。
+这就是为什么同一套代码既能跑 475GB 的 DeepSeek，也能跑 51.8GB 的 Qwen。
+
+## 从哪开始读
+
+| 想知道什么 | 看哪份 |
+| --- | --- |
+| 时间花在哪、为什么优化不动了 | `docs/decode_bounds.md`（实测分解 + 三条硬件上限） |
+| 和 vLLM 比谁强、强在哪 | `docs/vs-vllm.md`（20GB 以上零 PCIe；kernel 慢 4.15x） |
+| 怎么测量才不会骗自己 | `docs/MEASUREMENT.md`（5 类陷阱 + 8 条被否决的尝试） |
+| 引擎怎么做决策 | `docs/architecture.md`（没有卡型号查表，全部按实测字节求解） |
+| 历史性能记录 | `docs/benchmarks.md`、`docs/decode_speed.md`（**已过时，仅存档**） |
+
+跑一遍验证：
+
+```
+python scripts/check_kernels.py              # 78 个 kernel 一致性用例
+python -m pytest tests -q --ignore=tests/test_server.py   # 50 个
+python -c "import sys; sys.path.insert(0,'src'); from tinyinfer.loading import selftest; assert selftest()"
+python scripts/predict.py --model <dir>      # 各档显卡的规划表
+```
 
 ## 当前实测
 
@@ -19,7 +38,7 @@
 | 模型 | 权重 | 驻留 | 引擎路径 | 说明 |
 | --- | --- | --- | --- | --- |
 | Qwen3.5-0.8B | 1.4 GB bf16 | 24/24 全在卡上 | **180 tok/s** | CUDA graph，输出与参考逐 token 一致 |
-| DeepSeek-V4.1-Flash-1017 | 510 GB | 10/40 层 | **1.22 tok/s** | AGGRESSIVE 档，流式 + 专家缓存 |
+| DeepSeek-V4.1-Flash-1017 | 475.3 GB | 10/40 层 | **1.26 tok/s** | AGGRESSIVE 档，流式 + 专家缓存 |
 | Qwen3.8-27B | 51.8 GB | 2/64 层 | 逐层读入 | 64 层能逐层读入并跑完一遍，速度未测通 |
 
 Qwen3.5-0.8B 走引擎：同一套代码，`engine.block(i)` 逐层驱动，整步捕获成一张 CUDA graph。
