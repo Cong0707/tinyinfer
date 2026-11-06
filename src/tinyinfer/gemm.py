@@ -285,7 +285,8 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
     return out.view(*x.shape[:-1], out.shape[-1])
 
 
-def fp4_linear(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor, act_block: int = 32) -> torch.Tensor:
+def fp4_linear(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor,
+               act_block: int = 32, key=None) -> torch.Tensor:
     """C = x @ w_fp4.T with fp8 activation quant, fp4 weight (official kernel path)."""
     # Marlin first when the vendored extension is present. Measured on a real expert
     # matrix [2304, 5120]: marlin 16.5 us / 379 GB/s against the hand-written GEMV's
@@ -302,7 +303,7 @@ def fp4_linear(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor, act_
             try:
                 from .deepseek.gemv_fp4_marlin import gemv_fp4_fast as _marlin_gemv
 
-                return _marlin_gemv(x, w_fp4, w_scale)
+                return _marlin_gemv(x, w_fp4, w_scale, key=key)
             except Exception:
                 pass
     if x.dim() == 2 and 0 < x.size(0) <= 8 and x.is_cuda:

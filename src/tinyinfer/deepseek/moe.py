@@ -95,6 +95,12 @@ class Expert:
         # merged gate|up matrix: one GEMV produces both halves so vLLM's
         # silu_and_mul_with_clamp can consume them directly
         self.fp4_13 = None
+        # Stable identity for the marlin repack cache: (layer, expert) or None for the
+        # shared expert. An expert's fp4 tensors are views into the recycled _blob_stage
+        # ring, so their addresses rotate and a data_ptr-keyed cache never hits -- measured
+        # 2217 repack launches per decode step where ~240 would do, each costing 733 us
+        # against 32.5 us for a hit. Carrying the identity down the call chain is the fix.
+        self.key = None
 
     def to(self, device):
         # torch.Tensor.to returns a NEW tensor; dropping the result left the weights on
@@ -115,6 +121,7 @@ class Expert:
         """fp4 kernel path; M==1 (decode) uses the GEMV kernels (GEMM wastes 31/32 rows)."""
         from ..gemm import fp4_linear
 
+        _key = self.key
         w1, s1, w2, s2, w3, s3 = self.fp4
         # the fused prefill kernel is built for chunk-sized M; at M=2..8 it measured
         # 7.5x slower per layer than the GEMV path (667ms vs 89ms), so only real
@@ -128,8 +135,8 @@ class Expert:
                                             limit=float(self.swiglu_limit))
             except Exception:
                 pass
-        gate = fp4_linear(x, w1, s1)
-        up = fp4_linear(x, w3, s3)
+        gate = fp4_linear(x, w1, s1, key=_key)
+        up = fp4_linear(x, w3, s3, key=_key)
         if self.swiglu_limit > 0:
             # Merge the two halves on the ACTIVATION (64KB at T=1), never on the
             # weights: stacking W1/W3 would cost another 36MB per expert per step.
@@ -149,7 +156,7 @@ class Expert:
             y = F.silu(gate.float()) * up.float()
         if weights is not None:
             y = weights * y
-        return fp4_linear(y.to(torch.bfloat16), w2, s2)
+        return fp4_linear(y.to(torch.bfloat16), w2, s2, key=_key)
 
     def forward_fp4_pq(self, aq: torch.Tensor, asc: torch.Tensor,
                        weights: torch.Tensor | None = None) -> torch.Tensor:
@@ -354,6 +361,9 @@ class MoE:
             e = Expert(None, None, None, self.swiglu_limit)
             e.fp4 = (t["w1.weight"], t["w1.scale"], t["w2.weight"], t["w2.scale"],
                      t["w3.weight"], t["w3.scale"])
+            # ExpertRecord.key is (layer, expert): exactly the identity the marlin repack
+            # cache needs, and stable across the blob ring reusing its address.
+            e.key = getattr(rec, "key", None)
             return e
         return self._expert_from(rec.tensor)
 

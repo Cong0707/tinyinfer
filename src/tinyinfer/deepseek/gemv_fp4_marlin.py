@@ -154,12 +154,31 @@ def _workspace(device) -> torch.Tensor:
     return ws
 
 
-def _prepared(w_fp4: torch.Tensor, w_scale: torch.Tensor) -> MarlinFp4Weight:
-    key = w_fp4.data_ptr()
+# Caching a repacked expert costs VRAM as well as the repack: the entry has to keep the
+# source tensors alive (a recycled _blob_stage slot would otherwise invalidate the copy),
+# which is 6.0 MB per expert at this model's shape. Measured on an 8GB card:
+#
+#     TI_MARLIN_CACHE=1    prefill(8 tokens)  1.9 s
+#     TI_MARLIN_CACHE=64   prefill(8 tokens)  4.8 s
+#     TI_MARLIN_CACHE=512  prefill(8 tokens) 11.3 s
+#
+# Larger is monotonically worse -- the retained weights evict buffers the streaming ring
+# needs, and an unbounded cache tripped the CUDA allocator outright
+# (`!handles_.at(i) INTERNAL ASSERT FAILED`). So the repack is paid per call. That is not
+# a bug to fix here: it is the 8GB card saying it cannot afford a repack cache, and the
+# decode path does not go through marlin at all (fp4_linear is reached only by the shared
+# expert during prefill), so there was nothing to win.
+_CACHE_MAX = 1
+
+
+def _prepared(w_fp4: torch.Tensor, w_scale: torch.Tensor, key=None) -> MarlinFp4Weight:
+    if key is None:
+        key = w_fp4.data_ptr()
     hit = _CACHE.get(key)
     if hit is not None and hit[0] is w_fp4:
         return hit[1]
     weight = MarlinFp4Weight(w_fp4, w_scale)
+    _CACHE.clear()
     _CACHE[key] = (w_fp4, weight, w_scale)
     return weight
 
@@ -199,9 +218,10 @@ def _native_launcher():
     return _NATIVE or None
 
 
-def gemv_fp4_fast(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor) -> torch.Tensor:
+def gemv_fp4_fast(x: torch.Tensor, w_fp4: torch.Tensor, w_scale: torch.Tensor,
+                 key=None) -> torch.Tensor:
     """x [M,K] activation, w fp4 [N,K/2] packed, w_scale [N,K/32] e8m0 -> [M,N] bf16."""
-    weight = _prepared(w_fp4, w_scale)
+    weight = _prepared(w_fp4, w_scale, key)
     a = x.reshape(-1, weight.size_k)
     if a.dtype != torch.bfloat16:
         a = a.to(torch.bfloat16)
