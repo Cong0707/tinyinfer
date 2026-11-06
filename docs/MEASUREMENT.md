@@ -5,6 +5,34 @@ cause was the measurement rather than the code. They are collected here because 
 mistakes are more reusable than the results: the next person (or the next me) will make
 the same ones.
 
+## 0. A multi-threaded counter is not a wall clock
+
+This one cost more time than the other four combined. `ShardReader` sums
+`read_seconds += time.perf_counter() - started` inside every worker, so its total is the
+sum of per-thread durations, not elapsed time. Over six decode steps it accumulated
+4057 ms while those steps took 4300 ms in total -- if that number were treated as wall
+time it would report a 94696% share of a token.
+
+Consequence: two separate conclusions were drawn from it and both were wrong.
+
+  - "disk is 85% of a decode step" -- computed as 2.49 GB / 3.7 GB/s, assuming serial
+    reads that never happen (six workers are in flight).
+  - "the disk is fully hidden" -- inferred from a cache-size change that cut bytes 18%
+    without changing token time, which only shows the change was too small to cross a
+    threshold, not that the term is free.
+
+The correct measurement wraps `perf_counter` around the *calls* on the calling thread:
+
+    fetch (ExpertStore.fetch, blocks on the async read)   285 ms   36%
+    gate                                                   36 ms    4%
+    everything else                                       474 ms   60%
+
+and the regression over twelve tokens confirms it is real: `corr(fetch_ms, disk_MB) =
+0.9986`, `fetch_ms = 114 us/MB * disk_MB + 74 ms`.
+
+**Rule:** a counter that sums worker durations answers "how much work did the threads
+do", never "how long did the caller wait". For the latter, time the call.
+
 ## 1. The benchmark function had a side effect
 
 `Engine.stream_generate(prompt, max_new_tokens=1)` calls `reset()` and then forwards the
