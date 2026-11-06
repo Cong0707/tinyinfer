@@ -91,6 +91,30 @@ def register(report) -> None:
     except Exception as exc:
         report.add(Case('moe_gemv act', f'raised {exc!r}', False))
 
+    # --- down: the second projection; w2 is [n_rows_out, k/2] packed, k must be %256 ---
+    try:
+        d_nrows, d_k = 128, 512
+        w2p = [torch.randint(0, 16, (d_nrows, d_k // 2), dtype=torch.uint8,
+                             device='cuda') for _ in range(n_exp)]
+        s2 = [torch.full((d_nrows, d_k // 32), 127, dtype=torch.uint8, device='cuda')
+              for _ in range(n_exp)]
+        aqd = torch.randint(0, 120, (n_exp, d_k), dtype=torch.uint8, device='cuda')
+        ascd = torch.full((n_exp, d_k // 32), 127, dtype=torch.uint8, device='cuda')
+        gotd = moe_gemv.down(aqd, ascd, w2p, s2)
+        afd = aqd.view(torch.float8_e4m3fn).float()
+        wantd = torch.zeros(n_exp, d_nrows, device='cuda')
+        for e in range(n_exp):
+            # unpack the two nibbles into [n_rows, k] before the matmul
+            pk = w2p[e]
+            lo = (pk & 0x0F).long()
+            hi = ((pk >> 4) & 0x0F).long()
+            wf = lut[torch.stack((lo, hi), dim=-1).reshape(d_nrows, d_k)]
+            wantd[e] = afd[e] @ wf.T
+        # plane 0 of each expert's output is [2*n_rows] wide; the first n_rows are real
+        check_close(report, 'moe_gemv down', gotd.float()[:, :d_nrows], wantd, rtol=5e-2)
+    except Exception as exc:
+        report.add(Case('moe_gemv down', f'raised {exc!r}', False))
+
     # --- acc: y += sum over experts; dst is FP32 (the kernel accumulates in fp32) ---
     try:
         src_rows = torch.randn(n_exp, n, dtype=torch.bfloat16, device='cuda')
