@@ -383,7 +383,12 @@ class Engine:
                         str(min(16, max(4, (__import__("os").cpu_count() or 8)))))),
                     cache_bytes=_cache_bytes,
                     pool=_cache_pool,
-                    policy=__import__("os").environ.get("TI_CACHE_POLICY", "arc"),
+                    # LRU, not ARC. Measured on this model's real routing over three
+                    # runs: lru 0.789/0.789/0.788 hit and 30.9-31.3 GB read, arc
+                    # 0.710/0.685/0.667 and 34.8-39.4 GB, s3fifo 0.567. ARC's ghost lists
+                    # are tuned for a workload with a stable hot set to promote; this
+                    # model's routing is flat enough that they mostly cost capacity.
+                    policy=__import__("os").environ.get("TI_CACHE_POLICY", "lru"),
                     vram_slots=_slots if device != "cpu" else 0,
                     device=device if device != "cpu" else "cpu",
                     # direct=NO_BUFFERING reads: measured 6.3GB/s at 6 threads vs
