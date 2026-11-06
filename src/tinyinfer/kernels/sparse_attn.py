@@ -191,27 +191,8 @@ def sparse_attn_dispatch(q, kv, attn_sink, topk_idxs, scale: float, prefer_tilel
     _cuda_out = sparse_attn_cuda(q, kv, attn_sink, topk_idxs, scale)
     if _cuda_out is not None:
         return _cuda_out
-    try:
-        from .official_kernel_ref import sparse_attn as _official_sparse_attn
-
-        # the official window helper hands back CPU int64 indices; its kernel wants CUDA int32
-        return _official_sparse_attn(q, kv, attn_sink,
-                                     topk_idxs.to(q.device).int(), float(scale))
-    except Exception as _exc:
-        import os as _os2
-        if _os2.environ.get("TI_TL_DEBUG"):
-            print(f"[sparse_attn] official kernel failed: {_exc!r}", flush=True)
-    if prefer_tilelang and _TL_STATE is not False and _TL is not None:
-        try:
-            out = sparse_attn_tl(q, kv, attn_sink, topk_idxs, scale)
-            _TL_STATE = True
-            return out
-        except Exception as _exc:
-            import os as _os
-            if _os.environ.get("TI_TL_DEBUG"):
-                import traceback
-                print(f"[sparse_attn] tilelang failed for shape q={tuple(q.shape)} "
-                      f"kv={tuple(kv.shape)} idx={tuple(topk_idxs.shape)}: {_exc!r}", flush=True)
-                traceback.print_exc()
-            _TL_STATE = False
+    # No tilelang and no official-kernel fallback: both are external JIT kernels that
+    # this tree no longer carries (they need tilelang installed plus a source checkout).
+    # A shape the native kernel does not cover falls through to the plain-torch
+    # implementation, which is the reference the native one was checked against.
     return sparse_attn_ref(q, kv, attn_sink, topk_idxs, scale)

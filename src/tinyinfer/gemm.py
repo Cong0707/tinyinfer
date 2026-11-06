@@ -178,18 +178,8 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
         # features the engine's per-row kernel wins (it owns 16 features per CTA and
         # never pads), from 4096 up the ported 128-feature/CTA kernel wins by 12-25x
         # (wq_b at N=32768, wo_b at 5120, the vocabulary head).
-        if w_fp8.shape[0] >= 4096:
-            try:
-                from .official_kernels import gemv_fp8_block
-
-                with _bf16_default():
-                    x_fp8, x_s = _act_quant(x, block, SCALE_FMT, SCALE_DTYPE)
-                out = gemv_fp8_block(x_fp8, w_fp8, x_s.float().reshape(1, -1),
-                                     w_scale.float(), block)
-                if out is not None:
-                    return out
-            except Exception:
-                pass
+        # (A tilelang gemv_fp8_block was tried here for N >= 4096. It is gone with the
+        # rest of tilelang -- the native GEMV below covers every shape this runs.)
         try:
             # The name this used to import, gemv_fp8, has never existed in that module
             # (it exports fused_fp8_gemv / fused_fp8_gemv_pq). The ImportError raised on
@@ -203,12 +193,9 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
             # N=2304/K=5120 and it faults there too, asynchronously inside hc_post).
             # Forcing a 16-byte-aligned copy of x did not fix it. Off until that kernel's
             # alignment assumptions are understood: TI_FP8_GEMV=1 enables it.
-            import os as _os_g8
-
-            if _os_g8.environ.get("TI_FP8_GEMV") == "1":
-                from .gemv_fp8 import fused_fp8_gemv
-
-                return fused_fp8_gemv(x, w_fp8, w_scale)
+            # (A tilelang fused_fp8_gemv was wired behind TI_FP8_GEMV here; it is gone
+            # with the rest of tilelang.)
+            pass
         except Exception:
             pass
     # The tensor-core kernel is faster than a row loop once M is large enough for the
@@ -271,6 +258,16 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
                         for i in range(xf.size(0))]
                 out = torch.cat(rows, dim=0)
                 return out.view(*x.shape[:-1], out.shape[-1])
+    # Prefill (M > 8 or a shape the GEMV does not cover): the native tensor-core GEMM.
+    # This used to be the tilelang _k.fp8_gemm; the mma kernel is the replacement and
+    # takes M >= 128, which is what a prefill chunk is.
+    if x.is_cuda and x.dim() == 2 and x.size(0) >= 128 and block == 32:
+        try:
+            from .kernels import mma_gemm
+
+            return mma_gemm.fp8_gemm_mma(x, w_fp8, w_scale)
+        except Exception:
+            pass
     if _k is not None:
         with _bf16_default():
             x_fp8, x_s = _act_quant(x, block, SCALE_FMT, SCALE_DTYPE)

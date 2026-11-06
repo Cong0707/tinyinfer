@@ -1,47 +1,20 @@
-"""Lazy tilelang kernel cache for fused fp8->bf16 block dequantization."""
+"""Block-32 fp8 -> bf16 dequantisation, on our own kernel."""
+
 import torch
-
-try:
-    import tilelang
-    import tilelang.language as T
-    _OK = True
-except Exception:  # pragma: no cover
-    _OK = False
-
-_KERNELS: dict = {}
-
-
-if _OK:
-    @tilelang.jit
-    def _dequant_kernel(O: int, I: int, BLK: int = 32, threads: int = 128):
-        @T.prim_func
-        def kernel(
-            W: T.Tensor([O, I], "float8_e4m3fn"),
-            S: T.Tensor([O // BLK, I // BLK], "uint8"),
-            Y: T.Tensor([O, I], "bfloat16"),
-        ):
-            with T.Kernel(O // BLK, I // BLK, threads=threads) as (bo, bi):
-                for i in T.Parallel(BLK):
-                    for j in T.Parallel(BLK):
-                        raw = T.Cast("float32", S[bo, bi])
-                        scale = T.exp2(raw - 127.0)
-                        Y[bo * BLK + i, bi * BLK + j] = T.Cast(
-                            "bfloat16",
-                            T.Cast("float32", W[bo * BLK + i, bi * BLK + j]) * scale,
-                        )
-        return kernel
 
 
 def dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """weight [O, I] float8_e4m3fn, scale [O/32, I/32] e8m0 bytes -> bf16."""
-    if not _OK:
-        raise RuntimeError("tilelang unavailable")
-    O, I = weight.shape
-    key = (O, I)
-    k = _KERNELS.get(key)
-    if k is None:
-        k = _dequant_kernel(O, I)
-        _KERNELS[key] = k
-    out = torch.empty(O, I, dtype=torch.bfloat16, device=weight.device)
-    k(weight.contiguous(), scale.contiguous().view(torch.uint8), out)
+    from .kernels import native
+
+    O, I = int(weight.shape[0]), int(weight.shape[1])
+    if I % 32 or O % 32:
+        raise ValueError(f'dequant_fp8 needs O%32==0 and I%32==0, got O={O} I={I}')
+    out = torch.empty((O, I), dtype=torch.bfloat16, device=weight.device)
+    # grid: x covers I in 16-element steps (256 threads), y covers O in 8-row tiles
+    # 32x8 = 256 threads: 32 lanes cover 512 of I in 16-element steps, 8 rows of O
+    grid = ((((I // 16) + 31) // 32), (O + 7) // 8)
+    b = native.bind('dequant_fp8', 'dequant_fp8', grid, (32, 8), 'TTOii')
+    b(weight.view(torch.uint8), scale.view(torch.uint8), out, int(O), int(I),
+      stream=None)
     return out
