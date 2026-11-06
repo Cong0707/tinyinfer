@@ -31,10 +31,28 @@ Below ~475 GB of VRAM there is no comparison to make: one engine runs and the ot
 does not. That is the whole reason this project exists, and it is worth stating plainly
 rather than as a benchmark table with a footnote.
 
-At 24 GB and above the engine is not slower for being a streaming engine -- the planner
+At 20 GB and above the engine is not slower for being a streaming engine -- the planner
 fits the entire decode working set (topk 6 x 40 layers = 240 distinct experts) into the
 slot pool, so a token crosses PCIe zero times. The 8 GB row is the only one paying for
-streaming, and it pays 4.2 GB of expert traffic per token.
+streaming, and it pays 1.85 GB of expert traffic per token.
+
+### Prefill is where the gap is widest
+
+Everything above is decode. Prefill tells a different story, because every prompt token
+passes through every layer's MoE: 51 tokens x 40 layers x 6 experts = 12240 expert visits
+against decode's 240. Measured on the 8 GB card:
+
+    prefill 51 tokens   17.3 s   75.75 GB read from disk
+    decode 1 token       0.79 s   1.85 GB read from disk
+
+Extrapolating from the same 8.8 GB/s effective read rate, about half of that 17.3 s is
+disk; the other half is arithmetic. A 500-token prompt therefore needs roughly 740 GB of
+reads, i.e. four to five minutes.
+
+This is the dimension where a resident deployment differs most: on 20 GB or more the
+expert table is in VRAM instead of on disk, which takes prefill from ~17 s to ~9 s for
+this prompt (-50%) against decode's -36%. It is also where vLLM's 475 GB residency is
+worth the most -- it never reads an expert from disk in either phase.
 
 ## Where vLLM is genuinely better
 
