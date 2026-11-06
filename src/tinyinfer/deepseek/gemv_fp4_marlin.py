@@ -197,6 +197,22 @@ def _workspace(device) -> torch.Tensor:
 _CACHE_MAX = 1
 
 
+def set_cache_capacity(n: int) -> None:
+    """Size the repack cache to the plan's expert-slot count.
+
+    The repacked qweight is the same size as the fp4 weight it replaces (measured 1.00x:
+    5.62 MB uint8 -> 5.62 MB int32 at [2304, 5120]), so on a card that already holds the
+    slots, caching the repack costs nothing extra. On a card with no slots (this 8 GB box
+    plans expert_slots=0) the decode path never reaches Marlin at all, so the default of
+    1 is the right conservative value there.
+
+    Without this, every Marlin call re-interleaves its expert: 43 us of repack against a
+    20 us GEMV, 240 experts per token.
+    """
+    global _CACHE_MAX
+    _CACHE_MAX = max(1, int(n))
+
+
 def _prepared(w_fp4: torch.Tensor, w_scale: torch.Tensor, key=None) -> MarlinFp4Weight:
     if key is None:
         key = w_fp4.data_ptr()

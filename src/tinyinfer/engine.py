@@ -245,6 +245,18 @@ class Engine:
                 hw = self.hw_plan
                 _slots = int(__import__("os").environ.get(
                     "TI_SLOTS", hw.expert_slots if hw is not None else 96))
+                # A card with expert slots serves its decode experts through Marlin, whose
+                # repack is 43 us against a 20 us GEMV. Size the repack cache to the slot
+                # count so each expert is interleaved once instead of once per token.
+                # Zero slots (this 8 GB box) never reaches Marlin on decode, and the
+                # setter leaves the conservative default there.
+                if _slots > 0:
+                    try:
+                        from .deepseek.gemv_fp4_marlin import set_cache_capacity
+
+                        set_cache_capacity(_slots)
+                    except Exception:
+                        pass
                 from .budget import budget as _host_budget
                 _hb_room = _host_budget().room()
                 _plan_cache = (hw.cache_bytes if hw is not None
