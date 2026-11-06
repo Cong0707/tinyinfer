@@ -94,6 +94,55 @@ def shard_linear(linear, shard: Shard, *, axis: str = "out"):
     return out
 
 
+def shard_grouped(linear, shard: Shard, groups: int, *, axis: str):
+    """Shard the per-group axis of a projection stored as [groups * per, ...].
+
+    compressed attention stores wo_a as [groups*per, dim] and wo_b as [dim, groups*per].
+    The per-group index is the fast-varying one within its group, so a plain contiguous
+    slice -- which is what shard_linear("in") does -- would take the first k columns of
+    every group instead of a slice of every group. That silently mismatches the other
+    side of the grouped matmul: with tp=2 and groups=8, wo_b kept the prefix of each of
+    the 8 groups while the einsum output is laid out group-major.
+
+    This reshape-slice-reshape keeps the group-major layout that the forward pass builds.
+    """
+    w = getattr(linear, "weight", None)
+    s = getattr(linear, "scale", None)
+    if w is None:
+        return linear
+    out = type(linear).__new__(type(linear))
+    out.__dict__.update(getattr(linear, "__dict__", {}))
+    if axis == "out":
+        # [groups*per, rest]
+        total, rest = w.shape
+        per = total // groups
+        lo, hi = shard.columns(per)
+        out.weight = w.view(groups, per, rest)[:, lo:hi].contiguous().view(-1, rest)
+        if s is not None:
+            # scale [groups*per/32, rest/32] for fp8, [groups*per, rest/32] for fp4
+            if s.shape[0] * 32 == total:
+                spo = per // 32
+                out.scale = (s.view(groups, spo, -1)[:, lo // 32:hi // 32]
+                             .contiguous().view(-1, s.shape[1]))
+            else:
+                out.scale = (s.view(groups, per, -1)[:, lo:hi]
+                             .contiguous().view(-1, s.shape[1]))
+    else:
+        # [rest, groups*per]
+        rest, total = w.shape
+        per = total // groups
+        lo, hi = shard.rows(per)
+        out.weight = w.view(rest, groups, per)[:, :, lo:hi].contiguous().view(rest, -1)
+        if s is not None:
+            if s.shape[1] * 32 == total:      # fp8: [rest/32, groups*per/32]
+                out.scale = (s.view(s.shape[0], groups, per // 32)[:, :, lo // 32:hi // 32]
+                             .contiguous().view(s.shape[0], -1))
+            else:                              # fp4: [rest, groups*per/32]
+                out.scale = (s.view(s.shape[0], groups, per)[:, :, lo:hi]
+                             .contiguous().view(s.shape[0], -1))
+    return out
+
+
 def all_reduce_sum(x: torch.Tensor) -> torch.Tensor:
     """Sum a tensor across ranks when distributed is live; identity otherwise."""
     try:

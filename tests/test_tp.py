@@ -61,6 +61,61 @@ def test_fp4_out_shard_keeps_blocks_aligned():
         assert torch.allclose(part, full[lo:hi])
 
 
+def test_grouped_outer_shard_keeps_group_major_layout():
+    """wo_a is [groups*per, dim]: sharding the per axis must slice INSIDE every group.
+
+    The regression this covers: shard_linear("in") on wo_b used to take a contiguous run
+    of the [dim, groups*per] axis, which keeps the first k columns of each group rather
+    than a slice of each group, while wo_a was never split at all (its stored weight is
+    2-D, so the old 3-D guard never fired). Any tp>1 run then mismatched the grouped
+    matmul. Here the full and the per-rank results must agree up to the fp32 summation
+    order that a real all-reduce also has.
+    """
+    from tinyinfer.tp import Shard, shard_grouped, SHARD_BLOCK
+
+    g, per, dim, batch = 8, 512, 32, 2
+    assert per % SHARD_BLOCK == 0
+    torch.manual_seed(0)
+    w_a = torch.randn(g * per, dim)
+    w_b = torch.randn(dim, g * per)
+    o = torch.randn(batch, g, dim)
+
+    def fwd(wa, wb):
+        rs = wa.shape[0] // g
+        y = torch.einsum("bgd,grd->bgr", o, wa.view(g, rs, dim)).reshape(batch, -1)
+        return torch.nn.functional.linear(y, wb)
+
+    full = fwd(w_a, w_b)
+    for world in (2, 4):
+        parts = []
+        for rank in range(world):
+            sh = Shard(rank, world)
+            wa = shard_grouped(SimpleNamespace(weight=w_a, scale=None), sh, g, axis="out")
+            wb = shard_grouped(SimpleNamespace(weight=w_b, scale=None), sh, g, axis="in")
+            # every rank must own a non-empty slice of every group
+            assert wa.weight.shape[0] == g * (per // world)
+            assert wb.weight.shape[1] == g * (per // world)
+            parts.append(fwd(wa.weight, wb.weight))
+        got = sum(parts)
+        assert torch.allclose(full, got, atol=2e-3), world
+
+
+def test_grouped_outer_shard_scales_follow_the_slice():
+    """fp8 scales are one scalar per 32x32 block, so the per-group slice must move them."""
+    from tinyinfer.tp import Shard, shard_grouped
+
+    g, per, dim = 8, 512, 64
+    w = torch.zeros(g * per, dim)
+    s = torch.arange((g * per // 32) * (dim // 32), dtype=torch.float32)
+    s = s.view(g * per // 32, dim // 32)
+    lin = SimpleNamespace(weight=w, scale=s)
+    sh = Shard(1, 2)
+    out = shard_grouped(lin, sh, g, axis="out")
+    rlo, rhi = sh.columns(per)
+    want = s.view(g, per // 32, dim // 32)[:, rlo // 32:rhi // 32]
+    assert torch.equal(out.scale, want.reshape(-1, dim // 32))
+
+
 def test_all_reduce_is_identity_without_distributed():
     from tinyinfer.tp import all_reduce_sum
 

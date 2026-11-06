@@ -190,22 +190,26 @@ class MLAWindowAttention:
         self.wq_b = shard_linear(self.wq_b, tp, axis="out")
         lo, hi = tp.columns(self.n_heads)
         self.sink = self.sink[lo:hi].contiguous()
-        # wo_a is grouped as (o_groups, o_lora_rank, -1): slice the o_lora dimension
+        # wo_a is stored [o_groups * o_lora_rank, dim] and wo_b [dim, o_groups * o_lora_rank]:
+        # the o_lora axis is INSIDE each group, so both sides need the group-major reshape
+        # (shard_grouped). The previous version only split when the stored weight happened
+        # to be 3-D, which it never is, so tp>1 left wo_a unsplit while wo_b was cut by a
+        # contiguous run of the axis -- two different layouts of the same quantity.
+        from ..tp import shard_grouped
+
         w = getattr(self.wo_a, "weight", None)
-        if w is not None and w.dim() == 3:
-            gr, r, rest = w.shape
-            rlo, rhi = tp.rows(r)
+        if w is not None:
+            rlo, rhi = tp.rows(self.o_lora_rank)
             if isinstance(self.wo_a, torch.Tensor):
-                self.wo_a = w[:, rlo:rhi].contiguous()
+                gr, dim = w.shape
+                self.wo_a = (w.view(self.o_groups, gr // self.o_groups, dim)[:, rlo:rhi]
+                             .contiguous().view(-1, dim))
             else:
-                self.wo_a.weight = w[:, rlo:rhi].contiguous()
-                s = getattr(self.wo_a, "scale", None)
-                if s is not None and s.dim() >= 2:
-                    self.wo_a.scale = s[:, rlo:rhi].contiguous()
+                self.wo_a = shard_grouped(self.wo_a, tp, self.o_groups, axis="out")
             self.o_lora_rank = rhi - rlo
         # wo_b consumes the sliced o_lora dimension (row-parallel input) and its output
         # is summed across ranks
-        self.wo_b = shard_linear(self.wo_b, tp, axis="in")
+        self.wo_b = shard_grouped(self.wo_b, tp, self.o_groups, axis="in")
         self.tp_world = tp.world
         self.tp_rank = tp.rank
         self.tp = tp

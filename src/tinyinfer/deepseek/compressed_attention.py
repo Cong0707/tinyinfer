@@ -186,19 +186,26 @@ class MLACompressedAttention:
         self.wq_b = shard_linear(self.wq_b, tp, axis="out")
         lo, hi = tp.columns(self.n_heads)
         self.sink = self.sink[lo:hi].contiguous()
+        # wo_a is [o_groups * o_lora_rank, dim] and wo_b is [dim, o_groups * o_lora_rank]:
+        # the o_lora_rank axis lives INSIDE each group, so both sides have to be split with
+        # the group-major reshape (shard_grouped), not by a contiguous slice and not only
+        # when the stored weight happens to be 3-D. Before this, wo_a was never split (the
+        # stored weight is 2-D) while wo_b was, so any tp>1 run mismatched the grouped
+        # matmul: wo_a produced groups*o_lora_rank columns and wo_b wanted a contiguous
+        # fraction of them.
+        from ..tp import shard_grouped
+
         w = getattr(self.wo_a, "weight", None)
-        if w is not None and w.dim() == 3:
-            gr, r, rest = w.shape
-            rlo, rhi = tp.rows(r)
+        if w is not None:
+            rlo, rhi = tp.rows(self.o_lora_rank)
             if isinstance(self.wo_a, torch.Tensor):
-                self.wo_a = w[:, rlo:rhi].contiguous()
+                gr, dim = w.shape
+                self.wo_a = (w.view(self.o_groups, gr // self.o_groups, dim)[:, rlo:rhi]
+                             .contiguous().view(-1, dim))
             else:
-                self.wo_a.weight = w[:, rlo:rhi].contiguous()
-                s = getattr(self.wo_a, "scale", None)
-                if s is not None and s.dim() >= 2:
-                    self.wo_a.scale = s[:, rlo:rhi].contiguous()
+                self.wo_a = shard_grouped(self.wo_a, tp, self.o_groups, axis="out")
             self.o_lora_rank = rhi - rlo
-        self.wo_b = shard_linear(self.wo_b, tp, axis="in")
+        self.wo_b = shard_grouped(self.wo_b, tp, self.o_groups, axis="in")
         self.tp_world = tp.world
         self.tp_rank = tp.rank
 
