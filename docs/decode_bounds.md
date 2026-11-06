@@ -8,13 +8,36 @@ analysis were wrong and are corrected below; the corrections are the useful part
 
     790 ms/token = 1.26 tok/s       steady state, output [223,19,17,20]
 
-    term                  value        share
-    expert bytes / token  2.49 GB
-    disk rate (direct)    3.0 GB/s     --
-    disk time             830 ms       100% (overlapped with compute)
-    launch cost           6.1 ms       0.8%
+Measured by wrapping `perf_counter` around the calls, taking care to accumulate
+single-threaded wall time (see the warning at the bottom about multi-threaded totals):
 
-Decode time is, to first order, `expert_bytes / disk_rate`. Nothing else is close.
+    ffn (MoE)       614 ms   60%     of which fetch 285 ms waiting on disk,
+                                     the other 329 ms is the MoE matmuls
+    attention       191 ms   19%     40 layers of compressed attention
+    hc_mixes         96 ms    9%     80 calls (2 per layer), already fused
+    outside          48 ms    5%     embed / head / python
+    hc_post           5 ms    0%
+    rest            ~66 ms    6%
+
+**The expert-fetch wait is 36% of a token, and it is linear in the bytes read.** Twelve
+consecutive decode steps, regressing fetch time against bytes:
+
+    corr(fetch_ms, disk_MB) = 0.9986
+    fetch_ms = 114 us/MB * disk_MB + 74 ms
+
+114 us/MB is 8.8 GB/s effective, which is the 3.0 GB/s single-stream rate across ~3 reads
+in flight. The 74 ms intercept is the floor when nothing has to be read.
+
+Consequences, each computed from that fit:
+
+| change | fetch | token | gain |
+| --- | --- | --- | --- |
+| cache hit rate to 100% | 285 -> 74 ms | 584 ms | +36% |
+| read rate doubled | 285 -> 180 ms | 690 ms | +15% |
+| disk traffic -22% | 285 -> 239 ms | 749 ms | +6% |
+
+None of them is available: the hit rate is already 93% over 30 steps, and 3.0 GB/s is
+this NVMe's ceiling in unbuffered mode. The remaining 64% is the model's own arithmetic.
 
 ## The three ceilings, each measured
 
