@@ -1150,8 +1150,12 @@ class TinyModelBackend(BaseBackend):
             with torch.inference_mode():
                 model.forward(ids, 0)
             model.reset()
-            if torch.cuda.is_available() and torch.cuda.is_initialized():
-                torch.cuda.empty_cache()
+            # NOT empty_cache() here. It releases the blocks the warm-up just proved are
+            # needed, so the first real request re-requests them and the allocator has to
+            # re-split a fragmented pool. Measured: the CLI path (which warms up) hit
+            # "!handles_.at(i) INTERNAL ASSERT FAILED" in the caching allocator on a card
+            # this full, while the same model driven without warm-up ran fine. Keeping the
+            # cache warm is the entire point of warming up.
         except Exception as exc:
             logger.debug("warmup forward failed; first request will pay for it", exc_info=exc)
 
