@@ -21,6 +21,21 @@ from ..config import TinyConfig
 from ..quant import dequant_fp4_block, dequant_fp8_block
 from ..weights import ShardStore
 
+# Bound launchers for swiglu_scale, keyed by element count (the grid depends on it).
+_SWIGLU_BOUND: dict = {}
+
+
+def _swiglu_bound(n: int):
+    from ..kernels import native
+
+    hit = _SWIGLU_BOUND.get(n)
+    if hit is not None:
+        return hit
+    bound = native.bind("swiglu_scale", "swiglu_scale", ((n + 255) // 256,), (256,),
+                        "TTnTOif")
+    _SWIGLU_BOUND[n] = bound
+    return bound
+
 
 class Gate:
     def __init__(self, store: ShardStore, layer_id: int, cfg: TinyConfig, topk: int = 0):
@@ -207,16 +222,19 @@ class Expert:
         # fused wrapper still takes fp32 scales. Measured on [2304, 5120] x 2:
         #     fused gate_up   250.7 us   (and it needs a pow(2, s-127) pass first)
         #     two e8m0 calls   42.2 us
-        gate = _lin(aq, asc, w1, s1, ws[0]).float()
-        up = _lin(aq, asc, w3, s3, ws[2]).float()
-        if self.swiglu_limit > 0:
-            up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
-            gate = torch.clamp(gate, max=self.swiglu_limit)
-        y = F.silu(gate) * up
-        if weights is not None:
-            y = weights * y
+        gate_t = _lin(aq, asc, w1, s1, ws[0])
+        up_t = _lin(aq, asc, w3, s3, ws[2])
+        # One launch for clamp + silu + multiply + routing weight. The torch spelling was
+        # seven kernels per layer (two dtype copies, two clamps, silu, mul, mul) and the
+        # tensors are [1, 2304] -- so the cost was the launches, not the bytes.
+        _n = int(gate_t.numel())
+        y = torch.empty_like(gate_t)
+        _bound = _swiglu_bound(_n)
+        _bound(gate_t.reshape(-1), up_t.reshape(-1),
+               None if weights is None else weights.reshape(-1),
+               y.reshape(-1), _n, float(self.swiglu_limit), stream=None)
         from ..gemm import fp4_linear
-        return fp4_linear(y.to(torch.bfloat16), w2, s2)
+        return fp4_linear(y, w2, s2)
 
     def forward(self, x: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
         if hasattr(self.w1, "forward"):  # fp8 QuantLinear shared expert
