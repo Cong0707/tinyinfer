@@ -4,6 +4,7 @@ from __future__ import annotations
 import torch
 
 _ONE = object()
+_BOUND: dict = {}
 
 
 def available() -> bool:
@@ -45,9 +46,21 @@ def fp8_gemm_mma(x, w_fp8, w_scale, block: int = 32):
     # speedup and a NaN result, exactly what happened when NB changed from 8 to 1 here
     # without this grid following it.
     _BLOCK_M, _WARP_M, _WARP_N, _NB = 128, 16, 8, 4
+    _STAGES = 4
+    _NWARP = _BLOCK_M // _WARP_M
     _BCOL = _WARP_N * _NB
     grid = ((n + _BCOL - 1) // _BCOL, (xf.size(0) + _BLOCK_M - 1) // _BLOCK_M)
-    threads = (_BLOCK_M // _WARP_M) * 32
-    native.launch(native.kernel('fp8_gemm_mma', 'fp8_gemm_mma'), grid, (threads,),
-                  [aq, asc, w_fp8, w_scale, out, int(xf.size(0)), n, k])
+    threads = _NWARP * 32
+    # Dynamic shared memory: NWARP*STAGES warp-private A tiles (16*32 B each) followed by
+    # STAGES B tiles (NCOL*32 B each) = 8*4*512 + 4*1024 = 20 KB at NCOL=32. Constant per
+    # launch, so bind once per geometry instead of re-marshalling arguments every call.
+    _smem = _NWARP * _STAGES * (_WARP_M * 32) + _STAGES * (_BCOL * 32)
+    _key = ('fp8_gemm_mma', int(n), int(k), int(xf.size(0)))
+    _fn = _BOUND.get(_key)
+    if _fn is None:
+        _fn = native.BoundLaunch(
+            native.kernel('fp8_gemm_mma', 'fp8_gemm_mma'), grid, (threads,),
+            "TTTTOiii", shared=_smem)
+        _BOUND[_key] = _fn
+    _fn(aq, asc, w_fp8, w_scale, out, int(xf.size(0)), n, k, stream=None)
     return out.view(*x.shape[:-1], n)

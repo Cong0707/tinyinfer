@@ -37,6 +37,7 @@ constexpr int WARP_K = 32;    // k per mma, also one scale block
 // arithmetic: each block still computes whole mma tiles, just fewer of them.
 constexpr int NB = TI_MMA_NB;
 constexpr int BLOCK_M = 128;  // 8 warps stacked along M
+constexpr int NWARP = BLOCK_M / WARP_M;
 
 __device__ __forceinline__ float e8m0_val(unsigned char b) {
     // The stored byte IS the biased exponent: value = 2^(b - 127), so the float bits are
@@ -91,7 +92,19 @@ extern "C" __global__ void fp8_gemm_mma(
     // along M, so before this staging each of the 8 warps fetched the block's weight tile
     // from global on its own, 8x the necessary traffic. One tile is ncol x 32 bytes =
     // 1 KB, small enough to double-buffer and keep the next k-block's fetch in flight.
-    __shared__ __align__(16) uint8_t sB[2][WARP_N * NB * 32];
+    // B tile in shared memory, swizzled. ncu on the plain layout measured 5,901,609 bank
+    // conflicts -- 50.01% of all shared-load wavefronts, i.e. every load took 2.0
+    // wavefronts instead of 1.0 -- because the four lanes of a quad read addresses
+    // (g*32 + q*4) mod 128, which only ever touches banks 0..3, 8..11, 16..19, 24..27
+    // (16 of the 32). The XOR below folds the row index into the low bits so consecutive
+    // rows land on different banks, which is the standard tensor-core swizzle.
+    constexpr int ROW_B = 32;
+#define TI_SWZ(COL, OFF) ((uint8_t*)(sB[cur] + (COL) * ROW_B + (((COL) & 3) ^ ((OFF) >> 2)) * 4))
+    // B is shared by the whole block: the 8 warps are stacked along M and need the SAME
+    // weight columns, so staging it per warp multiplies the global reads by 8 (measured:
+    // 23.0 -> 7.6 TFLOPS). Block-wide staging plus one __syncthreads per k-block is the
+    // cheaper trade, and the barrier is what the double buffer exists to hide.
+    __shared__ __align__(16) uint8_t sB[2][WARP_N * NB * ROW_B];
 
 #define TI_STAGE_B(ST, KB)                                                       \
     do {                                                                         \
@@ -103,7 +116,8 @@ extern "C" __global__ void fp8_gemm_mma(
             const uint32_t _v = (_n < N)                                          \
                 ? *(const uint32_t*)(B + (long long)_n * K + _kb + _off)         \
                 : 0u;                                                            \
-            *(uint32_t*)(sB[ST] + _col * 32 + _off) = _v;                         \
+            *(uint32_t*)(sB[ST] + _col * ROW_B + (((_col) & 3) ^ ((_off) >> 2)) * 4)   \
+                = _v;                                                          \
         }                                                                        \
     } while (0)
 
@@ -117,6 +131,12 @@ extern "C" __global__ void fp8_gemm_mma(
 #pragma unroll
         for (int j = 0; j < 4; ++j) acc[i][j] = 0.f;
 
+    // Loop-invariant row bases (see the note at their use site).
+    const unsigned char* a_lo_row = A + (long long)(m0 + g) * K;
+    const unsigned char* a_hi_row = A + (long long)(m0 + g + 8) * K;
+    const unsigned char* as_lo_row = AS + (long long)(m0 + g) * nb_k;
+    const unsigned char* as_hi_row = AS + (long long)(m0 + g + 8) * nb_k;
+
     int cur = 0;
     TI_STAGE_B(0, 0);
     for (int kb = 0; kb < nb_k; ++kb) {
@@ -124,38 +144,63 @@ extern "C" __global__ void fp8_gemm_mma(
         if (kb + 1 < nb_k) TI_STAGE_B(1 - cur, kb + 1);
         const int kbase = kb << 5;
 
+        // A's row bases are loop-invariant: (m0+g)*K does not depend on kb, and the
+        // previous form recomputed it (a 64-bit multiply) four times per k-block, 160 times
+        // at K=5120. Hoisting them into registers outside the loop removes 8 integer
+        // instructions per iteration; at four mma per iteration that is a measurable share
+        // of the ALU pipe ncu reported as the busiest one (21.1%).
         uint32_t a[4];
         if (rows_lo) {
-            a[0] = *(const uint32_t*)(A + (long long)(m0 + g) * K + kbase + q * 4);
-            a[2] = *(const uint32_t*)(A + (long long)(m0 + g) * K + kbase + q * 4 + 16);
+            a[0] = *(const uint32_t*)(a_lo_row + kbase + q * 4);
+            a[2] = *(const uint32_t*)(a_lo_row + kbase + q * 4 + 16);
         } else { a[0] = 0u; a[2] = 0u; }
         if (rows_hi) {
-            a[1] = *(const uint32_t*)(A + (long long)(m0 + g + 8) * K + kbase + q * 4);
-            a[3] = *(const uint32_t*)(A + (long long)(m0 + g + 8) * K + kbase + q * 4 + 16);
+            a[1] = *(const uint32_t*)(a_hi_row + kbase + q * 4);
+            a[3] = *(const uint32_t*)(a_hi_row + kbase + q * 4 + 16);
         } else { a[1] = 0u; a[3] = 0u; }
 
-        const float as_lo = rows_lo ? e8m0_val(AS[(long long)(m0 + g) * nb_k + kb]) : 0.f;
-        const float as_hi = rows_hi ? e8m0_val(AS[(long long)(m0 + g + 8) * nb_k + kb]) : 0.f;
+        const float as_lo = rows_lo ? e8m0_val(as_lo_row[kb]) : 0.f;
+        const float as_hi = rows_hi ? e8m0_val(as_hi_row[kb]) : 0.f;
 
+        // Independent accumulators, one per mma tile, so the four mma instructions of this
+        // k-block issue back to back instead of each waiting on the previous one's scale
+        // FMA. The scale is applied after ALL four have retired: every lane's d[] is a
+        // hardware register set written by the mma itself, so there is no dependency
+        // between them until the multiply. Doing the FMA inline (the previous form) put a
+        // read-after-write on acc[nb] right behind every mma, which the scheduler cannot
+        // hide with only four instructions in flight.
+        float d0[NB], d1[NB], d2[NB], d3[NB];
 #pragma unroll
         for (int nb = 0; nb < NB; ++nb) {
-            const int n = n0 + nb * WARP_N + g;
-            // every lane must reach the mma; a column past N was staged as zero
-            const uint32_t* sp =
-                reinterpret_cast<const uint32_t*>(sB[cur] + (nb * WARP_N + g) * 32);
+            const int _col = nb * WARP_N + g;
+            const uint8_t* _base = sB[cur] + _col * ROW_B;
             uint32_t b[2];
-            b[0] = sp[q];
-            b[1] = sp[q + 4];
-
-            float d[4];
-            mma_m16n8k32(d, a, b);
-
-            const float bs_n = (n < N)
-                ? e8m0_val(BS[(long long)(n >> 5) * nb_k + kb]) : 0.f;
-            acc[nb][0] += d[0] * as_lo * bs_n;
-            acc[nb][1] += d[1] * as_lo * bs_n;
-            acc[nb][2] += d[2] * as_hi * bs_n;
-            acc[nb][3] += d[3] * as_hi * bs_n;
+            b[0] = *(const uint32_t*)(_base + ((_col & 3) ^ q) * 4);
+            b[1] = *(const uint32_t*)(_base + ((_col & 3) ^ (q + 4)) * 4);
+            float dd[4];
+            mma_m16n8k32(dd, a, b);
+            d0[nb] = dd[0];
+            d1[nb] = dd[1];
+            d2[nb] = dd[2];
+            d3[nb] = dd[3];
+        }
+        // One bs per 32-column scale block, and NB*WARP_N == 32 when NB == 4, so every nb in
+        // this block shares the SAME weight scale. The previous form decoded it once per
+        // nb (four e8m0_val calls where one suffices) and then multiplied by as twice per
+        // accumulator, i.e. 32 multiply instructions for what is 2 + 4 per nb. The two
+        // products s_lo/s_hi are formed once and reused by all four FMA, which is what a
+        // fused multiply-add wants anyway.
+        const int _nc = (n0 >> 5) * nb_k + kb;   // column scale-block of this n tile
+        const float bs_c = ((n0 >> 5) < (N + 31) / 32 && nb_k > 0)
+            ? e8m0_val(BS[(long long)_nc]) : 0.f;
+        const float s_lo = as_lo * bs_c;
+        const float s_hi = as_hi * bs_c;
+#pragma unroll
+        for (int nb = 0; nb < NB; ++nb) {
+            acc[nb][0] += d0[nb] * s_lo;
+            acc[nb][1] += d1[nb] * s_lo;
+            acc[nb][2] += d2[nb] * s_hi;
+            acc[nb][3] += d3[nb] * s_hi;
         }
         cur ^= 1;
     }
