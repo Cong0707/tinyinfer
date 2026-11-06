@@ -131,7 +131,7 @@ All of it is bit-exact against the previous path (verified per call site):
     end to end: ~808 -> ~790 ms (inside the 782-850 run-to-run spread)
 
 The bound-launch work is worth about 6 ms/token. The GEMV work is worth almost nothing
-here and everything on a card that holds the model: at 24 GB the decode working set lives
+here and everything on a card that holds the model: at 20 GB the decode working set lives
 in the VRAM slot pool, so kernel time is the whole token.
 
 ## The honest bottom line
@@ -141,6 +141,7 @@ are both hardware:
 
     MTP speculative decoding   -61% expert bytes at 50% acceptance   (+72%)
                                needs 7.6 GB of draft stages; 8 GB cannot hold them
-    24 GB or more              zero PCIe, zero disk for the expert table
+    20 GB or more              zero PCIe, zero disk for the expert table
+                               (see docs/vs-vllm.md for the per-size measurement)
 
 Neither is a software problem. Everything above was measured trying to find one anyway.

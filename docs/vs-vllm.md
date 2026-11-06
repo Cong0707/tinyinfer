@@ -12,7 +12,7 @@ streams the rest.
 
 | hardware | vLLM | this engine |
 | --- | --- | --- |
-| 8 GB | cannot start (475 GB needed) | 1.23 tok/s, 810 ms/token |
+| 8 GB | cannot start (475 GB needed) | 1.26 tok/s, 790 ms/token |
 | 20 GB | cannot start | **40/40 layers, 247 slots -- the zero-PCIe threshold** |
 | 24 GB | cannot start | 40/40 layers, 309 slots |
 | 32 GB | cannot start | 40/40 layers, 561 slots |
