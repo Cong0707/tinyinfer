@@ -133,6 +133,29 @@ that drives the per-rank passes」—— 那个 caller 不存在。
 **现在默认关闭，`TI_EP=1` 才打开，打开时大声警告。** 多卡时每层仍然算全部六个专家
 （权重在每张卡上重复），结果正确，只是多占显存 —— 这比静默丢掉一半专家好。
 
+### 已经修掉的第一个 bug：变量名冲突
+
+`MoE.forward` 里 `_route` 被用了两次：437 行是「路由到的专家 id 列表」，452 行又被
+赋值成 `ExpertRoute` 对象。而 516 行的 decode 路径要 `enumerate(_route)` 去建
+`_groups`，于是任何 `ep_world > 1` 的 decode 都在那里抛
+`TypeError: 'NoneType' object is not iterable`。**这才是专家并行从来没跑通过的原因**
+—— 不是数值不准，是根本跑不完。改名成 `_epr` 之后能跑到底了。
+
+### 还没修掉的：归约后的值差 14%
+
+单卡手工驱动两个 rank（同一张卡、不同的 `ep_rank`）验证：append/reduce/clear 都发生了，
+但 reduce 的结果和 `ep_world=1` 的全量仍差一截：
+
+```
+max|diff| = 4.07    mean|diff| = 0.86
+median(yr / yf) = 0.860     相同元素: 15 / 5120
+```
+
+**整体缩到 86%**，说明少了约 14% 的贡献，不是某几个位置错。已知 rank0 的三个专家
+只贡献 norm 964、rank1 的三个贡献 4365（差 4.5 倍），而两者的 active 集合是互补且
+完整的（[46,342,354] 与 [127,153,285]，全量正是这六个）。下一步从这里查：`_wsum`
+的取法、以及 `moe_gemv.acc` 在 `_ids` 只有 3 个时的索引。
+
 为什么不是一个驱动循环就能补上：`ExpertStore.fetch_async(layer, experts)` **没有
 device 参数**，专家的落点永远是层所在的那张卡。所以「让每张卡各算一部分」在当前架构
 里没有落脚点 —— 要么给 fetch 加设备参数、把层的执行拆到多卡（层内并行），要么换一种
