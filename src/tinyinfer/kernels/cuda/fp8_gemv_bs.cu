@@ -47,8 +47,14 @@ extern "C" __global__ void fp8_gemv_bs(
     const unsigned char* __restrict__ ws,   // [N/32, K/32] e8m0 weight scales
     __nv_bfloat16* __restrict__ y,          // [N]
     int n_rows, int k_dim) {
+    // Rows per block comes from the launch, not a literal: one warp handles one row and
+    // the reduction is warp-local, so the block's warp count only affects how the rows are
+    // packed onto the SMs -- the arithmetic is identical for any block size. That makes it
+    // a free knob for the wave-tail: N/16 blocks on a 26-SM part is 1.4 waves (the second
+    // wave leaves 40% of the SMs idle), while N/8 doubles the block count and fills it.
+    const int warps = blockDim.x >> 5;
     const int lane = threadIdx.x & 31;
-    const int n = blockIdx.x * 16 + (threadIdx.x >> 5);
+    const int n = blockIdx.x * warps + (threadIdx.x >> 5);
     if (n >= n_rows) return;
 
     const int nb = k_dim >> 5;              // scale groups along k

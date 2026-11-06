@@ -95,7 +95,8 @@ def _fp8_gemv(report):
         x = torch.randn(1, k, dtype=torch.bfloat16, device='cuda')
         aq, asc = act_quant(x, 32, 'ue8m0', torch.float8_e8m0fnu)
         out = torch.empty(n, device='cuda', dtype=torch.bfloat16)
-        native.launch(native.kernel('fp8_gemv_bs', 'fp8_gemv_bs'), ((n + 15) // 16,), (512,),
+        # grid/block must match gemm.fp8_linear: 8 rows per block (one warp per row)
+        native.launch(native.kernel('fp8_gemv_bs', 'fp8_gemv_bs'), ((n + 7) // 8,), (256,),
                       [aq.view(torch.uint8).reshape(-1), asc.view(torch.uint8).reshape(-1),
                        w.view(torch.uint8).reshape(-1), ws.view(-1), out, n, k])
         # The scale sits INSIDE the k loop: it is per 32-element block, so each block's

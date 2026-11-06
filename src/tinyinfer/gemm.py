@@ -144,8 +144,13 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
             _key = ("fp8_gemv_bs", int(n), int(k))
             _fn = _GEMV_BOUND.get(_key)
             if _fn is None:
+                # 8 rows per block (256 threads), not 16. The reduction is warp-local, so
+                # how many warps share a block is a free scheduling knob: halving it
+                # doubles the block count and fills the wave tail on a 26-SM part.
+                # Measured [2304,5120] with HBM-resident weights: 16 rows 39.5 us /
+                # 307.9 GB/s, 8 rows 37.8 us / 322.4 GB/s, 4 rows 37.6 us / 324.2 GB/s.
                 _fn = native.BoundLaunch(native.kernel("fp8_gemv_bs", "fp8_gemv_bs"),
-                                         ((n + 15) // 16,), (512,), "TTTTOii")
+                                         ((n + 7) // 8,), (256,), "TTTTOii")
                 _GEMV_BOUND[_key] = _fn
             _fn(aq.view(torch.uint8).reshape(-1),
                 asc.view(torch.uint8).reshape(-1),
