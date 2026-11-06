@@ -43,7 +43,7 @@ constexpr int ROWS = 8;   // output rows per block, one warp each
 constexpr int BLK = 32;   // one quantisation block
 
 __device__ __forceinline__ float dot_block(const uint4 a0, const uint4 a1,
-                                           const uint4 w, const float* lut) {
+                                           const uint4 w, const float* __restrict__ lut) {
     const unsigned char* ab = reinterpret_cast<const unsigned char*>(&a0);
     const unsigned char* ai = reinterpret_cast<const unsigned char*>(&a1);
     const unsigned char* wb = reinterpret_cast<const unsigned char*>(&w);
@@ -80,6 +80,15 @@ extern "C" __global__ void gemv_fp4_w4a8(
     const float* __restrict__ WS,
     __nv_bfloat16* __restrict__ Y,
     int M, int N, int K) {
+    // The 16-entry E2M1 table belongs in shared memory. Reading it from its __device__
+    // (i.e. global) definition made every one of the 160 table lookups per thread a
+    // dependent global load; the header of this file already recorded that moving the
+    // table to shared memory was worth 7.6x on an earlier revision, but the array was
+    // still being passed in its global form.
+    __shared__ float sLut[16];
+    if (threadIdx.x < 16) sLut[threadIdx.x] = kFp4Lut[threadIdx.x];
+    __syncthreads();
+
     const int nb = K >> 5;                       // blocks per row
     const int lane = threadIdx.x & 31;
     const int r = threadIdx.x >> 5;
@@ -105,7 +114,7 @@ extern "C" __global__ void gemv_fp4_w4a8(
         const uint4 a1 = av[kb * 2 + 1];
         // W: block kb covers bytes [kb*16, kb*16+16) -> one uint4
         const uint4 w0 = wv[kb];
-        const float s = dot_block(a0, a1, w0, kFp4Lut);
+        const float s = dot_block(a0, a1, w0, sLut);
         const float sc = s * asrow[kb] * wsrow[kb];
         if (i & 1) acc1 += sc; else acc0 += sc;
     }
@@ -114,5 +123,77 @@ extern "C" __global__ void gemv_fp4_w4a8(
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) total += __shfl_xor_sync(0xffffffffu, total, off);
 
+    if (lane == 0) Y[(long long)bm * N + n] = __float2bfloat16(total);
+}
+
+// ---------------------------------------------------------------------------
+// Same arithmetic, two changes that the profile asked for.
+//
+// 1. Scales arrive as e8m0 bytes instead of fp32. The caller used to run
+//    pow(2, s-127) over [N, K/32] before every launch: measured 9.3 us against a
+//    34.9 us kernel, and it turned a 368 KB scale table into 1.47 MB of traffic.
+//    The e8m0 byte IS the biased exponent, so __uint_as_float(b << 23) reads it back
+//    with two instructions and no table.
+//
+// 2. The activation row lives in shared memory. It is the same 5 KB for every output
+//    row, and the previous version had each of the 8 warps re-read it from global on
+//    every iteration -- two thirds of the load instructions in the inner loop were
+//    re-fetching data the block already had.
+//
+// Layout: sA[K] fp8 bytes (16-byte aligned), then sAS[K/32] fp32 decoded scales.
+extern "C" __global__ void gemv_fp4_w4a8_e8m0(
+    const __nv_fp8_e4m3* __restrict__ A,
+    const unsigned char* __restrict__ AS,   // [M, K/32] e8m0
+    const unsigned char* __restrict__ W,    // [N, K/2] packed E2M1
+    const unsigned char* __restrict__ WS,   // [N, K/32] e8m0
+    __nv_bfloat16* __restrict__ Y,
+    int M, int N, int K) {
+    extern __shared__ __align__(16) unsigned char sMem[];
+    __nv_fp8_e4m3* sA = reinterpret_cast<__nv_fp8_e4m3*>(sMem);
+    float* sAS = reinterpret_cast<float*>(sMem + ((K + 15) & ~15));
+
+    __shared__ float sLut[16];
+    if (threadIdx.x < 16) sLut[threadIdx.x] = kFp4Lut[threadIdx.x];
+
+    const int nb = K >> 5;
+    const int lane = threadIdx.x & 31;
+    const int r = threadIdx.x >> 5;
+    const int nblocks = (N + ROWS - 1) / ROWS;
+    const int bx = blockIdx.x % nblocks;
+    const int bm = blockIdx.x / nblocks;
+    if (bm >= M) return;
+
+    // One coalesced pass to stage the activation row and decode its scales.
+    const uint4* av = reinterpret_cast<const uint4*>(A + (long long)bm * K);
+    uint4* sAv = reinterpret_cast<uint4*>(sA);
+    const int nvec = K >> 4;
+    for (int t = threadIdx.x; t < nvec; t += blockDim.x) sAv[t] = av[t];
+    const unsigned char* asrow_b = AS + (long long)bm * nb;
+    for (int t = threadIdx.x; t < nb; t += blockDim.x)
+        sAS[t] = __uint_as_float((unsigned int)asrow_b[t] << 23);
+    __syncthreads();
+
+    const int n = bx * ROWS + r;
+    if (n >= N) return;
+
+    const uint4* wv = reinterpret_cast<const uint4*>(W + (long long)n * (K >> 1));
+    const unsigned char* wsrow = WS + (long long)n * nb;
+
+    float acc0 = 0.f, acc1 = 0.f;
+    int kb = lane;
+    for (int i = 0; kb < nb; kb += 32, ++i) {
+        const uint4 a0 = sAv[kb * 2];
+        const uint4 a1 = sAv[kb * 2 + 1];
+        const uint4 w0 = wv[kb];
+        const float s = dot_block(a0, a1, w0, sLut);
+        // e8m0 byte -> 2^(b-127); the byte is already the biased exponent.
+        const float ws = __uint_as_float((unsigned int)wsrow[kb] << 23);
+        const float sc = s * sAS[kb] * ws;
+        if (i & 1) acc1 += sc; else acc0 += sc;
+    }
+
+    float total = acc0 + acc1;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) total += __shfl_xor_sync(0xffffffffu, total, off);
     if (lane == 0) Y[(long long)bm * N + n] = __float2bfloat16(total);
 }

@@ -24,12 +24,55 @@ def _scale(s: torch.Tensor) -> torch.Tensor:
     return s.float()
 
 
+# Launchers for the e8m0/shared-memory variant, keyed by K (its dynamic smem depends on
+# it). The kernel takes the checkpoint's scale bytes directly, so the caller no longer
+# pays a pow(2, s-127) pass over [N, K/32] before every expert: that conversion measured
+# 9.3 us against a 20.9 us kernel and inflated the scale table 4x.
+_E8M0_BOUND: dict = {}
+_E8M0_SMEM_RAISED = False
+
+
+def _e8m0_launcher(n: int, k: int):
+    global _E8M0_SMEM_RAISED
+    from ..kernels import native
+
+    # Keyed by (n, k): the grid is a function of n and the dynamic shared memory a
+    # function of k, so a k-only key handed a launcher built for one output size to a
+    # caller asking for another (cuLaunchKernel returned 1 on the next expert shape).
+    key = (n, k)
+    hit = _E8M0_BOUND.get(key)
+    if hit is not None:
+        return hit
+    nb = k // 32
+    smem = ((k + 15) & ~15) + 4 * nb
+    # No set_dynamic_smem: this kernel asks for K + 4*K/32 bytes, which is 5.8 KB at
+    # K=5120 -- far below the 48 KB a launch gets without raising the function attribute.
+    # (Raising it to the device maximum instead made cuFuncSetAttribute return 1, and
+    # setting it per shape lowered the ceiling for larger K launchers already bound.)
+    bound = native.bind("gemv_fp4_w4a8", "gemv_fp4_w4a8_e8m0", ((n + 7) // 8,), (256,),
+                        "TOOOOiii", shared=smem)
+    _E8M0_BOUND[key] = bound
+    return bound
+
+
 def gemv_fp4_pq(aq, asc, w_fp4, w_scale, ws=None):
     """fp8 activation [K] x fp4 weight [N, K/2] -> [1, N] bf16."""
     from ..kernels import native
 
     n, k2 = w_fp4.shape
     k = k2 * 2
+    # e8m0 path: no fp32 scale materialisation, activation staged in shared memory.
+    # Bit-identical to the fp32 form (verified maxdiff 0.0) and 1.87x faster on
+    # [2304, 5120]: 39.1 us -> 20.9 us, i.e. 300 GB/s against this card's 384.
+    if (ws is None and asc.dtype == torch.float8_e8m0fnu
+            and w_scale.dtype == torch.float8_e8m0fnu):
+        wb0 = w_fp4 if w_fp4.dtype == torch.uint8 else w_fp4.view(torch.uint8)
+        out0 = torch.empty(n, dtype=torch.bfloat16, device=aq.device)
+        launch = _e8m0_launcher(n, k)
+        launch(aq.reshape(-1), asc.view(torch.uint8).reshape(-1), wb0.reshape(-1),
+               w_scale.view(torch.uint8).reshape(-1), out0, 1, int(n), int(k),
+               stream=None)
+        return out0.view(1, n)
     if ws is None:
         ws = _scale(w_scale)
     # No repeat_interleave here: gemv_fp4_pq's caller already hands an [N, K/32] scale

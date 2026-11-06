@@ -196,33 +196,19 @@ class Expert:
         # NOTE: stacking [w1; w3] into one 2N-row GEMV was tried and removed: the two
         # torch.cat calls it needs cost 768 launches and 22ms of GPU time per token, more
         # than the 18 -> 12 launch saving. The GEMVs are not the bottleneck.
-        if aq.dim() == 2 and aq.size(0) == 1:
-            # Decode only: the fp32 scale conversion is a 1.5MB elementwise pass and it
-            # was done once per matmul (0.18ms x 3 per expert, 130ms per token). Caching
-            # it per expert at prefill would hold 3 tensors for every one of the ~2400
-            # experts a prompt touches, which OOMs an 8GB card -- so prefill converts as
-            # before and decode keeps it for the few experts it serves.
-            ws = getattr(self, "_ws_cache", None)
-            if ws is None:
-                from .fp4_native import _scale
-
-                ws = self._ws_cache = (_scale(s1), _scale(s2), _scale(s3))
-        # Decode: gate and up in one launch. They are two fp4 matrices over the same
-        # activation, so the fused kernel reads that activation once instead of twice --
-        # measured 1.50x on real expert weights, bit-identical to the two calls
-        # (diff 0.0 on both). Prefill keeps the row loop, where the batch dimension makes
-        # the two-call form the cheaper one.
-        _fused_gu = (aq.dim() == 2 and aq.size(0) == 1 and aq.is_cuda
-                     and ws is not None and w1.shape == w3.shape)
-        if _fused_gu:
-            from .fp4_gate_up import gemv_fp4_gate_up
-
-            gate_t, up_t = gemv_fp4_gate_up(aq, asc, w1, ws[0], w3, ws[2])
-            gate = gate_t.float()
-            up = up_t.float()
-        else:
-            gate = _lin(aq, asc, w1, s1, ws[0]).float()
-            up = _lin(aq, asc, w3, s3, ws[2]).float()
+        # ws stays None. It used to hold a cached pow(2, s-127) expansion of the three
+        # scale tables so the fp32-scale kernel could take them directly. The e8m0 kernel
+        # now reads the checkpoint's bytes, which removes that conversion (measured 9.3 us
+        # per expert matrix) and lets the decode path take the fast branch inside
+        # gemv_fp4_pq instead of the fp32 one.
+        # Two calls, not the fused gate_up kernel. The fusion was worth 1.50x when both
+        # paths were the fp32-scale GEMV (it reads the activation once instead of twice),
+        # but the e8m0 kernel stages the activation in shared memory anyway, and the
+        # fused wrapper still takes fp32 scales. Measured on [2304, 5120] x 2:
+        #     fused gate_up   250.7 us   (and it needs a pow(2, s-127) pass first)
+        #     two e8m0 calls   42.2 us
+        gate = _lin(aq, asc, w1, s1, ws[0]).float()
+        up = _lin(aq, asc, w3, s3, ws[2]).float()
         if self.swiglu_limit > 0:
             up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
             gate = torch.clamp(gate, max=self.swiglu_limit)
