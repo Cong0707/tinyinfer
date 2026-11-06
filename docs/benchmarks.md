@@ -1,5 +1,9 @@
 # Benchmark history (this machine, measured)
 
+> **Historical log, not the current state.** The newest row here is an older round; the
+> engine now runs at 790 ms/token = 1.26 tok/s with output [223,19,17,20]. See
+> docs/decode_bounds.md for the current numbers and where the time goes.
+
 Every row is one run of `python -m tinyinfer.bench` or the probe scripts; the disk rate
 is measured in the same run. Absolute tok/s is fetch-bound and tracks the disk, so the
 invariant to compare across runs is the ratio to the IO floor (docs/lower_bounds.md).

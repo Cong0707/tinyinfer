@@ -1,5 +1,11 @@
 # Decode speed and session handling
 
+> **Stale: these numbers are from an earlier round (1.66 s/token, 0.60 tok/s). The engine
+> now runs at 790 ms/token = 1.26 tok/s, and the bottleneck analysis in this file is
+> superseded by docs/decode_bounds.md, which measures where the time actually goes
+> (36% waiting on expert reads, 64% arithmetic) instead of assuming it is all disk.
+> Kept because the history of what was tried is still useful.
+
 ## Current (RTX 5060 8GB + 47GB, level 2, top-6 experts, quality preserving)
 
 | metric | value |
