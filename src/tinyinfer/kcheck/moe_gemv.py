@@ -38,7 +38,9 @@ def register(report) -> None:
         return
 
     torch.manual_seed(30)
-    n_exp, k, n = 3, 512, 128
+    # down's kernel walks k in 256-wide steps: the down projection's k_dim comes from
+    # w2's shape, so pick sizes where that is a multiple of 256
+    n_exp, k, n = 3, 512, 256
     lut = _lut().cuda()
 
     def codes(shape):
