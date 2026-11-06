@@ -25,17 +25,31 @@ def _native_ok() -> bool:
         return False
 
 
+# One bound launcher per (entry, n, k). This kernel is launched 288 times in a single
+# decode step (7 per layer), and the generic launch path re-tests every argument's type
+# and rebuilds the ctypes pointer array each time: measured 19.3 us of a 26.4 us call,
+# with the GPU work itself under 1 us at these sizes. BoundLaunch caches the geometry and
+# the argument kinds, leaving one list comprehension plus cuLaunchKernel.
+_BOUND: dict[tuple[str, int, int], object] = {}
+
+
 def _launch(x: torch.Tensor, out, scale, entry: str) -> None:
     from . import native
 
     n, k = x.shape
-    nwarp = (n * k) // 32
-    blk = 128
-    grid = (((nwarp * 32) + blk - 1) // blk,)
-    native.launch(native.kernel("act_quant", entry), grid, (blk,),
-                  # 1e-4 is the reference's floor (official_kernel_ref: T.max(amax, 1e-4));
-                  # using 1e-8 changed the decode output on real weights.
-                  [x, out, scale, int(n), int(k), 1e-4])
+    key = (entry, int(n), int(k))
+    fn = _BOUND.get(key)
+    if fn is None:
+        blk = 128
+        nwarp = (n * k) // 32
+        grid = (((nwarp * 32) + blk - 1) // blk,)
+        # 'T' tensor in, 'O' tensor written, 'i' int32, 'f' float32
+        fn = native.BoundLaunch(native.kernel("act_quant", entry), grid, (blk,),
+                                "TOTiif")
+        _BOUND[key] = fn
+    # 1e-4 is the reference's floor (official_kernel_ref: T.max(amax, 1e-4)); using 1e-8
+    # changed the decode output on real weights.
+    fn(x, out, scale, int(n), int(k), 1e-4)
 
 
 def act_quant(x: torch.Tensor, block_size: int = 128, scale_fmt=None,
