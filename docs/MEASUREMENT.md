@@ -65,3 +65,35 @@ keying, and needs a fix that does not also drop the fused path.)
 
 The decode reference is `scripts/bench.py`; run it standalone, not inside another
 process, and read `decode_tok_per_s_steady` rather than the mean.
+## Dead ends, with the measurement that closed them
+
+Everything below was implemented far enough to measure, and then reverted. They are kept
+because 'we tried X and it did not work' is only useful with the number that killed it.
+
+| attempt | measured result |
+| --- | --- |
+| cross-layer router prefetch | 790 -> 1216 ms. The next layer's router can be evaluated
+  from the current layer's output (0.052 ms each), but its prediction agrees with the real
+  routing at Jaccard 0.150, so 85% of what gets fetched is the wrong expert and the disk
+  sees more traffic, not less. |
+| marlin repack cache | 1.9 s -> 4.8 s (64 entries) -> 11.3 s (512). Retaining a repacked
+  expert also pins its source tensors (6 MB each); on a 6.9 GB card that evicts buffers
+  the streaming ring needs. Unbounded it trips the CUDA allocator. |
+| more reader threads | 8/16/32 threads: 2.88/2.99/2.89 GB/s. Saturated at 8. |
+| reading through the Windows file cache | 1.06 GB/s against 3.0 with FILE_FLAG_NO_BUFFERING
+  (decode 726 -> 1103 ms). |
+| larger expert cache | 15.8 -> 27.5 GB buys hit rate 49.3% -> 52.5%, i.e. ~6% of a token,
+  for 11.7 GB more RAM on a 47.2 GB box. |
+| coalescing a layer's 28 DMAs into 3 | needs the host addresses to be contiguous; on
+  Windows cudaHostAlloc scatters them over 2.4 TB of address space, so the path cannot
+  engage. Works on Linux. |
+| tensor-core GEMM at M=1 | 4.2x (wq_b) to 6.5x (w1) slower than the SIMT GEMV; 15/16 of
+  the 16-row tile is padding. |
+| CPU-side MoE routing | 788 -> 879 ms; the D2H sync costs more than the matmul it saves. |
+
+## One more measurement trap worth naming
+
+Deleting a code block by line-number slice corrupted `engine.py`: the offsets were read
+from one snapshot of the file and applied to another, so a non-adjacent range went with
+it. `git checkout --` recovered it. Use an edit with a unique anchor; line numbers are not
+stable across a read and a write.
