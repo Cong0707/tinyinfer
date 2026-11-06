@@ -55,12 +55,33 @@ def _native_sinkhorn(mixes, hc_scale, hc_base, hc_mult, iters, eps):
 
     hc = int(hc_mult)
     b, s, _ = mixes.shape
-    pre = torch.sigmoid(mixes[..., :hc] * hc_scale[0] + hc_base[:hc]) + eps
-    post = 2.0 * torch.sigmoid(mixes[..., hc:2 * hc] * hc_scale[1] + hc_base[hc:2 * hc])
-    comb = (mixes[..., 2 * hc:].view(b, s, hc, hc) * hc_scale[2]
-            + hc_base[2 * hc:].view(hc, hc)).contiguous()
-    out = torch.empty_like(comb)
     n = int(b * s)
+    # pre/post/comb in one kernel instead of eight elementwise launches, twice per layer.
+    # The kernel uses explicitly-rounding intrinsics so it is bit-identical to the torch
+    # spelling (maxdiff 0.0 on all three); hc is fixed at 4 inside it, other values fall
+    # back below.
+    _split = _BOUND.get(("hc_split", n, hc))
+    if _split is None and hc == 4:
+        try:
+            _split = native.BoundLaunch(native.kernel("hc_split", "hc_split"),
+                                        ((n + 127) // 128,), (128,), "TTTOOOif")
+            _BOUND[("hc_split", n, hc)] = _split
+        except Exception:
+            _split = None
+    if _split is not None:
+        mx = mixes if mixes.is_contiguous() else mixes.contiguous()
+        pre = torch.empty((b, s, hc), dtype=mixes.dtype, device=mixes.device)
+        post = torch.empty_like(pre)
+        comb = torch.empty((b, s, hc, hc), dtype=mixes.dtype, device=mixes.device)
+        _split(mx.reshape(n, 2 * hc + hc * hc), hc_scale.reshape(-1), hc_base.reshape(-1),
+               pre.view(n, hc), post.view(n, hc), comb.view(n, hc * hc),
+               n, float(eps), stream=None)
+    else:
+        pre = torch.sigmoid(mixes[..., :hc] * hc_scale[0] + hc_base[:hc]) + eps
+        post = 2.0 * torch.sigmoid(mixes[..., hc:2 * hc] * hc_scale[1] + hc_base[hc:2 * hc])
+        comb = (mixes[..., 2 * hc:].view(b, s, hc, hc) * hc_scale[2]
+                + hc_base[2 * hc:].view(hc, hc)).contiguous()
+    out = torch.empty_like(comb)
     # Bound launcher: sinkhorn_hc runs twice per layer (80 times per decode step) and the
     # generic launch path charges ~19 us of argument marshalling for a kernel that does a
     # 4x4 normalisation loop. Keyed on the geometry, which only depends on the batch shape.
