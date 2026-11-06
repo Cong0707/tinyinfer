@@ -435,9 +435,18 @@ class HCBlockMixin:
                 bfs = x.dtype == torch.bfloat16
                 out = torch.empty((b * s, hc, d), dtype=x.dtype, device=x.device)
                 n = b * s * hc * d
-                _launch(_kern("hc_post_bf" if bfs else "hc_post_f"),
-                        ((n + 255) // 256,), (256,),
-                        [xc, rc, pc, cc, out, b * s, hc, d])
+                # Bound launcher: hc_post runs once per layer (80 per decode step on this
+                # model's two hyper-connection sites). Signature is
+                #   (x, residual, post, comb, out, n, hc, d) = T T T T O i i i
+                from ..kernels import native as _nv
+
+                _key = (bool(bfs), int(b * s), int(hc), int(d))
+                _fn = _BOUND.get(_key)
+                if _fn is None:
+                    _nm = "hc_post_bf" if bfs else "hc_post_f"
+                    _fn = _nv.BoundLaunch(_kern(_nm), ((n + 255) // 256,), (256,), "TTTTOiii")
+                    _BOUND[_key] = _fn
+                _fn(xc, rc, pc, cc, out, b * s, hc, d, stream=None)
                 return out.view(b, s, hc, d)
             except Exception:
                 pass

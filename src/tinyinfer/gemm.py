@@ -89,6 +89,10 @@ def _fp8_native() -> bool:
 _FP8_NATIVE = None
 
 
+# Bound launchers for the decode-time GEMVs, keyed by (kernel, n, k).
+_GEMV_BOUND: dict = {}
+
+
 def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, block: int = 32) -> torch.Tensor:
     # Cast BEFORE the fast path decides anything. act_quant only has a native
     # kernel for bf16 input; handing it fp32 falls back to the tilelang one, which
@@ -135,13 +139,19 @@ def fp8_linear(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor, bloc
             aq, asc = _act_quant(x, block, SCALE_FMT, SCALE_DTYPE)
             n, k = w_fp8.shape
             y = torch.empty(n, device=x.device, dtype=torch.bfloat16)
-            native.launch(native.kernel("fp8_gemv_bs", "fp8_gemv_bs"),
-                          ((n + 15) // 16,), (512,),
-                          [aq.view(torch.uint8).reshape(-1),
-                           asc.view(torch.uint8).reshape(-1),
-                           w_fp8.view(torch.uint8).reshape(-1),
-                           w_scale.view(torch.uint8).reshape(-1),
-                           y, int(n), int(k)])
+            # Bound launcher: 248 calls per decode token, and the generic launch path
+            # spends ~19 us marshalling arguments for a kernel that reads 11 MB.
+            _key = ("fp8_gemv_bs", int(n), int(k))
+            _fn = _GEMV_BOUND.get(_key)
+            if _fn is None:
+                _fn = native.BoundLaunch(native.kernel("fp8_gemv_bs", "fp8_gemv_bs"),
+                                         ((n + 15) // 16,), (512,), "TTTTOii")
+                _GEMV_BOUND[_key] = _fn
+            _fn(aq.view(torch.uint8).reshape(-1),
+                asc.view(torch.uint8).reshape(-1),
+                w_fp8.view(torch.uint8).reshape(-1),
+                w_scale.view(torch.uint8).reshape(-1),
+                y, int(n), int(k), stream=None)
             return y.view(1, n)
         except Exception as _exc:
             if __import__("os").environ.get("TI_FP8_DEBUG") == "1":
