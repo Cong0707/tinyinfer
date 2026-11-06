@@ -62,3 +62,8 @@ build/
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Historical bench / profiling scratch: one-off drivers kept from earlier work
+# plus the vLLM kernel sources they were built against (~13 MB). Not engine
+# source; the current benchmark entry points live in scripts/.
+bench/
