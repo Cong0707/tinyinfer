@@ -13,11 +13,19 @@ streams the rest.
 | hardware | vLLM | this engine |
 | --- | --- | --- |
 | 8 GB | cannot start (475 GB needed) | 1.23 tok/s, 810 ms/token |
-| 24 GB | cannot start | 40/40 layers, 241 expert slots, zero PCIe per token |
+| 20 GB | cannot start | **40/40 layers, 247 slots -- the zero-PCIe threshold** |
+| 24 GB | cannot start | 40/40 layers, 309 slots |
 | 32 GB | cannot start | 40/40 layers, 561 slots |
 | 80 GB | cannot start | 40/40 layers, 2480 slots |
 | 141 GB | cannot start | 40/40 layers, 4919 slots |
 | 8x141 GB | runs, 42% of VRAM used | runs, same residency, kernel-bound |
+
+The zero-PCIe threshold is 20 GB, not 24. A decode token touches at most topk(6) x 40",
++ "layers = 240 distinct experts at 18.8 MB each, so the slot pool needs 240 entries (4.5 GB)
+on top of the 6.5 GB of resident weights and the ring/workspace. Measured with the planner
+at each size: 16 GB gives 36/40 layers and no slots at all; 18 GB holds all 40 layers but
+only 69 slots (171 short); 20 GB gives 247 slots and every expert of the working set is
+already resident.
 
 Below ~475 GB of VRAM there is no comparison to make: one engine runs and the other
 does not. That is the whole reason this project exists, and it is worth stating plainly
