@@ -1,4 +1,4 @@
-﻿"""Decode-time fp4 MoE fused across every routed expert of a layer.
+"""Decode-time fp4 MoE fused across every routed expert of a layer.
 
 The tilelang path launches one GEMV per expert per projection, converts each expert's
 e8m0 scale block to fp32 before the kernel can read it, and then spends about seven
@@ -135,6 +135,9 @@ def gate_up(aq: torch.Tensor, asc: torch.Tensor, w1, s1, w3, s3) -> torch.Tensor
     return out
 
 
+_BOUND: dict = {}
+
+
 def act(gu: torch.Tensor, w_exp: torch.Tensor, limit: float = 0.0):
     """[n_exp, n] bf16: silu(clamp(gate)) * clamp(up) * routing weight."""
     n_exp, two_n = gu.shape
@@ -142,8 +145,16 @@ def act(gu: torch.Tensor, w_exp: torch.Tensor, limit: float = 0.0):
     out = torch.empty((n_exp, n), dtype=torch.bfloat16, device=gu.device)
     if w_exp.dtype != torch.float32:
         w_exp = w_exp.float()
-    native.launch(_kernel("moe_act6"), ((n + 255) // 256, n_exp, 1), (256,),
-                  [gu, w_exp.contiguous(), out, n, float(limit), n_exp], 0)
+    # Bound launcher: this runs once per layer (40 per decode step) and the generic path
+    # charges ~19 us of argument marshalling for a kernel whose work here is well under
+    # that. Keyed on the geometry, which is constant for a given model shape.
+    key = ("moe_act6", int(n_exp), int(n))
+    fn = _BOUND.get(key)
+    if fn is None:
+        fn = native.BoundLaunch(_kernel("moe_act6"),
+                                ((n + 255) // 256, n_exp, 1), (256,), "TOTifi")
+        _BOUND[key] = fn
+    fn(gu, w_exp.contiguous(), out, n, float(limit), n_exp, stream=0)
     return out
 
 
@@ -163,8 +174,13 @@ def act_quant(gu: torch.Tensor, w_exp: torch.Tensor, limit: float = 0.0):
     asc = torch.empty((n_exp, n // 32), dtype=torch.uint8, device=gu.device)
     if w_exp.dtype != torch.float32:
         w_exp = w_exp.float()
-    native.launch(_kernel("moe_act_q6"), (n // 32, n_exp, 1), (32,),
-                  [gu, w_exp.contiguous(), aq, asc, n, float(limit), n_exp], 0)
+    key = ("moe_act_q6", int(n_exp), int(n))
+    fn = _BOUND.get(key)
+    if fn is None:
+        fn = native.BoundLaunch(_kernel("moe_act_q6"),
+                                (n // 32, n_exp, 1), (32,), "TOTOifi")
+        _BOUND[key] = fn
+    fn(gu, w_exp.contiguous(), aq, asc, n, float(limit), n_exp, stream=0)
     return aq.view(torch.float8_e4m3fn), asc.view(torch.float8_e8m0fnu)
 
 
