@@ -2286,8 +2286,33 @@ class VramSlotCache:
             more = int(usable // max(1, self.blob_bytes))
             if more < 8:
                 return 0
-            _a = torch.empty((more, self.blob_bytes), dtype=self._dtype or torch.uint8,
-                             device=_dev)
+            # 分到「cuBLAS 还能正常工作」为止，而不是分到 empty 返回成功为止。
+            # torch.empty 只保证地址空间够；运行期 cuBLAS 申请 workspace、
+            # KV 增长、分配器碎片都要额外的显存，吃干净就是
+            # CUBLAS_STATUS_ALLOC_FAILED（实测 1850 个槽位时每个请求都失败）。
+            # 这里用一次真实强度的 GEMM 当探针，失败就把数量缩 15% 再试。
+            _probe_m, _probe_n, _probe_k = 64, 5120, 5120
+            _a = None
+            while more >= 8:
+                try:
+                    _a = torch.empty((more, self.blob_bytes),
+                                     dtype=self._dtype or torch.uint8, device=_dev)
+                    _x = torch.empty(_probe_m, _probe_k, device=_dev, dtype=torch.bfloat16)
+                    _w = torch.empty(_probe_n, _probe_k, device=_dev, dtype=torch.bfloat16)
+                    torch.mm(_x, _w.t())
+                    torch.cuda.synchronize()
+                    del _x, _w
+                    break
+                except Exception:
+                    try:
+                        del _a
+                    except Exception:
+                        pass
+                    _a = None
+                    more = int(more * 0.85)
+                    torch.cuda.empty_cache()
+            if more < 8 or _a is None:
+                return 0
             with self._lock:
                 if self._arena is None:
                     self._arena = []
