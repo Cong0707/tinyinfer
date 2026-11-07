@@ -80,6 +80,42 @@ class Block(HCBlockMixin):
         # 降到"每个 tensor 一次指针运算"。
         self._h2d_batch = self._make_h2d_batch()
 
+        if hashes is not None and layer_id in cfg.engram_layer_ids:
+            shard = store.shard_of(f"layers.{layer_id}.engram.embed.weight")
+            if (store.model_dir / shard).exists():
+                from .engram import Engram
+                self.engram = Engram(store, layer_id, cfg, hashes)
+        self.hc_mult = cfg.hc_mult
+        self.hc_sinkhorn_iters = cfg.hc_sinkhorn_iters
+        self.hc_eps = cfg.hc_eps
+        # KV precision is its own axis (tier.kv_bits), but it must default to the weight
+        # flag so the resident-layer plan is unchanged for every tier that does not set
+        # it explicitly. kv_quant is resolved in Engine and passed down.
+        if cfg.compress_ratios[layer_id] == 0:
+            self.attn = MLAWindowAttention(store, layer_id, cfg, quant=self.kv_quant,
+                                           cache_wo_a=cache_wo_a, tp=tp, plan_fn=plan_fn)
+        else:
+            self.attn = MLACompressedAttention(store, layer_id, cfg, quant=self.kv_quant,
+                                               rt=rt, tp=tp, plan_fn=plan_fn)
+        # the bf16 expert cache exists for the dequantised (reference) path; when the
+        # block keeps fp8/fp4 the fp4 serve path reads the blob views directly, so eight
+        # bf16 copies per layer only cost VRAM (40 x 8 x 30MB = 9.6GB, which is what made
+        # a 63-token prefill run the allocator past physical memory)
+        self.ffn = MoE(store, layer_id, cfg, expert_store=expert_store, topk=expert_topk,
+                       cache_shared_bf16=cache_shared_bf16,
+                       max_bf16_experts=(0 if quant and not __import__("os").environ.get("TI_BF16_CACHE")
+                                          else 8),
+                       plan_fn=plan_fn)
+        p = f"layers.{layer_id}."
+        self.attn_norm = store.get(p + "attn_norm.weight")
+        self.ffn_norm = store.get(p + "ffn_norm.weight")
+        self.hc_attn_fn = store.get(p + "hc_attn_fn").float()
+        self.hc_attn_base = store.get(p + "hc_attn_base").float()
+        self.hc_attn_scale = store.get(p + "hc_attn_scale").float()
+        self.hc_ffn_fn = store.get(p + "hc_ffn_fn").float()
+        self.hc_ffn_base = store.get(p + "hc_ffn_base").float()
+        self.hc_ffn_scale = store.get(p + "hc_ffn_scale").float()
+
     def _make_h2d_batch(self):
         """返回一个把 [(dst, src, nbytes)] 批量提交到当前流的函数；不可用则 None。"""
         try:
@@ -129,42 +165,6 @@ class Block(HCBlockMixin):
             return True
 
         return _submit
-        if hashes is not None and layer_id in cfg.engram_layer_ids:
-            shard = store.shard_of(f"layers.{layer_id}.engram.embed.weight")
-            if (store.model_dir / shard).exists():
-                from .engram import Engram
-                self.engram = Engram(store, layer_id, cfg, hashes)
-        self.hc_mult = cfg.hc_mult
-        self.hc_sinkhorn_iters = cfg.hc_sinkhorn_iters
-        self.hc_eps = cfg.hc_eps
-        # KV precision is its own axis (tier.kv_bits), but it must default to the weight
-        # flag so the resident-layer plan is unchanged for every tier that does not set
-        # it explicitly. kv_quant is resolved in Engine and passed down.
-        if cfg.compress_ratios[layer_id] == 0:
-            self.attn = MLAWindowAttention(store, layer_id, cfg, quant=self.kv_quant,
-                                           cache_wo_a=cache_wo_a, tp=tp, plan_fn=plan_fn)
-        else:
-            self.attn = MLACompressedAttention(store, layer_id, cfg, quant=self.kv_quant,
-                                               rt=rt, tp=tp, plan_fn=plan_fn)
-        # the bf16 expert cache exists for the dequantised (reference) path; when the
-        # block keeps fp8/fp4 the fp4 serve path reads the blob views directly, so eight
-        # bf16 copies per layer only cost VRAM (40 x 8 x 30MB = 9.6GB, which is what made
-        # a 63-token prefill run the allocator past physical memory)
-        self.ffn = MoE(store, layer_id, cfg, expert_store=expert_store, topk=expert_topk,
-                       cache_shared_bf16=cache_shared_bf16,
-                       max_bf16_experts=(0 if quant and not __import__("os").environ.get("TI_BF16_CACHE")
-                                          else 8),
-                       plan_fn=plan_fn)
-        p = f"layers.{layer_id}."
-        self.attn_norm = store.get(p + "attn_norm.weight")
-        self.ffn_norm = store.get(p + "ffn_norm.weight")
-        self.hc_attn_fn = store.get(p + "hc_attn_fn").float()
-        self.hc_attn_base = store.get(p + "hc_attn_base").float()
-        self.hc_attn_scale = store.get(p + "hc_attn_scale").float()
-        self.hc_ffn_fn = store.get(p + "hc_ffn_fn").float()
-        self.hc_ffn_base = store.get(p + "hc_ffn_base").float()
-        self.hc_ffn_scale = store.get(p + "hc_ffn_scale").float()
-
     def _weight_paths(self):
         """(owner, attr, tensor) for every weight; runtime state (underscore) excluded."""
         out = []
