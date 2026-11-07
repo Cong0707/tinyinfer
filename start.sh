@@ -56,6 +56,23 @@ fi
 
 PY="$here/.venv/bin/python"
 [ -x "$PY" ] || PY="python"
+
+# 进程锁：一个 checkpoint 只能有一个常驻实例。重复启动会各自去抢显存，
+# 第二个必然在 cudaMalloc 上 OOM，而第一个已经吃掉 36GB；更糟的是失败的
+# 那个留下一个 Zl 僵尸进程，显存要等驱动回收才回来。
+LOCK="$here/.serve.lock"
+if [ -f "$LOCK" ]; then
+  _old=$(cat "$LOCK" 2>/dev/null || echo "")
+  if [ -n "$_old" ] && kill -0 "$_old" 2>/dev/null; then
+    echo "[tinyinfer] already running (pid $_old); refusing to start a second one" >&2
+    echo "           kill it first: kill $_old   (or rm $LOCK if the pid is stale)" >&2
+    exit 3
+  fi
+  # stale lock (process died): reclaim it
+  rm -f "$LOCK"
+fi
+printf '%s' "$$" > "$LOCK"
+trap 'rm -f "$LOCK" 2>/dev/null' EXIT INT TERM
 if [ ! -x "$PY" ] && ! command -v "$PY" >/dev/null 2>&1; then
   echo 'no python found: run ./scripts/bootstrap.sh first' >&2
   exit 1

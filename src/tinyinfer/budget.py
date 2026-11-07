@@ -488,30 +488,47 @@ class HostBudget:
         held = getattr(self, "_held", None)
         if held is None:
             held = self._held = []
-        while n >= (256 << 20):
-            try:
-                buf = mmap.mmap(-1, n)
-            except (OSError, MemoryError, ValueError):
-                n //= 2
-                continue
+        # 一次 mmap 到位。失败就直接报出来，不要减半重试：300GB 拿不到时
+        # 150GB 也拿不到，而每次重试都要重新 mmap + touch，纯属浪费时间。
+        # 池子小了引擎会静默降级（缓存变小、每 token 重新读盘），那种"能跑但慢
+        # 十倍"的结果比启动失败更难查。
+        try:
+            buf = mmap.mmap(-1, n)
+        except (OSError, MemoryError, ValueError) as exc:
+            raise MemoryError(
+                f"cannot reserve {n / (1 << 30):.1f}GB host pool: {exc}. "
+                f"Lower TI_HOST_POOL_GB / TI_RAM_FRACTION, or free memory."
+            ) from exc
+        # 逐页 touch 的唯一目的是"保证这些页真的属于我"，代价是内核要在启动时
+        # 做 n/4KB 次缺页（300GB = 7800 万次），即使分到多线程也是十几秒的纯等待，
+        # 而此刻 GPU 已经在空转。池子是个马上要被写满的缓存：专家读进来就写在
+        # 上面，页迟早会被 fault 进来，所以默认交给内核按需填充（mmap 本来就是
+        # lazy）。要"启动即锁定"用 TI_CLAIM_TOUCH=1。
+        if __import__("os").environ.get("TI_CLAIM_TOUCH", "0") == "1":
             try:
                 _touch_pages(buf, n)
-            except Exception:
+            except Exception as exc:
                 try:
                     buf.close()
                 except Exception:
                     pass
-                n //= 2
-                continue
-            try:
-                libc = ctypes.CDLL("libc.so.6", use_errno=True)
-                libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-                # mmap keeps the range mapped for the life of the object; addressof is
-                # not available for mmap, so lock through a one-byte buffer view instead
-                addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
-                libc.mlock(ctypes.c_void_p(addr), ctypes.c_size_t(n))
-            except Exception:
-                pass
+                raise MemoryError(f"cannot fault in {n / (1 << 30):.1f}GB pool: {exc}") from exc
+        if True:
+            # 不 mlock。mlock 要求内核把每一页都装进物理内存并锁住，280GB 意味着
+            # 一次强制 populate 7000 万页 —— 这是启动单核 100% 的真正来源，
+            # 而且默认的 RLIMIT_MEMLOCK 通常只有几十 MB 到几 GB，280GB 必然失败，
+            # 只是失败之前已经白干了。池子里的页在被写时会自然 fault 进来，锁不锁
+            # 对正确性没有影响；真要锁用 TI_CLAIM_MLOCK_GB 指定一个合理上限。
+            _mlock_gb = __import__("os").environ.get("TI_CLAIM_MLOCK_GB")
+            if _mlock_gb:
+                try:
+                    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+                    libc.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+                    addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
+                    _mn = min(n, int(float(_mlock_gb) * (1 << 30)))
+                    libc.mlock(ctypes.c_void_p(addr), ctypes.c_size_t(_mn))
+                except Exception:
+                    pass
             held.append(("mmap", buf, n))
             self._claim_buf = buf
             self._claim_bytes = n

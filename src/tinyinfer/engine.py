@@ -259,8 +259,11 @@ class Engine:
                         pass
                 from .budget import budget as _host_budget
                 _hb_room = _host_budget().room()
+                # 没有硬件计划时也不设绝对上限：按当前可用的宿主预算给，
+                # 60% 留给缓存（剩下的留给层 slab 和运行时）。16GB 这个数是
+                # 47GB 内存机器上的观察值，不该是所有机器的默认。
                 _plan_cache = (hw.cache_bytes if hw is not None
-                               else min(16 << 30, max(512 << 20, cache_budget)))
+                               else max(512 << 20, int(_hb_room * 0.6)))
                 # leave the majority of what is left to the pinned layer slab, which
                 # _flat_setup requests later: 45% here, the rest there
                 # The layer slab asks for its bytes AFTER this, so the cache may only
@@ -300,8 +303,20 @@ class Engine:
                 # have a ceiling well below physical RAM), and the caches are sized from
                 # the bytes actually handed over. Hand-tuning a cap here only traded
                 # hit rate for a guess.
+                # 上限原来写死 28GB（笔记本上 pin 池的实测天花板）。在 371GB 内存的
+                # 机器上等于把 300GB 闲置：池子只有 28GB，缓存再大也装不下，
+                # 每个 token 的专家读全靠这 28GB 兜。改成按可用内存取：
+                # 留 5GB 给进程自身，再留 25% 不动（给页缓存和内核），其余全给池。
+                # TI_HOST_POOL_GB 仍然可以硬指定。
+                # 用 total 而不是 available：available 已经把页缓存扣掉了，而读模型
+                # 权重会在 page cache 里留下几百 GB —— 那些页是可回收的，池子要用的
+                # 时候内核会把它们让出来。按 available 算等于让模型自己的读缓存把
+                # 专家缓存挤掉（实测 371GB 的机器上池子只拿到 151GB）。
+                # 只保留 15% 的绝对余量给内核和其它进程。
+                _tot = int(getattr(_budget, "total", 0) or 0)
+                _base = _tot - int(_tot * 0.15) if _tot else int(_avail - (5 << 30))
                 _target = max(192 << 20,
-                              min(_budget.room(), int(_avail - (5 << 30)), 28 << 30))
+                              min(_budget.room(), _base))
                 _pov = __import__("os").environ.get("TI_HOST_POOL_GB")
                 if _pov:
                     # An explicit override wins over the RAM-derived cap. It is the knob
@@ -628,9 +643,19 @@ class Engine:
         # names come from the adapter: a checkpoint decides what it calls these (DeepSeek
         # keeps embed/norm/head at the top level, Qwen nests them under
         # model.language_model and ties the head to the embedding)
-        _emb = self.store.get(self.adapter.embed_key)
+        # embed(1.3GB) / norm / head(1.3GB) 是启动时最重的三次读盘，互不依赖。
+        # 串行读它们就是启动阶段单核 100% 的来源之一（py-spy 停在 ShardStore.get）。
+        from concurrent.futures import ThreadPoolExecutor as _TPE3
+        _keys = [self.adapter.embed_key, self.adapter.norm_key]
+        _vals = {}
+        def _rd(_k):
+            return _k, self.store.get(_k)
+        with _TPE3(max_workers=2, thread_name_prefix="tinyinfer-hdr") as _ex3:
+            for _k, _v in _ex3.map(_rd, _keys):
+                _vals[_k] = _v
+        _emb = _vals[self.adapter.embed_key]
         self.embed = _emb if self.embed_on_cpu else _emb.to(device)
-        self.out_norm = self.store.get(self.adapter.norm_key).to(device)
+        self.out_norm = _vals[self.adapter.norm_key].to(device)
         # the output head is the largest single tensor: off-VRAM it costs ~40ms/token but
         # frees 1.3GB. A tied checkpoint has no separate head, so reuse the embedding.
         head_key = self.adapter.head_key
@@ -650,14 +675,19 @@ class Engine:
         # the session instead of failing the engine.
         _mtp_ok = bool(getattr(self.tier, "mtp", False)) and bool(
             getattr(self.hw_plan, "speculation", True))
-        if __import__("os").environ.get("TI_MTP") == "1":
+        # MTP 的 draft 需要 [2, T, 512] 的拼接，而当前 serve 路径在 T 变化时给出了
+        # [1, T, 512]，服务端直接 500。默认关掉，等 shape 修好再开。
+        if __import__("os").environ.get("TI_MTP", "0") == "1":
             # force the draft stages on even when the plan says they do not fit: used to
             # measure the accept rate on a card the planner keeps them off for
             _mtp_ok = True
         if getattr(self.tier, "mtp", False) and not _mtp_ok:
             print("[tinyinfer] MTP off: the draft stages do not fit beside the streaming "
                   "ring on this card (see the plan above)", flush=True)
-        if _mtp_ok and device != "cpu":
+        # MTP 的 draft 需要 [2, T, 512]，而当前 serve 路径在 T 变化时给出 [1, T, 512]，
+        # 服务端直接 500。默认不加载（它也是启动阶段的一串逐 tensor 读盘）；
+        # shape 修好后用 TI_MTP=1 打开。
+        if _mtp_ok and device != "cpu" and __import__("os").environ.get("TI_MTP", "0") == "1":
             try:
                 if self.load_mtp():
                     print("[tinyinfer] MTP draft stages loaded (tier %s)" % self.tier.level.name,

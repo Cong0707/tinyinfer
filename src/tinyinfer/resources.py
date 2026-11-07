@@ -602,8 +602,11 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     # 0.8 of the remainder measured best: 4.8GB of cache held only one token's experts
     # (273 entries) so the second token missed everything and fetch doubled; ~10GB
     # reaches the 40% hit rate that keeps the SSD inside its 4.6GB/s envelope.
+    # 纯比例：宿主预算扣掉层 slab、CPU 侧的 embed/head、预留的页缓存之后，80% 给专家
+    # 缓存。这里曾经有一个 128GB 的绝对上限，是 47GB 内存的机器上"再大也没用"的观察值；
+    # 搬到 371GB 的机器上它就成了枷锁 —— 300GB 内存闲置，每个 token 的专家读全靠那点
+    # 缓存兜。比例本身已经保证小机器不会超支。
     cache_b = int(max(256 * MB, (host - slab_b - cpu_tables - page_cache_b) * 0.8))
-    cache_b = min(cache_b, 128 << 30)
 
     if len(cards) <= 1:
         layer_card = {i: 0 for i in range(n_layers)}

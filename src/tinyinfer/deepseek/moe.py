@@ -477,7 +477,12 @@ class MoE:
         use_fp4_kernel = target.type == "cuda" and (
             _fp4_env == "1" or (_single_token and _fp4_env != "0")
         )
-        limit = self._max_bf16
+        # _expert_cache 存的是 Expert 对象（fp4 视图 + 少量 torch 包装），不是 bf16 副本，
+        # 所以它的容量不该绑在 _max_bf16 上。quant 模式下 engine 传
+        # max_bf16_experts=0（bf16 副本确实不该留），但这个 0 同时把 Expert 视图缓存
+        # 也关掉了 —— 于是每个专家每次 forward 都重新 _expert_from_rec + tensors_on，
+        # 实测一步 2160 次重建、2.1 秒。视图缓存只要按专家数量给个上限即可。
+        limit = self._max_bf16 if self._max_bf16 > 0 else 4096
 
         # one activation quantisation for every routed expert of this layer: the
         # quantiser does not depend on the expert, and per-expert (per-row) quantising

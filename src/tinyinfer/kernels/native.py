@@ -124,6 +124,10 @@ import threading as _threading
 # (stream_handle, c_void_p, Stream object) per thread. Keeping the Stream alive matters:
 # the handle is a raw address into it.
 _STREAM_CACHE: dict[int, tuple[int, object, object]] = {}
+# 每次 launch 回查 torch.cuda.current_stream() 的开销在 launch 热路径上很显著；
+# 引擎内部不切换 stream，默认直接用缓存。外部调用者若自己切流，置
+# TI_STREAM_CHECK=1 打开逐次校验。
+_STREAM_CHECK = __import__("os").environ.get("TI_STREAM_CHECK") == "1"
 
 
 class BoundLaunch:
@@ -179,16 +183,23 @@ class BoundLaunch:
                 raw[i] = a & 0xFFFFFFFF
         ptrs = self._ptrs
         if stream is None:
-            # cache the Stream wrapper per thread and only touch a plain attribute; the
-            # valiation is against torch's own notion of the current stream, so graph
-            # capture and user stream switches are still seen
+            # 缓存 Stream wrapper。per-kernel-launch 调 torch.cuda.current_stream() 会在
+            # 内部走 _get_device_index + 构造 Stream 对象，py-spy 采样里 Stream.__new__
+            # 和 current_stream 是仅次于 cuLaunchKernel 的热点；一个 token 1200+ 次
+            # launch，这些纯开销就吃掉了可观的 CPU 时间（而 CPU 已经是瓶颈）。
+            # 默认直接用缓存，只有 TI_STREAM_CHECK=1 时才每次回查 torch —— 引擎内部
+            # 不切换 stream，graph capture 也在独立路径上，回查只有在外部调用者
+            # 自己切流时才需要。
             tid = _threading.get_ident()
             ent = _STREAM_CACHE.get(tid)
-            cur = torch.cuda.current_stream()
-            raw = int(cur.cuda_stream)
-            if ent is None or ent[0] != raw:
-                stream = ctypes.c_void_p(raw)
-                _STREAM_CACHE[tid] = (raw, stream, cur)
+            if ent is None or _STREAM_CHECK:
+                cur = torch.cuda.current_stream()
+                raw = int(cur.cuda_stream)
+                if ent is None or ent[0] != raw:
+                    stream = ctypes.c_void_p(raw)
+                    _STREAM_CACHE[tid] = (raw, stream, cur)
+                else:
+                    stream = ent[1]
             else:
                 stream = ent[1]
         gx, gy, gz = self._grid

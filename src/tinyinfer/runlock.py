@@ -88,8 +88,14 @@ class EngineLock:
     def _acquire_posix(self) -> None:
         import fcntl
 
-        path = os.path.join(tempfile.gettempdir(),
-                            "tinyinfer-engine-" + str(abs(hash(self.name))) + ".lock")
+        # 不能用内置 hash()：Python 对 str 的 hash 是有随机种子的（PYTHONHASHSEED），
+        # 每个进程算出来都不一样，于是两个进程各锁各的文件，锁形同虚设 ——
+        # 第二个引擎照样起来抢显存，第一个被挤到 cudaMalloc 失败。
+        # 用固定摘要，同一台机器上的每个进程算出同一个路径。
+        import hashlib
+
+        _tag = hashlib.sha1(self.name.encode("utf-8")).hexdigest()[:16]
+        path = os.path.join(tempfile.gettempdir(), f"tinyinfer-engine-{_tag}.lock")
         f = open(path, "a+")
         try:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
