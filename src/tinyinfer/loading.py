@@ -2297,6 +2297,11 @@ class VramSlotCache:
                 try:
                     _a = torch.empty((more, self.blob_bytes),
                                      dtype=self._dtype or torch.uint8, device=_dev)
+                    # torch.empty 只拿虚拟地址空间 —— CUDA 在真正写入之前不会提交
+                    # 物理页，所以「empty 成功」证明不了这 33GB 真的存在（实测
+                    # 1851 个槽位 empty 和探针 GEMM 都过，之后每个请求都 OOM）。
+                    # 显式写一遍把它压实：33GB 在 864GB/s 下约 40ms，可接受。
+                    _a.fill_(0)
                     _x = torch.empty(_probe_m, _probe_k, device=_dev, dtype=torch.bfloat16)
                     _w = torch.empty(_probe_n, _probe_k, device=_dev, dtype=torch.bfloat16)
                     torch.mm(_x, _w.t())
