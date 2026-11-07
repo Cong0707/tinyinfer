@@ -798,10 +798,10 @@ class Engine:
             _sl = getattr(getattr(self, "expert_store", None), "slots", None)
             if _sl is not None and getattr(_sl, "slots", 0) > 0:
                 try:
-                    _more = _sl.try_grow()
-                    if _more:
-                        print(f"[tinyinfer] expert slots grown by {_more} -> {_sl.slots} "
-                              f"(VRAM now in use)", flush=True)
+                    _n = _sl.reinit()
+                    if _n:
+                        print(f"[tinyinfer] expert slots sized to {_n} from measured VRAM",
+                              flush=True)
                 except Exception as _exc:
                     print(f"[tinyinfer] slot grow skipped: {_exc!r}", flush=True)
 

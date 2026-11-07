@@ -2266,77 +2266,82 @@ class VramSlotCache:
             self._copy_stream = torch.cuda.Stream(device=dev)
             self._copy_events = [torch.cuda.Event() for _ in range(self.slots)]
 
-    def try_grow(self, reserve_bytes: int = 2 << 30) -> int:
-        """模型全部就位后，按芯片上真实剩下的显存扩容槽位。返回新增数量。
+    def reinit(self, reserve_bytes: int = 2 << 30) -> int:
+        """模型全部就位后重建一次槽位池，按芯片上真实剩余的显存定数量。
 
         _ensure() 第一次跑的时候层权重未必全部加载完，那时 mem_get_info 报的
-        free 偏大 —— 按它算会得到 1823 个槽位（32.6GB），加上模型就会 OOM
-        （实测：slots=1824 而 buffers 已归零，后续 self._buffers[slot] 越界）。
-        所以扩容放在模型确实就位之后：只申请增量，失败就原样保留。
+        free 偏大；按它算会得到 1823 个槽位，加上模型直接 OOM。增量扩容又会在
+        状态数组和 arena 之间对不齐（实测 slots=1765 而 buffers 已归零，
+        后续 self._buffers[slot] 越界）。
+
+        所以整池重建：释放旧 arena，用当前真实的 free 减去运行期余量算出数量，
+        一次性重新分配并重建全部状态数组。失败就原样返回旧池。
         """
-        if not self.slots or getattr(self, "_paused", False):
+        import torch
+        _had = len(self._buffers)
+        if not self.slots and not _had:
             return 0
         try:
-            import torch
             _dev = torch.device((getattr(self, "devices", None) or [self.device])[0])
-            free, _total = torch.cuda.mem_get_info(_dev)
-            usable = int(free) - int(reserve_bytes)
-            if usable <= 0:
-                return 0
-            more = int(usable // max(1, self.blob_bytes))
-            if more < 8:
-                return 0
-            # 分到「cuBLAS 还能正常工作」为止，而不是分到 empty 返回成功为止。
-            # torch.empty 只保证地址空间够；运行期 cuBLAS 申请 workspace、
-            # KV 增长、分配器碎片都要额外的显存，吃干净就是
-            # CUBLAS_STATUS_ALLOC_FAILED（实测 1850 个槽位时每个请求都失败）。
-            # 这里用一次真实强度的 GEMM 当探针，失败就把数量缩 15% 再试。
-            _probe_m, _probe_n, _probe_k = 64, 5120, 5120
-            _a = None
-            while more >= 8:
-                try:
-                    _a = torch.empty((more, self.blob_bytes),
-                                     dtype=self._dtype or torch.uint8, device=_dev)
-                    # torch.empty 只拿虚拟地址空间 —— CUDA 在真正写入之前不会提交
-                    # 物理页，所以「empty 成功」证明不了这 33GB 真的存在（实测
-                    # 1851 个槽位 empty 和探针 GEMM 都过，之后每个请求都 OOM）。
-                    # 显式写一遍把它压实：33GB 在 864GB/s 下约 40ms，可接受。
-                    _a.fill_(0)
-                    _x = torch.empty(_probe_m, _probe_k, device=_dev, dtype=torch.bfloat16)
-                    _w = torch.empty(_probe_n, _probe_k, device=_dev, dtype=torch.bfloat16)
-                    torch.mm(_x, _w.t())
-                    torch.cuda.synchronize()
-                    del _x, _w
-                    break
-                except Exception:
-                    try:
-                        del _a
-                    except Exception:
-                        pass
-                    _a = None
-                    more = int(more * 0.85)
-                    torch.cuda.empty_cache()
-            if more < 8 or _a is None:
-                return 0
-            with self._lock:
-                if self._arena is None:
-                    self._arena = []
-                self._arena.append(_a)
-                _base = len(self._buffers)
-                for _s in range(more):
-                    self._buffers.append(_a[_s])
-                    self._slot_dev.append(0)
-                self._state.extend([self.FREE] * more)
-                self._key.extend([None] * more)
-                self._refs.extend([0] * more)
-                self._event.extend([None] * more)
-                self.slots = len(self._buffers)
-            if self.pin_staging:
-                self._copy_events.extend([torch.cuda.Event() for _ in range(more)])
-            return more
         except Exception:
-            # 扩容是优化，失败就按当前槽位数继续服务
             return 0
+        # 先释放旧池，才能测到「给槽位用」的真实空间
+        _old_bufs, _old_arena = self._buffers, self._arena
+        self._buffers, self._arena = [], None
+        with self._lock:
+            self._state, self._key, self._refs, self._event = [], [], [], []
+            self._by_key.clear()
+            self._lru.clear()
+        del _old_bufs, _old_arena
+        torch.cuda.empty_cache()
+        try:
+            free, _total = torch.cuda.mem_get_info(_dev)
+            n = int((int(free) - int(reserve_bytes)) // max(1, self.blob_bytes))
+        except Exception:
+            n = 0
+        if n < 8:
+            return 0
+        # 分到能真的写满为止：torch.empty 只拿虚拟地址，CUDA 在写入前不提交物理页。
+        dtype = self._dtype or torch.uint8
+        while n >= 8:
+            try:
+                _a = torch.empty((n, self.blob_bytes), dtype=dtype, device=_dev)
+                _a.fill_(0)                    # 压实物理页（33GB 约 40ms）
+                _x = torch.empty(64, 5120, device=_dev, dtype=torch.bfloat16)
+                _w = torch.empty(5120, 5120, device=_dev, dtype=torch.bfloat16)
+                torch.mm(_x, _w.t())           # 确保 cuBLAS 还能拿到 workspace
+                torch.cuda.synchronize()
+                del _x, _w
+                break
+            except Exception:
+                try:
+                    del _a
+                except Exception:
+                    pass
+                torch.cuda.empty_cache()
+                n = int(n * 0.85)
+                _a = None
+        else:
+            return 0
+        if n < 8:
+            return 0
+        with self._lock:
+            self._arena = [_a]
+            self._buffers = [_a[_s] for _s in range(n)]
+            self._slot_dev = [0] * n
+            self._state = [self.FREE] * n
+            self._key = [None] * n
+            self._refs = [0] * n
+            self._event = [None] * n
+            self._by_key.clear()
+            self._lru.clear()
+            self.slots = n
+        if self.pin_staging:
+            try:
+                self._copy_events = [torch.cuda.Event() for _ in range(n)]
+            except Exception:
+                pass
+        return n
 
     def _copy_blocking(self, idx: int, data: Any, event: Any = None):
         """Copy data bytes into slot idx; returns the completion CUDA event (or None)."""
