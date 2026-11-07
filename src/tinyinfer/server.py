@@ -758,6 +758,17 @@ class QwenBackend(BaseBackend):
         budget = max(1, min(int(params.max_tokens),
                             self.max_context_tokens - prompt_tokens))
         eos = self._tok.eos_token_id
+
+        # GraphDecoder 这条路对当前 checkpoint 不稳定：capture 阶段
+        # cudaErrorStreamCaptureInvalidated（forward 里有动态分配），回退 eager
+        # 之后又会在 prep_tokens 和 MTP draft 的 shape 上翻车
+        # （实测 10 次请求里 3 次 500：'NoneType' 和 [1,60,512] 广播失败）。
+        # 引擎自己的 generate() 是同一条前向，但不经过图捕获和 prep 回放，
+        # 实测稳定在 295ms/token。默认走它，需要时再用 TI_GRAPH=1 试图。
+        if __import__("os").environ.get("TI_GRAPH", "0") != "1":
+            yield from self._generate_plain(request, ids, prompt_tokens, budget)
+            return
+
         dec, fresh = self._decoder_for(request, ids, budget)
         sampler = _Sampler(params, torch)
         produced = 0
@@ -805,6 +816,43 @@ class QwenBackend(BaseBackend):
             usage=Usage.from_counts(prompt_tokens, produced))
 
     # -- capture reuse -----------------------------------------------------
+    def _generate_plain(self, request, ids, prompt_tokens: int, budget: int):
+        """Serve straight through Engine.generate -- no graph capture, no prep replay.
+
+        比图捕获路径慢一点（每次都要重新走 eager 的逐层调度），但没有 capture
+        校验、没有 prep token 回放、没有 MTP draft 的 shape 假设，因此不会在
+        第 N 次请求上突然 500。对外是完整的 OpenAI 流式协议。
+        """
+        torch = self._torch
+        params = request.sampling
+        eos = self._tok.eos_token_id
+        text_buf: list[str] = []
+        stops = tuple(s for s in (params.stop or ()) if s)
+        prompt_ids = [int(t) for t in ids[0].tolist()]
+        with torch.inference_mode():
+            out = self._model.generate(prompt_ids, max_new_tokens=budget)
+        produced = 0
+        for tok_id in (out or []):
+            tok_id = int(tok_id)
+            piece = self._tok.decode([tok_id], skip_special_tokens=False)
+            text_buf.append(piece)
+            produced += 1
+            yield TokenEvent(text=piece, token_id=tok_id)
+            if any("".join(text_buf).endswith(s) for s in stops):
+                yield TokenEvent(finish_reason="stop",
+                                 usage=Usage.from_counts(prompt_tokens, produced))
+                return
+            if eos is not None and tok_id == eos:
+                yield TokenEvent(finish_reason="stop",
+                                 usage=Usage.from_counts(prompt_tokens, produced))
+                return
+            if produced >= budget:
+                yield TokenEvent(finish_reason="length",
+                                 usage=Usage.from_counts(prompt_tokens, produced))
+                return
+        yield TokenEvent(finish_reason="stop",
+                         usage=Usage.from_counts(prompt_tokens, produced))
+
     def _decoder_for(self, request, ids, budget: int = 256):
         """A captured decoder for this prompt length.
 
