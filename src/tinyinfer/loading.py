@@ -2137,6 +2137,38 @@ class VramSlotCache:
             return
         import torch
         self._torch = torch
+
+        # 槽位数按「分配这一刻芯片上真实剩下的显存」决定，而不是按启动前的静态估算。
+        # planner 只能估：它不知道核函数 workspace、cuBLAS handle、KV 实际大小这些
+        # 运行时开销，所以在 44GB 的卡上它给 1359 个槽位、实际只用掉 41GB，留下 3.6GB
+        # 白放着；换一张 96GB 或 141GB 的卡，它又会估小。这里第一次真正要用槽位时
+        # （此时模型、KV、workspace 都已就位）直接问驱动还剩多少，按 blob 大小整除。
+        # 换机器不需要任何手动参数。
+        if (getattr(self, "slot_arena", False)
+                and __import__("os").environ.get("TI_SLOTS") is None
+                and getattr(self, "auto_slots", True)):
+            try:
+                _dev0 = torch.device((getattr(self, "devices", None) or [self.device])[0])
+                _free, _total = torch.cuda.mem_get_info(_dev0)
+                # 留 8%：驱动、cuBLAS 的临时 workspace、以及分配器自己的碎片。
+                # 槽位是长期驻留的，不能把余量吃干净。
+                _usable = int(_free * 0.92)
+                _auto = int(_usable // max(1, self.blob_bytes))
+                _hard = int(getattr(self, "_hard_max_slots", 0) or 0)
+                if _hard:
+                    _auto = min(_auto, _hard)
+                if _auto > self.slots:
+                    self.slots = _auto
+                    # 配套的状态数组是 __init__ 里按旧槽位数开的，必须一起重建。
+                    # 此刻是第一次分配（_ensure 只会走到这里一次），它们都还是初始
+                    # 状态，直接重开即可。
+                    self._state = [self.FREE] * self.slots
+                    self._key = [None] * self.slots
+                    self._refs = [0] * self.slots
+                    self._event = [None] * self.slots
+            except Exception:
+                # 拿不到就按 planner 的值走，不因为探测失败影响服务
+                pass
         dtype = self._dtype or torch.uint8
         dev = torch.device(self.device)
         # Multi-GPU: slots are spread over the devices in self.devices, proportional to
