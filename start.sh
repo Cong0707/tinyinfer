@@ -57,6 +57,21 @@ fi
 PY="$here/.venv/bin/python"
 [ -x "$PY" ] || PY="python"
 
+# 启动前确认显存没被别人占着。上一个实例没清理干净时，新进程会在
+# cudaMalloc 上 OOM，而它是在模型加载到一半才炸的 —— 既浪费几分钟，
+# 也把真正的错因埋在很深的调用栈里。这里提前拦下来。
+if command -v nvidia-smi >/dev/null 2>&1; then
+  _free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+  _need="${TINYINFER_MIN_FREE_MB:-8000}"
+  if [ -n "$_free" ] && [ "$_free" -lt "$_need" ]; then
+    echo "[tinyinfer] only ${_free}MB of GPU memory free (need >= ${_need}MB)." >&2
+    echo "           another process is probably still holding the card:" >&2
+    nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader 2>/dev/null | sed 's/^/             /' >&2
+    echo "           kill it (or wait for it to exit) before starting." >&2
+    exit 4
+  fi
+fi
+
 # 进程锁：一个 checkpoint 只能有一个常驻实例。重复启动会各自去抢显存，
 # 第二个必然在 cudaMalloc 上 OOM，而第一个已经吃掉 36GB；更糟的是失败的
 # 那个留下一个 Zl 僵尸进程，显存要等驱动回收才回来。
