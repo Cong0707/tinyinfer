@@ -2858,7 +2858,18 @@ class ExpertStore:
             # single-expert fetches go to the bytearray reader; the pinned path costs
             # an 18.8MB cudaHostAlloc per blob and measured 2x slower for that case
             _have = self.ram.contains_many(layer, experts)
-            misses = [e for e in experts if not _have.get(e)]
+            # 显存槽位里已有的专家，字节是完整的，不需要读盘也不需要主机缓存。
+            # 原来看都不看槽位，只查 ram，于是每个命中槽位的专家仍然去读一次盘
+            # （cProfile：6 个 token 里 readinto 占 1.83s，而 copy_in 是 0 次）。
+            _slot_have = set()
+            if (self.slots is not None and self.slots.slots > 0 and cache):
+                for _e in experts:
+                    try:
+                        if self.slots.has(layer, _e):
+                            _slot_have.add(_e)
+                    except Exception:
+                        pass
+            misses = [e for e in experts if not _have.get(e) and e not in _slot_have]
             if __import__("os").environ.get("TI_CACHE_TRACE") == "1" and layer == 0:
                 print(f"[fetch] layer0 experts={experts} misses={misses}", flush=True)
             if misses:
