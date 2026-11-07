@@ -400,8 +400,18 @@ class Engine:
                     # per step) but the cache prevents reads, so there is an interior
                     # optimum; 12 and 10 tie, and 12 leaves more of the pool free for the
                     # layer weights the build has not read yet.
-                    _cap_gb = float(__import__("os").environ.get("TI_CACHE_CAP_GB", "12"))
-                    _pool_avail = min(_pool_avail, int(_cap_gb * (1 << 30)))
+                    # 缓存上限不再写死 12GB：那是 8GB 显存 + 47GB 内存的笔记本上扫出来的
+                    # 内部最优（缓存和层 slab 争同一块 pin 池），搬到 371GB 内存的机器上
+                    # 等于把 300GB 内存闲置，每个 token 的专家读全靠 12GB 的缓存兜。
+                    # 改成按宿主预算自适应：不给显式覆盖时，上限 = 预算里除 slab 之外
+                    # 能拿到的全部（_pool_avail 已经扣掉了 slab_reserve），再留 25% 余量
+                    # 给尚未加载的层权重。TI_CACHE_CAP_GB 仍然可以硬指定。
+                    _cap_env = __import__("os").environ.get("TI_CACHE_CAP_GB")
+                    if _cap_env is None:
+                        _cap_bytes = max(192 << 20, int(_pool_avail * 0.75))
+                    else:
+                        _cap_bytes = max(192 << 20, int(float(_cap_env) * (1 << 30)))
+                    _pool_avail = min(_pool_avail, _cap_bytes)
                     _cache_bytes = min(_ov_bytes, _pool_avail) if _ov_bytes else _pool_avail
                     _slot = self.host_pool.alloc(_cache_bytes)
                     if _slot is not None:
@@ -411,9 +421,9 @@ class Engine:
                     slot_arena=bool(getattr(self.tier, "slot_arena", False)),
                     # parallel reads saturate the device around QD=8-16; scale with the
                     # core count instead of pinning a machine-specific thread count
-                    reader_threads=int(__import__("os").environ.get(
-                        "TI_READERS",
-                        str(min(16, max(4, (__import__("os").cpu_count() or 8)))))),
+                    # 并行读深度：跟随 CPU 数（pread 在 C 侧释放 GIL，线程数真的
+                    # 决定并行度），不再写死 16 的上限。
+                    reader_threads=int(__import__("os").environ.get("TI_READERS", "0")) or 0,
                     cache_bytes=_cache_bytes,
                     pool=_cache_pool,
                     # LRU, not ARC. Measured on this model's real routing over three
@@ -699,14 +709,29 @@ class Engine:
                 # happens INSIDE the claimed pool, so Task Manager shows the pool's one
                 # jump and nothing after it
                 self.store.build_pool = pool
-            for i in layers:
-                if i in streamed_set:
-                    # built by _flat_setup below; its weights also land in the pool
-                    continue
-                b = self.block(i)
-                # resident layers live in VRAM for the whole run; the pinned host copy
-                # only exists for a to("cpu") that never happens on them
-                b._cpu_refs = None
+            # 逐层串行构建 = 启动时单核 100%（实测 64 核机器上只有 C0 在动）。
+            # 每层是独立的：读自己的分片 + 建自己的子模块，互不依赖，所以按 CPU 数
+            # 并发构建。self.block() 内部写 self._blocks，加锁保护那一次写入即可。
+            _build = [i for i in layers if i not in streamed_set]
+            if len(_build) > 1:
+                import os as _os2
+                from concurrent.futures import ThreadPoolExecutor as _TPE2
+                # dict 写的是不同 key，CPython 下由 GIL 保证原子，不需要额外锁
+                _nw = max(2, min(len(_build), (_os2.cpu_count() or 4)))
+
+                def _mk(i):
+                    b = self.block(i)
+                    # resident layers live in VRAM for the whole run; the pinned host
+                    # copy only exists for a to("cpu") that never happens on them
+                    b._cpu_refs = None
+                    return b
+
+                with _TPE2(max_workers=_nw, thread_name_prefix="tinyinfer-build") as _ex2:
+                    list(_ex2.map(_mk, _build))
+            else:
+                for i in _build:
+                    b = self.block(i)
+                    b._cpu_refs = None
             # flat streaming builds each streamed block and copies its weights into the
             # pinned slab -- all inside the same pool
             try:
@@ -1692,11 +1717,24 @@ class Engine:
             # the step is CPU bound -- the GPU kernels are only ~91ms of it.
             from .loading import _async_h2d
 
+            # 逐 tensor 提交 DMA：每层几十个，每次 copy_ 约 84us 的 CPU dispatch，
+            # 全局每步 2849 次调用 -> 239ms，而 GPU kernel 只有 ~91ms —— 拷贝提交
+            # 本身就是瓶颈。这里把手上的 (dst, src, n) 一次收齐再提交，让驱动按批
+            # 入队而不是每个都走一遍 Python + dispatch。
+            _pairs = []
             for (owner, name, t), (o, n) in zip(b._weight_paths(), offs):
                 src = b._cpu_refs[Block._wkey(owner, name)]
                 dst = buf[o:o + n].view(t.dtype).view(t.shape)
-                if not _async_h2d(dst, src, n):
-                    dst.copy_(src, non_blocking=True)
+                _pairs.append((dst, src, n))
+            _queued = False
+            if _pairs:
+                _batch = getattr(b, "_h2d_batch", None)
+                if _batch is not None:
+                    _queued = _batch(_pairs)
+            if not _queued:
+                for dst, src, n in _pairs:
+                    if not _async_h2d(dst, src, n):
+                        dst.copy_(src, non_blocking=True)
         else:
             buf[:total].copy_(host[layer], non_blocking=True)
         for (owner, name, t), (o, n) in zip(b._weight_paths(), offs):

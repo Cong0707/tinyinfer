@@ -1,0 +1,10 @@
+# tinyinfer 运行时依赖（Linux 部署）
+# torch 由 bootstrap.sh 单独装（需要匹配驱动的 CUDA 版本）
+transformers>=4.45
+safetensors>=0.4
+huggingface-hub>=0.24
+numpy>=1.26
+psutil>=5.9
+# tilelang 是硬依赖：kernels/sparse_attn.py 和 fp8/fp4 quant 走官方 kernel.py
+# 它会 JIT 编译，所以运行时也要有 CUDA toolkit
+tilelang>=0.1.15

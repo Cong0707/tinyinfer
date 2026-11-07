@@ -19,6 +19,10 @@ MODEL="${TINYINFER_MODEL:-}"
 TIER="${TINYINFER_TIER:-aggressive}"
 HOST_ADDR="${TINYINFER_HOST:-127.0.0.1}"
 PORT="${TINYINFER_PORT:-8000}"
+# 对外服务的 API key（OpenAI 的 Authorization: Bearer <key>）；留空则不校验
+API_KEY="${TINYINFER_API_KEY:-}"
+# /v1/models 里暴露的名字
+MODEL_ID="${TINYINFER_MODEL_ID:-}"
 BG=0
 
 usage() {
@@ -31,6 +35,8 @@ while [ $# -gt 0 ]; do
     --tier) TIER="${2:-}"; shift 2;;
     --host) HOST_ADDR="${2:-}"; shift 2;;
     --port) PORT="${2:-}"; shift 2;;
+    --api-key) API_KEY="${2:-}"; shift 2;;
+    --model-id) MODEL_ID="${2:-}"; shift 2;;
     --bg) BG=1; shift;;
     -h|--help) usage; exit 0;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2;;
@@ -56,12 +62,16 @@ if [ ! -x "$PY" ] && ! command -v "$PY" >/dev/null 2>&1; then
 fi
 
 echo "[tinyinfer] starting resident server on http://${HOST_ADDR}:${PORT} (tier=${TIER})"
+extra=()
+[ -n "$API_KEY" ] && extra+=(--api-key "$API_KEY")
+[ -n "$MODEL_ID" ] && extra+=(--model-id "$MODEL_ID")
+
 if [ "$BG" = "1" ]; then
   nohup "$PY" -m tinyinfer.server --backend tiny --model-dir "$MODEL" \
-        --tier "$TIER" --host "$HOST_ADDR" --port "$PORT" \
+        --tier "$TIER" --host "$HOST_ADDR" --port "$PORT" "${extra[@]}" \
         > "$here/serve.log" 2> "$here/serve.err.log" &
   echo "[tinyinfer] background pid $!; tail serve.log for readiness"
 else
   exec "$PY" -m tinyinfer.server --backend tiny --model-dir "$MODEL" \
-       --tier "$TIER" --host "$HOST_ADDR" --port "$PORT"
+       --tier "$TIER" --host "$HOST_ADDR" --port "$PORT" "${extra[@]}"
 fi

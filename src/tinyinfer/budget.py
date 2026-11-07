@@ -121,21 +121,59 @@ def _cudart():
 def _touch_pages(buf, n: int) -> None:
     """Commit every 4KB page of a host allocation right now.
 
-    A per-page Python loop (the old code) took tens of seconds for 18GB and showed up
-    in Task Manager as a slow climb while the engine was already "up": the physical
-    pages were being faulted in one by one as later writes landed. Doing the same walk
-    in C makes the claim a single visible step (the pool is fully resident when
-    _commit returns), which is what "claim it up front" is supposed to mean.
-    """
-    try:
-        import numpy as np
+    The C loop below is a single strided numpy write, which is ordered and therefore
+    single-threaded: on a 300GB claim that is 78M page faults on one core (measured:
+    the whole start-up sat in this function, one core at 100%, for tens of seconds).
+    The faults themselves are independent per range, so split the buffer into
+    cpu_count() chunks and touch them from threads -- the page-fault work is in the
+    kernel, so it scales with cores.
 
-        np.frombuffer(buf, dtype=np.uint8)[::4096] = 1
-        return
+    MADV_POPULATE_WRITE (Linux >= 5.14) does the same thing in one syscall; try it
+    first and fall back to the threaded walk.
+    """
+    import os as _os
+    try:
+        import ctypes as _ct
+
+        _libc = _ct.CDLL("libc.so.6", use_errno=True)
+        _rc = _libc.madvise(_ct.c_void_p(_ct.addressof(_ct.c_char.from_buffer(buf))),
+                            _ct.c_size_t(n), 23)  # MADV_POPULATE_WRITE
+        if _rc == 0:
+            return
     except Exception:
         pass
-    for off in range(0, n, 4096):
-        buf[off] = b"\x01"
+
+    ncpu = max(1, min(32, (_os.cpu_count() or 4)))
+    if n < (1 << 20) or ncpu == 1:
+        try:
+            import numpy as np
+
+            np.frombuffer(buf, dtype=np.uint8)[::4096] = 1
+            return
+        except Exception:
+            pass
+        for off in range(0, n, 4096):
+            buf[off] = b"\x01"
+        return
+
+    step = (n + ncpu - 1) // ncpu
+    step -= step % 4096
+    ranges = [(o, min(n, o + step)) for o in range(0, n, step)]
+
+    def _do(lo_hi):
+        lo, hi = lo_hi
+        try:
+            import numpy as _np
+
+            _np.frombuffer(buf, dtype=_np.uint8, offset=lo, count=hi - lo)[::4096] = 1
+        except Exception:
+            for off in range(lo, hi, 4096):
+                buf[off] = b"\x01"
+
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+
+    with _TPE(max_workers=ncpu, thread_name_prefix="tinyinfer-touch") as _ex:
+        list(_ex.map(_do, ranges))
 
 
 class HostPool:

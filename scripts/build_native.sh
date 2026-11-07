@@ -34,6 +34,7 @@ module_name() {
   esac
 }
 
+failed=()
 want=("$@")
 mapfile -t all < <(find "$CUDA" -name '*.cu' | sort)
 [ "${#all[@]}" -gt 0 ] || { echo "no .cu under $CUDA" >&2; exit 1; }
@@ -57,9 +58,18 @@ for cu in "${all[@]}"; do
     fi
     inc=(-I "$(dirname "$cu")" -I "$CUTLASS/include" --expt-relaxed-constexpr -std=c++17)
   fi
+  # one kernel failing must not abort the rest: not every kernel compiles on
+  # every arch. Collect failures, report at the end.
   if ! nvcc -cubin -arch="$ARCH" "${inc[@]}" -o "$dst" "$cu"; then
     echo "nvcc failed for $base" >&2
-    exit 1
+    failed+=("$base")
+    continue
   fi
   printf '%-20s %8d bytes\n' "$mod" "$(stat -c%s "$dst" 2>/dev/null || stat -f%z "$dst")"
 done
+
+if [ "${#failed[@]}" -gt 0 ]; then
+  echo "" >&2
+  echo "failed: ${failed[*]}" >&2
+  exit 1
+fi

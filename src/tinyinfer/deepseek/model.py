@@ -74,6 +74,61 @@ class Block(HCBlockMixin):
         self._stream_flat = None    # (pinned cpu flat, device flat) for streamed layers
         self._flat_offsets = None
         self._cpu_refs = None       # original CPU tensors, restored on to("cpu")
+        # 批量 H2D：逐 tensor copy_ 每次要吃 ~84us 的 CPU dispatch（每步 2849 次 = 239ms，
+        # 而 GPU kernel 只有 ~91ms）。这里把同一层的几十个 (dst, src, n) 一次性用
+        # cudaMemcpyAsync 入队，Python 侧只走一遍循环，dispatch 成本从"每个 tensor 一次"
+        # 降到"每个 tensor 一次指针运算"。
+        self._h2d_batch = self._make_h2d_batch()
+
+    def _make_h2d_batch(self):
+        """返回一个把 [(dst, src, nbytes)] 批量提交到当前流的函数；不可用则 None。"""
+        try:
+            import ctypes
+            import torch
+            _lib = None
+            for _nm in ("libcudart.so", "libcudart.so.12", "libcudart.so.13",
+                        "cudart64_12.dll", "cudart64_13.dll"):
+                try:
+                    _lib = ctypes.CDLL(_nm)
+                    break
+                except OSError:
+                    continue
+            if _lib is None:
+                return None
+            _fn = _lib.cudaMemcpyAsync
+            _fn.restype = ctypes.c_int
+            _fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                            ctypes.c_int, ctypes.c_void_p]
+            _get_stream = _lib.cudaStreamDefault if hasattr(_lib, "cudaStreamDefault") else None
+            _MEMCPY_H2D = 1
+        except Exception:
+            return None
+
+        _keep = []
+
+        def _submit(pairs):
+            try:
+                stream = torch.cuda.current_stream().cuda_stream
+            except Exception:
+                return False
+            dp = [dst.data_ptr() for dst, _s, _n in pairs]
+            if not dp or any(x == 0 for x in dp):
+                return False
+            for dst, src, n in pairs:
+                # src 是 pinned host tensor（Block._cpu_refs 就是 pin 过的）
+                rc = _fn(ctypes.c_void_p(dst.data_ptr()),
+                         ctypes.c_void_p(src.data_ptr()),
+                         ctypes.c_size_t(int(n)),
+                         _MEMCPY_H2D,
+                         ctypes.c_void_p(stream))
+                if rc != 0:
+                    _keep.clear()
+                    return False
+            _keep.clear()
+            _keep.extend(pairs)
+            return True
+
+        return _submit
         if hashes is not None and layer_id in cfg.engram_layer_ids:
             shard = store.shard_of(f"layers.{layer_id}.engram.embed.weight")
             if (store.model_dir / shard).exists():

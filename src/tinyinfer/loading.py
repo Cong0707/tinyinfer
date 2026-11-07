@@ -1048,7 +1048,17 @@ class ShardReader:
     uses unbuffered reads on Windows (recommended for the expert stream).
     """
 
-    def __init__(self, index: ShardIndex, threads: int = 6, direct: bool = False):
+    @staticmethod
+    def auto_threads() -> int:
+        """并行读深度：跟随 CPU 数，6 是 8 核笔记本上的最优，不该硬编码到所有机器。
+        pread 在 C 侧释放 GIL，所以线程数真的决定并行度；上限 32 是因为单块 NVMe
+        超过这个深度只增加队列开销。"""
+        import os as _os
+        return max(6, min(32, (_os.cpu_count() or 8) // 2))
+
+    def __init__(self, index: ShardIndex, threads: int = 0, direct: bool = False):
+        if not threads:
+            threads = ShardReader.auto_threads()
         self.index = index
         self.threads = max(1, int(threads))
         self.direct = bool(direct)
@@ -1782,12 +1792,37 @@ class ExpertCache:
         try:
             import torch
 
-            for _ in range(target):
-                if self.pin_budget and (self._pinned_bytes + self.blob_bytes) > self.pin_budget:
-                    break
-                self._pin_free.append(torch.empty(self.blob_bytes, dtype=torch.uint8,
-                                                  pin_memory=True))
-                self._pinned_bytes += self.blob_bytes
+            # 预热是 N 次独立的 cudaHostAlloc + 首次 touch，串行跑在 64/128 核的机器上
+            # 只有一个核在动（实测启动阶段单核 100%）。改成按 CPU 数分片并发分配：
+            # cudaHostAlloc 走的是驱动锁，但首次 touch 的页面 fault 是并行的，这一半
+            # 才是启动慢的来源。
+            import os as _os
+            from concurrent.futures import ThreadPoolExecutor as _TPE
+            _n = max(1, min(target, (_os.cpu_count() or 8)))
+            _per = [0] * _n
+            _budget_left = None
+            if self.pin_budget:
+                _budget_left = max(0, self.pin_budget - self._pinned_bytes)
+            def _mk(k):
+                out = []
+                for _i in range(k):
+                    out.append(torch.empty(self.blob_bytes, dtype=torch.uint8,
+                                           pin_memory=True))
+                    out[-1].fill_(0)
+                return out
+            _k = target // _n
+            _extra = target - _k * _n
+            _counts = [_k + (1 if i < _extra else 0) for i in range(_n)]
+            if _budget_left is not None:
+                _allow = min(target, int(_budget_left // max(1, self.blob_bytes)))
+                _acc = 0
+                for i in range(_n):
+                    _counts[i] = max(0, min(_counts[i], _allow - _acc))
+                    _acc += _counts[i]
+            with _TPE(max_workers=_n, thread_name_prefix="tinyinfer-pin") as _ex:
+                for _chunk in _ex.map(_mk, _counts):
+                    self._pin_free.extend(_chunk)
+            self._pinned_bytes += len(self._pin_free) * self.blob_bytes
         except Exception:
             pass
 
@@ -2604,7 +2639,11 @@ class ExpertStore:
         policy: str = "arc",
         vram_slots: int = 0,
         device: str = "cuda",
-        reader_threads: int = 6,  # measured optimum: 4-8 threads ~5.3GB/s (buffered IO ceiling)
+        # 并行读深度。6 这个值是在 8 核笔记本上测出来的（4-8 线程 ~5.3GB/s 的缓冲 IO 上限），
+    # 搬到 64/128 核的机器上就是单核跑、63 个核看。改成跟随 CPU 数：
+    # 读盘是 pread（C 侧释放 GIL），真能并行，上限由磁盘带宽和 NVMe 队列深度决定，
+    # 不由核数决定。默认取 cpu/2，至少 6，至多 32（再高对单块 NVMe 只增开销）。
+    reader_threads: int = 0,  # 0 = 按 CPU 数自动
         direct: bool = False,
         max_pinned_bytes: int | None = None,
         pool=None,
@@ -2612,6 +2651,8 @@ class ExpertStore:
         slot_arena: bool = False,
     ):
         self.index = index or ShardIndex(model_dir)
+        if not reader_threads:
+            reader_threads = ShardReader.auto_threads()
         self.reader = ShardReader(self.index, threads=reader_threads, direct=direct)
         # per-expert access counts: a chat workload revisits a small set of experts and
         # pinning them (hot_prefetch) turns later reads into RAM hits
@@ -2832,7 +2873,13 @@ class ExpertStore:
                     # admitted: a prefill batch may touch all 384 experts, and filling the
                     # cache with those evicts the decode working set while making the
                     # stored buffer a different one from the read that produced the output.
-                    _admit_ok = cache and len(experts) <= 8
+                    # 不再按 expert 数量设 hard gate：decode 一层 6 个、prefill 一层几百个，
+                    # 这个阈值原本是为了别让 prefill 冲掉 decode 工作集，但它在小批量
+                    # decode（<=8）之外把整个缓存路径关掉了，于是在大卡上跑满速也永远
+                    # 命不中。改成按「这批会不会挤爆缓存」判断：只有本次专家数超过缓存
+                    # 能装的容量时才跳过 admit。
+                    _cap = getattr(self.ram, "capacity_entries", 0) or 0
+                    _admit_ok = bool(cache) and (not _cap or len(experts) <= _cap)
                     if _admit_ok:
                         datas = self.ram._read_many_pooled(blobs) if blobs else []
                     else:
