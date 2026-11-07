@@ -1442,6 +1442,10 @@ class TinyModelBackend(BaseBackend):
         while True:
             item = seq.queue.get()
             if isinstance(item, BaseException):
+                # 生成线程里抛的异常到这里只剩一句消息，调用栈在传过队列时就丢了。
+                # 500 响应本身不带栈，排查只能靠日志，所以先把栈打出来。
+                import traceback as _tb
+                _tb.print_exception(type(item), item, item.__traceback__)
                 raise BackendError(f"generation failed: {item}", status_code=500)
             if item is None:
                 break

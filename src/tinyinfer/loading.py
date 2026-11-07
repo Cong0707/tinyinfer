@@ -1054,7 +1054,10 @@ class ShardReader:
         pread 在 C 侧释放 GIL，所以线程数真的决定并行度；上限 32 是因为单块 NVMe
         超过这个深度只增加队列开销。"""
         import os as _os
-        return max(6, min(32, (_os.cpu_count() or 8) // 2))
+        # 用满所有 vCPU。原来除以 2，在 32 物理核 + 超线程的机器上只铺满
+        # 物理核、逻辑核全空（top 里一半核 0%）；pread 是 IO 等待型，逻辑核
+        # 也能贡献吞吐，而 decode 的瓶颈恰恰是调用者被 IO 拖住。
+        return max(6, min(64, _os.cpu_count() or 8))
 
     def __init__(self, index: ShardIndex, threads: int = 0, direct: bool = False):
         if not threads:
