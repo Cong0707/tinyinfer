@@ -1199,6 +1199,9 @@ class Engine:
             # every later run inherits those bytes
             if hasattr(b.attn, "_bf16_cache"):
                 b.attn._bf16_cache = None
+            # _expert_cache 必须清：里面的 Expert 持有的是槽位视图，而 slot 会在
+            # evict 时被别的专家覆盖，留着就是悬空指针（试过不清，服务端每个请求
+            # 都直接失败）。要跨请求复用，得让槽位本身不释放，而不是缓存对象。
             b.ffn._expert_cache.clear()
         # Streaming state is per-forward. Dropping it alone would leave every streamed
         # block's weights pointing into a ring buffer that no longer exists, so restore
