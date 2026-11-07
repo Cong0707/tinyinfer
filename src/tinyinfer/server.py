@@ -765,8 +765,16 @@ class QwenBackend(BaseBackend):
         # （实测 10 次请求里 3 次 500：'NoneType' 和 [1,60,512] 广播失败）。
         # 引擎自己的 generate() 是同一条前向，但不经过图捕获和 prep 回放，
         # 实测稳定在 295ms/token。默认走它，需要时再用 TI_GRAPH=1 试图。
-        if __import__("os").environ.get("TI_GRAPH", "0") != "1":
+        _gmode = __import__("os").environ.get("TI_GRAPH", "plain")
+        if _gmode == "plain":
             yield from self._generate_plain(request, ids, prompt_tokens, budget)
+            return
+        if _gmode != "1":
+            # 默认走调度器的连续批处理：它按请求维护 KV slot，一次 forward 推进
+            # 整个 running 集合，是并发吞吐的来源。实测两个并发请求都能正确出
+            # 结果（ServingEngine max_batch=2 直接跑通）。
+            # TI_GRAPH=plain 退回逐请求串行，TI_GRAPH=1 试图捕获。
+            yield from self._generate_batched(request)
             return
 
         dec, fresh = self._decoder_for(request, ids, budget)

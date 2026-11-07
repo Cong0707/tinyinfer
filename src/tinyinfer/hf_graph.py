@@ -164,8 +164,32 @@ class GraphDecoder:
                 tok0 = int(self.ids_buf[0, 0])
 
                 g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g):
-                    self._fwd()
+                if __import__("os").environ.get("TI_GRAPH_TRACE") == "1":
+                    import traceback as _tb
+                    _oc = torch.Tensor.copy_
+                    _ot = torch.Tensor.to
+                    def _hc(self, src, *a, **k):
+                        if self.is_cuda and isinstance(src, torch.Tensor)                                 and src.device.type == "cpu" and not src.is_pinned():
+                            print("[graph-trace] non-pinned copy_ from:", flush=True)
+                            _tb.print_stack(limit=10)
+                        return _oc(self, src, *a, **k)
+                    def _ht(self, *a, **k):
+                        dev = k.get("device", a[0] if a else None)
+                        if dev is not None and "cuda" in str(dev) and self.device.type == "cpu"                                 and not self.is_pinned():
+                            print("[graph-trace] non-pinned to():", flush=True)
+                            _tb.print_stack(limit=10)
+                        return _ot(self, *a, **k)
+                    torch.Tensor.copy_ = _hc
+                    torch.Tensor.to = _ht
+                    try:
+                        with torch.cuda.graph(g):
+                            self._fwd()
+                    finally:
+                        torch.Tensor.copy_ = _oc
+                        torch.Tensor.to = _ot
+                else:
+                    with torch.cuda.graph(g):
+                        self._fwd()
                 torch.cuda.synchronize()
 
                 _cache_restore(snap)

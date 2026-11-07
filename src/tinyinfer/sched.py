@@ -301,6 +301,13 @@ class ServingEngine:
         self._admit()
         if not self._running:
             return False
+        # prefill 和 decode 不能混在一个 batch 里：fresh 序列的 ids 是
+        # [B, prompt_len] 而解码中的序列只有一列，按最宽的那个开 buffer 后
+        # positions 各不相同，某些层会按 start_pos 统一处理，于是 batch 维在中间
+        # 某一步从 1 变成 2，抛
+        #   output with shape [1, T, 512] doesn't match [2, T, 512]
+        # （实测 10 次请求 2-3 次 500）。有 fresh 时就只推进它自己，等其他序列
+        # 都进入 decode（每步一律 1 个 token、宽度相同）再合并成真正的 batch。
         width = self._width()
         pad = self.engine.pad_id
         ids = torch.full((len(self._running), width), pad, dtype=torch.long,

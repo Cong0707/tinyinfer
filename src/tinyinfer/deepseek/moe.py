@@ -556,8 +556,13 @@ class MoE:
                 _cols = _groups.get(i)
                 if _cols:
                     rows = torch.zeros(len(_cols), dtype=torch.long, device=indices.device)
-                    s = sels[i] = (rows, torch.tensor(_cols, dtype=torch.long,
-                                                     device=indices.device))
+                    # 必须经 pinned 中转：torch.tensor(list, device='cuda') 是 pageable
+                    # H2D，而 CUDA graph 捕获期间禁止这类拷贝（实测报
+                    # "Cannot copy between CPU and CUDA tensors during CUDA graph
+                    # capture unless the CPU tensor is pinned"）。这条路径每个
+                    # expert 组只走一次，pinned 中转的代价可以忽略。
+                    _t = torch.tensor(_cols, dtype=torch.long, pin_memory=True)
+                    s = sels[i] = (rows, _t.to(indices.device, non_blocking=True))
                 else:
                     s = sels[i] = torch.where(indices == i)
             return s
