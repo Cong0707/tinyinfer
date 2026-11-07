@@ -66,6 +66,9 @@ _PTR_RING = 16
 _ptr_pool: dict[tuple, list] = {}
 _ptr_next = [0]
 _host_views: dict[int, "np.ndarray"] = {}
+# 指针数组按「专家组合」缓存：组合相同就是同一份字节，不需要再发 H2D。
+# 上限 4096 条，超了整体清空（比 LRU 简单，且这些条目创建成本很低）。
+_PTR_CACHE: dict = {}
 
 
 def _ptrs(tensors) -> torch.Tensor:

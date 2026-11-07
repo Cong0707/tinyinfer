@@ -795,15 +795,20 @@ class Engine:
             # 模型（40 层权重 + KV + workspace）现在确实全部就位了，这才是问驱动
             # 「还剩多少显存」的正确时机。按它把专家槽位扩到能吃满为止：换一张
             # 96GB/141GB 的卡不需要改任何参数，槽位数自己会跟上。
-            _sl = getattr(getattr(self, "expert_store", None), "slots", None)
-            if _sl is not None and getattr(_sl, "slots", 0) > 0:
-                try:
-                    _n = _sl.reinit()
-                    if _n:
-                        print(f"[tinyinfer] expert slots sized to {_n} from measured VRAM",
-                              flush=True)
-                except Exception as _exc:
-                    print(f"[tinyinfer] slot grow skipped: {_exc!r}", flush=True)
+            # 自动重算槽位暂不启用：reinit 会先释放旧 arena 再按实测 free 重建，
+            # 而 free 里还有 KV/workspace 的余量没扣干净，实测重建后状态数组和
+            # arena 对不齐（slots 有值、buffers 归零 → IndexError）。planner 的
+            # 静态值虽然保守（44GB 卡上给 1359 个），但实测 10/10 请求成功。
+            # 等 _ptrs() 静态化、decode 改成 CUDA graph 之后再回来做这件事。
+            if __import__("os").environ.get("TI_AUTO_SLOTS") == "1":
+                _sl = getattr(getattr(self, "expert_store", None), "slots", None)
+                if _sl is not None and getattr(_sl, "slots", 0) > 0:
+                    try:
+                        _n = _sl.reinit()
+                        if _n:
+                            print(f"[tinyinfer] expert slots sized to {_n}", flush=True)
+                    except Exception as _exc:
+                        print(f"[tinyinfer] slot grow skipped: {_exc!r}", flush=True)
 
     # -- residency ---------------------------------------------------------
     def available_layers(self) -> int:

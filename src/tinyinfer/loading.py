@@ -2137,6 +2137,8 @@ class VramSlotCache:
             return
         import torch
         self._torch = torch
+        # 记下 planner 给的保守值，reinit 失败时用它回退
+        self._planner_slots = max(1, int(self.slots))
 
         # 槽位数按「分配这一刻芯片上真实剩下的显存」决定，而不是按启动前的静态估算。
         # planner 只能估：它不知道核函数 workspace、cuBLAS handle、KV 实际大小这些
@@ -2294,12 +2296,29 @@ class VramSlotCache:
             self._lru.clear()
         del _old_bufs, _old_arena
         torch.cuda.empty_cache()
+
+        def _restore() -> int:
+            """重建不了就地回到 planner 的保守值，不能让服务没有槽位。"""
+            try:
+                self.slots = max(1, int(getattr(self, "_planner_slots", 0) or 1359))
+                self._buffers, self._arena = [], None
+                self._state = [self.FREE] * self.slots
+                self._key = [None] * self.slots
+                self._refs = [0] * self.slots
+                self._event = [None] * self.slots
+                self._ensure()
+                return len(self._buffers)
+            except Exception:
+                self.slots = 0
+                return 0
+
         try:
             free, _total = torch.cuda.mem_get_info(_dev)
             n = int((int(free) - int(reserve_bytes)) // max(1, self.blob_bytes))
         except Exception:
             n = 0
         if n < 8:
+            _restore()
             return 0
         # 分到能真的写满为止：torch.empty 只拿虚拟地址，CUDA 在写入前不提交物理页。
         dtype = self._dtype or torch.uint8
@@ -2307,11 +2326,12 @@ class VramSlotCache:
             try:
                 _a = torch.empty((n, self.blob_bytes), dtype=dtype, device=_dev)
                 _a.fill_(0)                    # 压实物理页（33GB 约 40ms）
-                _x = torch.empty(64, 5120, device=_dev, dtype=torch.bfloat16)
-                _w = torch.empty(5120, 5120, device=_dev, dtype=torch.bfloat16)
-                torch.mm(_x, _w.t())           # 确保 cuBLAS 还能拿到 workspace
+                # 只验证物理页（上面 fill_ 已经做了）。不再跑 GEMM 探针：
+                # 探针失败会让整个函数放弃并返回 0，而旧池此时已经释放，
+                # 结果是 slots 还留着、buffers 归零，每个请求都 IndexError
+                # （实测就是这么挂的）。运行期 cuBLAS 的 workspace 用
+                # reserve_bytes 覆盖。
                 torch.cuda.synchronize()
-                del _x, _w
                 break
             except Exception:
                 try:
@@ -2322,8 +2342,10 @@ class VramSlotCache:
                 n = int(n * 0.85)
                 _a = None
         else:
+            _restore()
             return 0
         if n < 8:
+            _restore()
             return 0
         with self._lock:
             self._arena = [_a]
