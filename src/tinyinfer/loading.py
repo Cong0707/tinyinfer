@@ -2522,8 +2522,16 @@ class VramSlotCache:
         their layout is fixed afterwards. A single device is the default and allocates
         exactly as before.
         """
-        self.devices = list(devices)
-        self.device_caps = [max(0, int(c)) for c in caps]
+        # 只在设备布局真的变化时才丢弃已分配的 arena。原来每次调用都清空
+        # _buffers，而引擎在加载/放置层的过程中会反复调它：槽位被释放又重建，
+        # 第二次分配时显存已经被第一次占住，于是 buffers 归零、slots 却还留着，
+        # 后续 self._buffers[slot] 直接 IndexError（实测 slots=1824 buffers=0）。
+        _new_devs = list(devices)
+        _new_caps = [max(0, int(c)) for c in caps]
+        if self._buffers and _new_devs == list(self.devices or []) and _new_caps == list(self.device_caps or []):
+            return
+        self.devices = _new_devs
+        self.device_caps = _new_caps
         self._buffers = []
         self._arena = None
         self._slot_dev = []
