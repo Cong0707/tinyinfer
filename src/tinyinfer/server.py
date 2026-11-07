@@ -767,7 +767,7 @@ class QwenBackend(BaseBackend):
             # tokens the decoder already produced while preparing the graph
             # the prep tokens (emitted between prefill and the captured step) are the same
             # for every request on this graph shape: _decoder_for recorded them once
-            for tok_id in self._prep.get((int(ids.shape[1]), budget), ()):
+            for tok_id in (self._prep.get((int(ids.shape[1]), budget)) or ()):
                 piece = self._tok.decode([tok_id], skip_special_tokens=False)
                 text_buf.append(piece)
                 produced += 1
@@ -826,14 +826,17 @@ class QwenBackend(BaseBackend):
         if cached is not None:
             # the prep tokens belong to the prompt, not to whichever request happened to
             # trigger the capture: they are what the model emits right after prefill
-            self._prep.setdefault(key, getattr(cached, "prep_tokens", []))
+            self._prep.setdefault(key, getattr(cached, "prep_tokens", None) or [])
             # rewind to the exact state replay expects: the capture advanced the cache by
             # one step, and this decoder has been replayed since
             cached.rewind()
             return cached, False
         dec = GraphDecoder.from_prompt(self._model, ids, capacity=key[1] + 8).capture()
         if dec.using_graph:
-            dec.prep_tokens = dec.drain()
+            # drain() 在没有 pending 时返回 None；后面把这些 token 重新 emit 时
+            # 是 for ... in <list>，None 会直接 TypeError（'NoneType' object is
+            # not subscriptable / not iterable，表现为间歇性 500）
+            dec.prep_tokens = dec.drain() or []
             self._graphs[key] = dec
             self._prep[key] = dec.prep_tokens
             return dec, True
