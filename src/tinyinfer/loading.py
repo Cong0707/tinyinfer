@@ -2235,16 +2235,22 @@ class VramSlotCache:
                 buf.copy_(cpu, non_blocking=True)
                 ev.record(self._copy_stream)
             return ev
+        # 非 pinned 源（我们的大池子是 mmap，pageable）：原来的路径先
+        # staging.copy_(cpu) 同步拷到 pinned staging，再异步 H2D —— 那次同步拷贝
+        # 把主线程钉在原地等 18.8MB，一个 token 240 次就是几十毫秒的纯阻塞，
+        # 期间 GPU 完全空转（实测推理时 GPU 0-27% 反复跳）。
+        # pageable 源直接 non_blocking=True 交给驱动：驱动会自己分块暂存，
+        # 慢一点但**不阻塞调用者**，主线程可以继续发下一层的 kernel。
         if staging is None or self._copy_stream is None:
-            buf.copy_(cpu, non_blocking=False)
+            buf.copy_(cpu, non_blocking=True)
             return None
-        with lock:
-            ev = event if event is not None else torch.cuda.Event()
-            staging.copy_(cpu)
-            with torch.cuda.stream(self._copy_stream):
-                buf.copy_(staging, non_blocking=True)
-                ev.record(self._copy_stream)
-            return ev
+        ev = event if event is not None else torch.cuda.Event()
+        with torch.cuda.stream(self._copy_stream):
+            # 同一份 pageable 源，驱动内部会做暂存；把这块也放到 copy stream 上，
+            # 就不会占住计算流的排序点。
+            buf.copy_(cpu, non_blocking=True)
+            ev.record(self._copy_stream)
+        return ev
 
     def _find_victim_locked(self) -> int | None:
         for idx in range(self.slots):
