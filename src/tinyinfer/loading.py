@@ -2196,19 +2196,54 @@ class VramSlotCache:
                 if _left:
                     _big = max(range(len(_caps)), key=lambda i: _caps[i])
                     _per[_big] += _left
-                self._arena = []
-                self._buffers = []
-                self._slot_dev = []
-                for _i, _n in enumerate(_per):
-                    if _n <= 0:
-                        continue
-                    _a = torch.empty((_n, self.blob_bytes), dtype=dtype, device=_devs[_i])
-                    self._arena.append(_a)
-                    for _s in range(_n):
-                        self._buffers.append(_a[_s])
-                        self._slot_dev.append(_i)
-                if not self._buffers:
-                    raise RuntimeError("no slot arena could be allocated")
+                # 按算出来的数量分配，失败就收缩再试。真机上 free 会随加载进度变化
+                # （_ensure 可能在任何时刻被第一次 fetch 触发，那时层权重还没全就位），
+                # 一次算准不现实；缩到能放下为止比让服务起不来强。
+                _try = int(_per[0]) if len(_per) == 1 else 0
+                while True:
+                    self._arena = []
+                    self._buffers = []
+                    self._slot_dev = []
+                    try:
+                        if len(_per) == 1:
+                            _n = max(0, _try)
+                            if _n > 0:
+                                _a = torch.empty((_n, self.blob_bytes), dtype=dtype,
+                                                 device=_devs[0])
+                                self._arena.append(_a)
+                                for _s in range(_n):
+                                    self._buffers.append(_a[_s])
+                                    self._slot_dev.append(0)
+                        else:
+                            for _i, _n in enumerate(_per):
+                                if _n <= 0:
+                                    continue
+                                _a = torch.empty((_n, self.blob_bytes), dtype=dtype,
+                                                 device=_devs[_i])
+                                self._arena.append(_a)
+                                for _s in range(_n):
+                                    self._buffers.append(_a[_s])
+                                    self._slot_dev.append(_i)
+                        if self._buffers:
+                            break
+                        raise RuntimeError("no slot arena could be allocated")
+                    except Exception:
+                        for _b in list(self._buffers):
+                            del _b
+                        self._arena = []
+                        self._buffers = []
+                        self._slot_dev = []
+                        if len(_per) == 1 and _try > 16:
+                            _try = int(_try * 0.85)   # 收缩 15% 再试
+                            torch.cuda.empty_cache()
+                            continue
+                        raise
+                if len(_per) == 1:
+                    self.slots = len(self._buffers)
+                    self._state = [self.FREE] * self.slots
+                    self._key = [None] * self.slots
+                    self._refs = [0] * self.slots
+                    self._event = [None] * self.slots
             else:
                 self._arena = None
                 self._slot_dev = [0] * self.slots
@@ -2220,6 +2255,10 @@ class VramSlotCache:
             self._buffers = []
             self.slots = 0
             return
+        if __import__("os").environ.get("TI_SLOT_DEBUG") == "1":
+            print(f"[slots] self.slots={self.slots} buffers={len(self._buffers)} "
+                  f"state={len(self._state)} devs={getattr(self,'devices',None)}",
+                  flush=True)
         if self.pin_staging and dev.type == "cuda":
             self._staging = torch.empty(self.blob_bytes, dtype=dtype, pin_memory=True)
             self._staging_b = torch.empty(self.blob_bytes, dtype=dtype, pin_memory=True)
