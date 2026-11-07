@@ -337,7 +337,17 @@ class MLACompressedAttention:
             # the same group offset, so two sequences of different length overwrite each
             # other's compressed history -- that is what made the second one degrade the
             # first (measured: row A drifted by 16.18 against the same prompt alone).
-            start_group = int(_grp0.min().item()) if _grp0 is not None else start_pos // self.ratio
+            # 单行时不需要问 GPU：组索引就是 position // ratio，而 start_pos 已经是
+            # Python int。原来的 int(_grp0.min().item()) 每层都要一次 DtoH 同步，
+            # 40 层就是每 token 40 次 —— 每次同步都把 GPU 钉在原地等 CPU 回话，
+            # 实测整个 decode 有 360 次 DtoH、GPU 利用率掉到 20-40%。
+            # 只有 batch>1（每行位置不同）时才真的需要读回 GPU 的值。
+            if _grp0 is None:
+                start_group = start_pos // self.ratio
+            elif _grp0.numel() == 1:
+                start_group = start_pos // self.ratio
+            else:
+                start_group = int(_grp0.min().item())
             need = start_group + latent.size(1)
             cur = self._compress_kv
             # The cache is shared across the kv_source group via self.rt, so it can already
@@ -360,6 +370,14 @@ class MLACompressedAttention:
             self._compress_kv[:, start_group : start_group + latent.size(1)] = latent
             self.rt.compress_kv = self._compress_kv
         if compress_len <= 0:
+            compress_kv = compress_idxs = None
+        elif self.rt.compress_kv is None:
+            # 本批里有序列的 position 已经过了压缩阈值，但这个 kv_source 组还没
+            # 写过任何压缩组（典型成因：批里混了刚 prefill 的序列和已经解码很久
+            # 的序列，start_pos 取的是最小值，而判断走的是最大值一侧）。
+            # 以前这里直接 self.rt.compress_kv[:, ...] 抛
+            # TypeError: 'NoneType' object is not subscriptable，整批请求 500。
+            # 退化成「本步不带压缩历史」，至少不炸整批。
             compress_kv = compress_idxs = None
         else:
             compress_kv = self.rt.compress_kv[:, :compress_len]

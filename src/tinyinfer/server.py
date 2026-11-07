@@ -765,7 +765,7 @@ class QwenBackend(BaseBackend):
         # （实测 10 次请求里 3 次 500：'NoneType' 和 [1,60,512] 广播失败）。
         # 引擎自己的 generate() 是同一条前向，但不经过图捕获和 prep 回放，
         # 实测稳定在 295ms/token。默认走它，需要时再用 TI_GRAPH=1 试图。
-        _gmode = __import__("os").environ.get("TI_GRAPH", "plain")
+        _gmode = __import__("os").environ.get("TI_GRAPH", "batch")
         if _gmode == "plain":
             yield from self._generate_plain(request, ids, prompt_tokens, budget)
             return
@@ -1524,6 +1524,18 @@ class TinyModelBackend(BaseBackend):
 
     def _serve_loop(self):
         """The one batch loop this backend serves through, started on first use."""
+        # 必须串行创建：两个 ASGI 线程同时进来看都是 None，会各自造一个
+        # ServingEngine，两个 loop 交替驱动同一个 engine 的 KV/hidden 状态，
+        # 症状就是 index 164 is out of bounds 和 'NoneType' object is not
+        # subscriptable（实测并发请求 10 次里 8 次失败）。
+        _lck = getattr(self, "_loop_lock", None)
+        if _lck is None:
+            import threading as _th
+            _lck = self._loop_lock = _th.Lock()
+        with _lck:
+            return self._serve_loop_locked()
+
+    def _serve_loop_locked(self):
         loop = getattr(self, "_batch_loop", None)
         if loop is None:
             from .sched import ServingEngine

@@ -36,11 +36,17 @@ def _ops():
 
 
 def available() -> bool:
+    # 判的是「能不能真的启动」，不是「vLLM 的 pyd 在不在」。原来这里调 _ops()，
+    # 而 _ops() 的唯一职责是返回那个已经不再随仓库分发的 pyd —— 于是即使
+    # kernels/cuda/marlin/ 的 cubin 编译成功，available() 依然永远是 False，
+    # MoE 也就永远走不到 Marlin 这条 sm_89 上最快的 fp4 路径。
     try:
-        _ops()
-        return True
+        return _native_launcher() is not None
     except Exception:
-        return False
+        try:
+            return _ops() is not None
+        except Exception:
+            return False
 
 
 def _scale_perms():
@@ -120,7 +126,10 @@ def _repack_launcher():
         # a build-time dependency on every expert load.
         _REPACK = (native.bind("marlin_repack", _REPACK_SYMBOL, (sms,), (256,),
                                "OOii", shared=smem), sms)
-    except Exception:
+    except Exception as _exc:
+        import os as _o
+        if _o.environ.get("TI_MARLIN_DEBUG") != "0":
+            print(f"[marlin] native repack unavailable: {_exc!r}", flush=True)
         _REPACK = False
     return _REPACK or None
 
@@ -146,7 +155,13 @@ class MarlinFp4Weight:
     def __init__(self, w_fp4: torch.Tensor, w_scale: torch.Tensor):
         size_n, k2 = w_fp4.shape
         size_k = k2 * 2
-        ops = _ops()
+        # ops 只用于 pyd 那条回退路。native 可用时根本不需要它，而 _ops() 在
+        # pyd 缺失时是直接 raise 的 —— 无条件调用会把整个 expert repack 打死，
+        # 于是 Marlin 明明已经编译好也用不上（available() 返回 True 但一用就崩）。
+        try:
+            ops = _ops()
+        except Exception:
+            ops = None
         packed = w_fp4.reshape(size_n, k2).contiguous()
         if packed.dtype != torch.uint8:
             packed = packed.view(torch.uint8)
@@ -252,10 +267,37 @@ def _native_launcher():
         props = torch.cuda.get_device_properties(0)
         sms = int(props.multi_processor_count)
         smem = int(props.shared_memory_per_block_optin)
-        native.set_dynamic_smem("marlin_fp4", _MARLIN_SYMBOL, smem)
-        _NATIVE = (native.bind("marlin_fp4", _MARLIN_SYMBOL, (sms,), (256,),
-                               "TTOnnnTnni" + "iii" + "Ti" + "iii", shared=smem), smem)
-    except Exception:
+        # 符号名里的模板参数字面量在 Windows 上是 Lx (long long)，在 Linux 上是
+        # Ll (long) —— 同一个模板，两个平台的 mangling 不同。写死某一个会让另一个
+        # 平台 cuModuleGetFunction 返回 500 (NOT_FOUND)，而异常又被吞成
+        # 「Marlin 不可用」，MoE 静默退回自研 GEMV。
+        # 所以两个都试，谁在 cubin 里就用谁。
+        # 两种 mangling 都要连 set_dynamic_smem 一起试：只要符号拼错，
+        # set_dynamic_smem 自己就会抛，把它留在 try 外会让整条路直接废掉。
+        _args = "TTOnnnTnni" + "iii" + "Ti" + "iii"
+        _launch = None
+        _last = None
+        for _tag, _sym in (("win/Lx", _MARLIN_SYMBOL),
+                           ("linux/Ll", _MARLIN_SYMBOL.replace("Lx", "Ll"))):
+            try:
+                native.set_dynamic_smem("marlin_fp4", _sym, smem)
+                _launch = native.bind("marlin_fp4", _sym, (sms,), (256,), _args,
+                                      shared=smem)
+                if _tag != "win/Lx":
+                    print(f"[marlin] using {_tag} symbol mangling", flush=True)
+                break
+            except Exception as _e2:
+                _last = _e2
+                _launch = None
+        if _launch is None:
+            raise RuntimeError(f"marlin: no mangling matched: {_last!r}")
+        _NATIVE = (_launch, smem)
+    except Exception as _exc:
+        # 不要静默失败：Marlin 不可用会让 MoE 掉回自研 GEMV，带宽效率差一半，
+        # 而表现只是「慢一点」，没有任何提示。这里必须能看到真正的原因。
+        import os as _o
+        if _o.environ.get("TI_MARLIN_DEBUG") != "0":
+            print(f"[marlin] native launcher unavailable: {_exc!r}", flush=True)
         _NATIVE = False
     return _NATIVE or None
 
