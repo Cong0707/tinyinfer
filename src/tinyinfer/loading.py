@@ -2252,12 +2252,13 @@ class VramSlotCache:
                 self._slot_dev = [0] * self.slots
                 self._buffers = [torch.empty(self.blob_bytes, dtype=dtype, device=dev)
                                  for _ in range(self.slots)]
-        except Exception:
-            # never let the staging pool be the allocation that takes the run down:
-            # without it experts are served straight from host memory (slower, correct)
-            self._buffers = []
-            self.slots = 0
-            return
+        except Exception as _exc:
+            # 不清零、不降级。slots=0 会让每个 routed expert 每 token 都从主机内存
+            # 走一次 H2D（240 次/token），decode 从「显存直读」退成「主机中转」，
+            # 而整个降级只有 TI_SLOT_DEBUG=1 才可见。分配失败就报错。
+            raise RuntimeError(
+                f"VRAM expert slot arena allocation failed "
+                f"(slots={self.slots}, blob={self.blob_bytes}B): {_exc!r}") from _exc
         if __import__("os").environ.get("TI_SLOT_DEBUG") == "1":
             print(f"[slots] self.slots={self.slots} buffers={len(self._buffers)} "
                   f"state={len(self._state)} devs={getattr(self,'devices',None)}",

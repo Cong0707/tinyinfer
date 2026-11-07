@@ -212,8 +212,10 @@ def hc_split_sinkhorn(
         try:
             return _native_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
         except Exception as _exc:
-            if __import__("os").environ.get("TI_SINKHORN_DEBUG"):
-                print(f"[sinkhorn] native path failed: {_exc!r}", flush=True)
+            # 不回退。eager 形式每次调用约 160 个 4 元素 kernel 的 launch，
+            # 每层 2 次、40 层 = 每 token 上万 launch；而这个 except 只在
+            # TI_SINKHORN_DEBUG 下才可见。失败就该直接报错。
+            raise RuntimeError(f"sinkhorn native kernel failed: {_exc!r}") from _exc
     return _sinkhorn_body(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
 
 
@@ -417,8 +419,8 @@ class HCBlockMixin:
                             [xc.contiguous(), pre_mix.reshape(b * s, hc).float().contiguous(),
                              out, b * s, hc, d])
                 return out.view(b, s, d)
-            except Exception:
-                pass
+            except Exception as _exc:
+                raise RuntimeError(f"hc_pre native kernel failed: {_exc!r}") from _exc
         y = torch.sum(pre_mix.unsqueeze(-1) * x.float(), dim=2)
         return y.to(x.dtype)
 
@@ -469,8 +471,8 @@ class HCBlockMixin:
                     _BOUND[_key] = _fn
                 _fn(xc, rc, pc, cc, out, b * s, hc, d, stream=None)
                 return out.view(b, s, hc, d)
-            except Exception:
-                pass
+            except Exception as _exc:
+                raise RuntimeError(f"hc_post native kernel failed: {_exc!r}") from _exc
         import os as _os
         if x.is_cuda and _FUSED_POST_OK and _os.environ.get("TI_HC_NOFUSE") != "1":
             try:

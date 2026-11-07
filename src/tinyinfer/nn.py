@@ -17,8 +17,12 @@ def _rms_native_ok() -> bool:
             from .kernels import native
             native.kernel("rms_norm", "rms_norm_kernel")
             _RMS_NATIVE["ok"] = True
-        except Exception:
-            _RMS_NATIVE["ok"] = False
+        except Exception as _exc:
+            # 不回退。torch 版本是 7 个 launch，每层 2 次、40 层 = 每 token 560 个
+            # 额外 launch，而失败本身会被这个 latch 永久记住且只在环境变量下可见。
+            # 探测失败就该直接报错。
+            raise RuntimeError(
+                f"rms_norm native kernel unavailable: {_exc!r}") from _exc
     return _RMS_NATIVE["ok"]
 
 
@@ -55,8 +59,10 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
             native.launch(native.kernel("rms_norm", "rms_norm_kernel"), (rows,), (32,),
                           [xc, wf, y, rows, d, float(eps)])
             return y.view(*shape)
-        except Exception:
-            pass
+        except Exception as _exc:
+            # 不回退到下面那条 7 个算子的 torch 链：那条每层 2 次、40 层就是
+            # 每 token 560 个额外 launch，而且只在速度上体现，没有任何提示。
+            raise RuntimeError(f"rms_norm native launch failed: {_exc!r}") from _exc
     xf = x.float()
     y = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
     return (y * weight.float()).to(orig_dtype)

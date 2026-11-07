@@ -28,12 +28,15 @@ _ones: dict[int, torch.Tensor] = {}
 
 
 def available() -> bool:
-    """True when the hand-written kernels are built."""
-    try:
-        _kernel("moe_gemv6")
-        return True
-    except Exception:
-        return False
+    """True when the hand-written kernels are built.
+
+    不回退成 False。这个函数的返回值被 moe.py 的 _fused_ok 永久 latch，
+    一次失败就等于本进程再也走不到 fused MoE：每层从 4 个 launch 变成 ~34 个，
+    多行时还会换成另一套精度不同的算术（实测同 prompt 相差 16.85）。
+    而且这个 latch 只在 TI_FUSED_STATS=1 时才有一行输出。
+    """
+    _kernel("moe_gemv6")
+    return True
 
 
 def _kernel(name: str):
