@@ -2266,7 +2266,7 @@ class VramSlotCache:
             self._copy_stream = torch.cuda.Stream(device=dev)
             self._copy_events = [torch.cuda.Event() for _ in range(self.slots)]
 
-    def try_grow(self, reserve_bytes: int = 512 << 20) -> int:
+    def try_grow(self, reserve_bytes: int = 2 << 30) -> int:
         """模型全部就位后，按芯片上真实剩下的显存扩容槽位。返回新增数量。
 
         _ensure() 第一次跑的时候层权重未必全部加载完，那时 mem_get_info 报的
