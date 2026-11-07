@@ -792,6 +792,18 @@ class Engine:
                     torch.cuda.empty_cache()
                 except Exception:
                     pass
+            # 模型（40 层权重 + KV + workspace）现在确实全部就位了，这才是问驱动
+            # 「还剩多少显存」的正确时机。按它把专家槽位扩到能吃满为止：换一张
+            # 96GB/141GB 的卡不需要改任何参数，槽位数自己会跟上。
+            _sl = getattr(getattr(self, "expert_store", None), "slots", None)
+            if _sl is not None and getattr(_sl, "slots", 0) > 0:
+                try:
+                    _more = _sl.try_grow()
+                    if _more:
+                        print(f"[tinyinfer] expert slots grown by {_more} -> {_sl.slots} "
+                              f"(VRAM now in use)", flush=True)
+                except Exception as _exc:
+                    print(f"[tinyinfer] slot grow skipped: {_exc!r}", flush=True)
 
     # -- residency ---------------------------------------------------------
     def available_layers(self) -> int:

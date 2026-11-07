@@ -2144,9 +2144,10 @@ class VramSlotCache:
         # 白放着；换一张 96GB 或 141GB 的卡，它又会估小。这里第一次真正要用槽位时
         # （此时模型、KV、workspace 都已就位）直接问驱动还剩多少，按 blob 大小整除。
         # 换机器不需要任何手动参数。
-        if (getattr(self, "slot_arena", False)
-                and __import__("os").environ.get("TI_SLOTS") is None
-                and getattr(self, "auto_slots", True)):
+        # 注意：这里**不**按 free 自动扩容。_ensure 可能在任何一次 fetch 时被
+        # 触发，那时层权重未必全部就位，free 会偏大（实测按它算出 1823 个槽位，
+        # 加模型直接 OOM）。真正的自动扩容在模型就位之后由 try_grow() 完成。
+        if (False):
             try:
                 _dev0 = torch.device((getattr(self, "devices", None) or [self.device])[0])
                 _free, _total = torch.cuda.mem_get_info(_dev0)
@@ -2264,6 +2265,48 @@ class VramSlotCache:
             self._staging_b = torch.empty(self.blob_bytes, dtype=dtype, pin_memory=True)
             self._copy_stream = torch.cuda.Stream(device=dev)
             self._copy_events = [torch.cuda.Event() for _ in range(self.slots)]
+
+    def try_grow(self, reserve_bytes: int = 512 << 20) -> int:
+        """模型全部就位后，按芯片上真实剩下的显存扩容槽位。返回新增数量。
+
+        _ensure() 第一次跑的时候层权重未必全部加载完，那时 mem_get_info 报的
+        free 偏大 —— 按它算会得到 1823 个槽位（32.6GB），加上模型就会 OOM
+        （实测：slots=1824 而 buffers 已归零，后续 self._buffers[slot] 越界）。
+        所以扩容放在模型确实就位之后：只申请增量，失败就原样保留。
+        """
+        if not self.slots or getattr(self, "_paused", False):
+            return 0
+        try:
+            import torch
+            _dev = torch.device((getattr(self, "devices", None) or [self.device])[0])
+            free, _total = torch.cuda.mem_get_info(_dev)
+            usable = int(free) - int(reserve_bytes)
+            if usable <= 0:
+                return 0
+            more = int(usable // max(1, self.blob_bytes))
+            if more < 8:
+                return 0
+            _a = torch.empty((more, self.blob_bytes), dtype=self._dtype or torch.uint8,
+                             device=_dev)
+            with self._lock:
+                if self._arena is None:
+                    self._arena = []
+                self._arena.append(_a)
+                _base = len(self._buffers)
+                for _s in range(more):
+                    self._buffers.append(_a[_s])
+                    self._slot_dev.append(0)
+                self._state.extend([self.FREE] * more)
+                self._key.extend([None] * more)
+                self._refs.extend([0] * more)
+                self._event.extend([None] * more)
+                self.slots = len(self._buffers)
+            if self.pin_staging:
+                self._copy_events.extend([torch.cuda.Event() for _ in range(more)])
+            return more
+        except Exception:
+            # 扩容是优化，失败就按当前槽位数继续服务
+            return 0
 
     def _copy_blocking(self, idx: int, data: Any, event: Any = None):
         """Copy data bytes into slot idx; returns the completion CUDA event (or None)."""
