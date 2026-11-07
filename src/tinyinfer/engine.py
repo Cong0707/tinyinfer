@@ -2580,6 +2580,13 @@ class Engine:
         acc = drafted = 0
         with torch.inference_mode():
             logits = self.forward(torch.tensor([ids], device=self.device), 0)
+            if logits is None:
+                # forward 的 3 次重试都失败时本该 raise（循环末尾就是 raise），
+                # 真出现 None 时下游 logits[0,-1] 只会抛
+                # 'NoneType' object is not subscriptable，把真正的失败点埋掉。
+                # 实测 10 次请求里有 1 次会这样，先让它说清楚。
+                raise RuntimeError(
+                    "forward() returned None on prefill (engine state reset?)")
             if self.device != "cpu":
                 torch.cuda.empty_cache()
             pos = len(ids)
@@ -2646,6 +2653,13 @@ class Engine:
             eos_token_id = getattr(getattr(self, "_tokenizer", None), "eos_token_id", None)
         with torch.inference_mode():
             logits = self.forward(torch.tensor([ids], device=self.device), 0)
+            if logits is None:
+                # forward 的 3 次重试都失败时本该 raise（循环末尾就是 raise），
+                # 真出现 None 时下游 logits[0,-1] 只会抛
+                # 'NoneType' object is not subscriptable，把真正的失败点埋掉。
+                # 实测 10 次请求里有 1 次会这样，先让它说清楚。
+                raise RuntimeError(
+                    "forward() returned None on prefill (engine state reset?)")
             if self.device != "cpu":
                 # the prefill kernels (tilelang workspace for the prompt-length shape)
                 # leave ~5GB of cached blocks behind; against an 8GB card that pushes
