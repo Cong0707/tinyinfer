@@ -829,8 +829,15 @@ class QwenBackend(BaseBackend):
         text_buf: list[str] = []
         stops = tuple(s for s in (params.stop or ()) if s)
         prompt_ids = [int(t) for t in ids[0].tolist()]
-        with torch.inference_mode():
-            out = self._model.generate(prompt_ids, max_new_tokens=budget)
+        # Engine 的 KV cache、_last_hidden、_target_hidden 都是「当前这一次前向」的
+        # 状态，没有按请求隔离。两个请求同时进来时会互相覆盖，症状是 batch 维
+        # 突然从 1 变成 2（"output with shape [1,60,512] doesn't match [2,60,512]"）
+        # 或者 logits 被另一路读走（'NoneType' object is not subscriptable）。
+        # 这里先串行化保证正确；要真正并发得走 batching 调度器（每个请求一条
+        # Sequence，一次前向带多个请求），那是另一件事。
+        with self._gen_lock:
+            with torch.inference_mode():
+                out = self._model.generate(prompt_ids, max_new_tokens=budget)
         produced = 0
         for tok_id in (out or []):
             tok_id = int(tok_id)
