@@ -383,7 +383,13 @@ def plan(hw: Hardware | None = None, n_layers: int = 40, model: dict | None = No
     LAYER_SLACK = 1.70          # allocator/state/fragmentation per resident layer,
                                 # measured: 355MB of bf16 weights costs ~600MB of VRAM
                                 # once its activations and fragments are counted
-    SLOT_FRACTION = 0.70
+    # 显存里留给专家槽位的比例。0.70 是 8GB 卡上「槽位和 prefill wave 争显存」时的
+    # 平衡点；在 44GB 的卡上，40 层全驻留之后剩下的显存几乎全可以用来装专家，
+    # 而每多一个槽位就直接减少一次 H2D。实测 L20：1057 槽位时 8 个 token 做了
+    # 770 次 pageable H2D（0.95ms/次 = 730ms，占整步的 61%），槽位一旦覆盖住
+    # 热点专家，这部分直接归零。
+    # 只留 10% 给 prefill wave / 运行时碎片。
+    SLOT_FRACTION = 0.90
     # ring depth actually allocated by _flat_setup; TI_RING lets the two agree so the
     # planner does not reserve a buffer that is never allocated
     BUF_COUNT = max(2, min(4, int(__import__("os").environ.get("TI_RING", "3"))))
