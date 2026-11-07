@@ -2150,12 +2150,16 @@ class VramSlotCache:
             try:
                 _dev0 = torch.device((getattr(self, "devices", None) or [self.device])[0])
                 _free, _total = torch.cuda.mem_get_info(_dev0)
-                # 留 15%：cuBLAS 的临时 workspace 是按调用申请的（fp8 GEMM 的
-                # split-k 缓冲可以有几百 MB），吃干净会有 CUBLAS_STATUS_ALLOC_FAILED。
-                # 槽位是长期驻留的，必须给运行期的临时分配让出空间。
-                # 实测 0.92 时 free 被槽位吃光，第一个请求就 ALLOC_FAILED；
-                # 0.85 留出约 5GB，正常。
-                _usable = int(_free * 0.85)
+                # 留一个绝对值，不按比例：运行期真正会临时申请的显存是有限的，
+                # 实测（L20，torch.cuda.max_memory_allocated 前后差）：
+                #   cuBLAS bf16 GEMM   M=1/64, 2304x5120 : 54-57 MB
+                #   cuBLAS bf16 GEMM   M=128, 5120x5120  : 116 MB（最大）
+                #   cuBLAS fp8 scaled_mm（实际用到的）    : 1-5 MB
+                # 再加上 cuBLAS handle、驱动侧簿记和分配器碎片，512MB 有 ~4 倍余量。
+                # 用比例会把大卡上的余量算得过大（44GB 的 15% 是 6.7GB，白白浪费掉
+                # 370 个槽位），小卡上又可能算不够；这里按字节留。
+                _RESERVE_BYTES = 512 << 20
+                _usable = max(0, _free - _RESERVE_BYTES)
                 _auto = int(_usable // max(1, self.blob_bytes))
                 _hard = int(getattr(self, "_hard_max_slots", 0) or 0)
                 if _hard:
