@@ -2786,6 +2786,14 @@ class ExpertRecord:
                              else view.view(slot.shape[0]))
             return out
 
+        # managed 内存（cudaMallocManaged）的地址在 GPU 的统一虚拟地址空间里：
+        # L20 的 PageableMemoryAccess=1，kernel 拿这个地址就能直接读，热点页
+        # 已经在显存时就是显存带宽。所以这条路径完全不拷贝 —— 既省掉一次
+        # 18.8MB 的 H2D，也让 CPU 不必参与搬运。
+        _managed = getattr(self.buffer, "addressof", None)
+        if _managed is not None:
+            flat = torch.frombuffer(self.buffer, dtype=torch.uint8)
+            return view_of(flat)
         if torch.is_tensor(self.buffer) and self.buffer.device.type == "cuda":
             return view_of(self.buffer)
         if torch.is_tensor(self.buffer):

@@ -575,7 +575,13 @@ class HostBudget:
         # 150GB 也拿不到，而每次重试都要重新 mmap + touch，纯属浪费时间。
         # 池子小了引擎会静默降级（缓存变小、每 token 重新读盘），那种"能跑但慢
         # 十倍"的结果比启动失败更难查。
-        buf = _managed_pool(n)
+        # managed 池默认关闭：实测服务模式 892 ms/token，比 mmap 的 203 慢 4.4 倍。
+        # 原因是 managed 的缺页只有 6.7 GB/s（PCIe 的 1/4），而 decode 每次 reset
+        # 都会让页重新掉出去。代码留着（ManagedBuffer + _managed_pool），
+        # TI_MANAGED_POOL=1 可以打开做实验，不作为默认。
+        buf = None
+        if __import__("os").environ.get("TI_MANAGED_POOL") == "1":
+            buf = _managed_pool(n)
         if buf is None:
             buf = mmap.mmap(-1, n)
         if False:
