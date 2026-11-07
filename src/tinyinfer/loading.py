@@ -2720,6 +2720,18 @@ class ExpertStore:
                      slot: int | None = None, ready: bool = False,
                      data: Any = None) -> ExpertRecord:
         blob = self.index.expert_blob(layer, expert)
+
+        # 先看显存槽位。命中时槽里已经是这个专家的完整字节，**不需要**再从主机缓存
+        # 取一份 —— 而原来这里先 ram.get 再判 ready，于是每个命中的专家都要去主机
+        # 缓存取一次，取不到就落到读盘（cProfile：4 个 token 里 readinto 占 1.24s，
+        # 而同一时间里 copy_in 是 0 次、acquire 全部 hit）。命中路径上这次读盘
+        # 完全是白费的。
+        if slot is None and self.slots is not None and self.slots.slots > 0:
+            slot, ready = self.slots.acquire(layer, expert)
+        if slot is not None and slot >= 0 and ready:
+            return ExpertRecord((layer, expert), self.slots.buffer(slot), blob.tensors,
+                                self.device, self.slots.event(slot))
+
         if data is not None:
             # the batch read already produced these bytes; looking them up in the RAM
             # cache again used to miss after the ARC eviction that the admit itself
@@ -2741,7 +2753,6 @@ class ExpertStore:
         if slot < 0:  # no VRAM slot available: serve straight from the RAM cache
             return ExpertRecord((layer, expert), data, blob.tensors, "cpu")
         if ready:
-            # a prefetch already owns this slot: hand its event to the caller
             return ExpertRecord((layer, expert), self.slots.buffer(slot), blob.tensors,
                                 self.device, self.slots.event(slot))
         ev = self.slots.copy_in(slot, data)
